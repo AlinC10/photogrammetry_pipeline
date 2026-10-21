@@ -170,15 +170,36 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         cleaned_obj_path = str(out_path / "model_cleaned_watertight.obj")
         textured_obj_path = str(openmvs_dir / "scene_textured.obj")
 
+        resume = bool(job.get("resume", False))
+
         if not mock_openmvs:
-            with telemetry.step("4.1 OpenMVS InterfaceCOLMAP"):
-                runner.run_interface_colmap(colmap_dir, undistorted_dir)
+            skip_densify = False
+            skip_reconstruct = False
 
-            with telemetry.step("4.2 OpenMVS DensifyPointCloud"):
-                runner.run_densify(masks_dir=masks_out_dir if Path(masks_out_dir).is_dir() else None)
+            if resume:
+                existing_meshes = [
+                    openmvs_dir / "scene_mesh.ply",
+                    openmvs_dir / "scene_mesh.mvs",
+                    openmvs_dir / "scene_dense_mesh.ply",
+                ]
+                if any(m.is_file() for m in existing_meshes):
+                    logger.info("[RESUME] Found existing reconstructed surface mesh, skipping DensifyPointCloud & ReconstructMesh.")
+                    skip_densify = True
+                    skip_reconstruct = True
+                elif (openmvs_dir / "scene_dense.mvs").is_file():
+                    logger.info("[RESUME] Found existing scene_dense.mvs point cloud, skipping DensifyPointCloud.")
+                    skip_densify = True
 
-            with telemetry.step("4.3 OpenMVS ReconstructMesh"):
-                runner.run_reconstruct_mesh()
+            if not skip_densify:
+                with telemetry.step("4.1 OpenMVS InterfaceCOLMAP"):
+                    runner.run_interface_colmap(colmap_dir, undistorted_dir)
+
+                with telemetry.step("4.2 OpenMVS DensifyPointCloud"):
+                    runner.run_densify(masks_dir=masks_out_dir if Path(masks_out_dir).is_dir() else None)
+
+            if not skip_reconstruct:
+                with telemetry.step("4.3 OpenMVS ReconstructMesh"):
+                    runner.run_reconstruct_mesh()
 
             # Identify raw reconstructed surface geometry (.ply or .obj)
             candidate_raw_meshes = [
@@ -209,12 +230,20 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                     config=config.cleaning,
                 )
 
+            # Determine appropriate MVS project file for TextureMesh
+            mvs_project = "scene_mesh.mvs"
+            if not (openmvs_dir / "scene_mesh.mvs").is_file():
+                if (openmvs_dir / "scene_dense.mvs").is_file():
+                    mvs_project = "scene_dense.mvs"
+                else:
+                    mvs_project = "scene.mvs"
+
             # ----------------------------------------------------------------------
             # STEP 4.4: OpenMVS TextureMesh on Watertight Sealed Geometry
             # ----------------------------------------------------------------------
             with telemetry.step("4.4 OpenMVS TextureMesh (Watertight)"):
                 _, textured_obj_path = runner.run_texture_mesh(
-                    input_mvs="scene_mesh.mvs",
+                    input_mvs=mvs_project,
                     mesh_file=cleaned_obj_path,
                 )
 
@@ -282,6 +311,7 @@ def parse_args():
     parser.add_argument("--openmvs_bin_dir", "--bin_dir", default=None, help="Custom path to OpenMVS binaries directory (e.g. C:\\OpenMVS or C:\\openMVS\\bin)")
     parser.add_argument("--resolution_level", type=int, default=1, help="OpenMVS densify downscale (0=full, 1=2x, 2=4x)")
     parser.add_argument("--step_deg", type=float, default=18.0, help="Turntable step angle in degrees")
+    parser.add_argument("--resume", action="store_true", help="Resume from existing OpenMVS dense cloud or mesh if available")
     parser.add_argument("--mock_openmvs", action="store_true", help="Simulate OpenMVS for fast testing")
     return parser.parse_args()
 
@@ -295,6 +325,7 @@ def main():
         "openmvs_bin_dir": args.openmvs_bin_dir,
         "resolution_level": args.resolution_level,
         "step_deg": args.step_deg,
+        "resume": args.resume,
         "mock_openmvs": args.mock_openmvs,
     }
     run_pipeline(job)

@@ -157,9 +157,21 @@ class OpenMVSRunner:
             "-v", "2",
         ]
         self._execute_cmd(cmd, "ReconstructMesh")
-        if not out_file.is_file():
-            raise FileNotFoundError(f"ReconstructMesh output missing: {out_file}")
-        return str(out_file)
+
+        # OpenMVS may save as .mvs or .ply directly depending on version
+        if out_file.is_file():
+            return str(out_file)
+
+        ply_candidate = self.work_dir / f"{out_file.stem}.ply"
+        if ply_candidate.is_file():
+            logger.info(f"ReconstructMesh generated PLY surface: {ply_candidate}")
+            return str(ply_candidate)
+
+        for alt in [self.work_dir / "scene_mesh.ply", self.work_dir / "scene_dense_mesh.ply"]:
+            if alt.is_file():
+                return str(alt)
+
+        raise FileNotFoundError(f"ReconstructMesh output missing: {out_file} or {ply_candidate}")
 
     def run_refine_mesh(
         self,
@@ -173,6 +185,9 @@ class OpenMVSRunner:
             return str(self.work_dir / input_mvs)
 
         in_file = self.work_dir / input_mvs
+        if not in_file.is_file():
+            in_file = self.work_dir / "scene_dense.mvs"
+
         out_file = self.work_dir / output_mvs
 
         cmd = [
@@ -201,7 +216,15 @@ class OpenMVSRunner:
         if not bin_path:
             raise FileNotFoundError("TextureMesh binary not found.")
 
+        # Fallback to scene_dense.mvs or scene.mvs if scene_mesh.mvs does not exist
         in_file = self.work_dir / input_mvs
+        if not in_file.is_file():
+            for cand_mvs in ["scene_dense.mvs", "scene.mvs"]:
+                cand_path = self.work_dir / cand_mvs
+                if cand_path.is_file():
+                    in_file = cand_path
+                    break
+
         out_file = self.work_dir / output_mvs
         expected_obj = self.work_dir / f"{out_file.stem}.obj"
 
@@ -214,7 +237,7 @@ class OpenMVSRunner:
             "-v", "2",
         ]
         if mesh_file and Path(mesh_file).is_file():
-            cmd.extend(["--mesh-file", str(Path(mesh_file).resolve())])
+            cmd.extend(["-m", str(Path(mesh_file).resolve())])
 
         self._execute_cmd(cmd, "TextureMesh")
 
