@@ -1,0 +1,25 @@
+version: "3.8"
+
+services:
+  turntable-studio:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: turntable-studio:latest
+    container_name: turntable_studio_worker
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - PYTHONUNBUFFERED=1
+    volumes:
+      # Mount input images and output deliverables
+      - ./input_images:/workspace/input_images:ro
+      - ./output:/workspace/output:rw
+    command: ["--input_dir", "/workspace/input_images", "--output_dir", "/workspace/output", "--rig_mode"]
