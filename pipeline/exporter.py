@@ -78,6 +78,180 @@ def convert_texture_png_to_jpg(png_path: str, jpg_path: str, quality: int = 85) 
         logger.warning(f"Failed converting texture to JPG: {e}")
 
 
+def find_source_mtl_and_textures(tex_p: Path) -> Tuple[Optional[Path], List[Path]]:
+    """
+    Finds the source MTL file and all associated texture images from OpenMVS output.
+    """
+    tex_dir = tex_p.parent
+    mtl_file = None
+
+    if tex_p.is_file():
+        try:
+            with open(tex_p, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if line.startswith("mtllib "):
+                        cand_name = line.split(maxsplit=1)[1].strip()
+                        cand = tex_dir / Path(cand_name).name
+                        if cand.is_file():
+                            mtl_file = cand
+                            break
+        except Exception:
+            pass
+
+    if not mtl_file:
+        cand_mtls = list(tex_dir.glob(f"{tex_p.stem}*.mtl")) or list(tex_dir.glob("*.mtl"))
+        if cand_mtls:
+            mtl_file = cand_mtls[0]
+
+    img_exts = {".jpg", ".jpeg", ".png", ".webp", ".tga", ".bmp", ".tif", ".tiff"}
+    tex_images: List[Path] = []
+
+    if mtl_file and mtl_file.is_file():
+        try:
+            with open(mtl_file, "r", encoding="utf-8", errors="ignore") as mf:
+                for line in mf:
+                    line = line.strip()
+                    if any(line.startswith(prefix) for prefix in ["map_Kd", "map_Ka", "map_bump", "bump"]):
+                        parts = line.split(maxsplit=1)
+                        if len(parts) > 1:
+                            ref_name = Path(parts[1].strip()).name
+                            cand_img = tex_dir / ref_name
+                            if cand_img.is_file() and cand_img not in tex_images:
+                                tex_images.append(cand_img)
+        except Exception as e:
+            logger.warning(f"Error reading MTL {mtl_file}: {e}")
+
+    # Fallback to search any images in directory matching stem or material
+    if not tex_images:
+        for f in tex_dir.iterdir():
+            if f.is_file() and f.suffix.lower() in img_exts:
+                if tex_p.stem in f.stem or "material" in f.name.lower() or "texture" in f.name.lower():
+                    if f not in tex_images:
+                        tex_images.append(f)
+
+    return mtl_file, tex_images
+
+
+def package_textured_model(
+    src_obj_path: Path,
+    dst_obj_path: Path,
+    dst_mtl_path: Path,
+    src_mtl_path: Optional[Path],
+    src_texture_images: List[Path],
+    target_format: str,            # "png" for high-poly, "jpg" for low-poly
+    downscale_max_dim: Optional[int] = None, # e.g. 2048 for low-poly
+    jpg_quality: int = 85,
+) -> None:
+    """
+    Packages a textured OBJ model with an explicitly named MTL and converted/downscaled textures.
+    - For high-poly: converts textures to PNG (lossless).
+    - For low-poly: converts textures to downscaled JPG (web optimized) and ensures MTL is present.
+    """
+    dst_dir = dst_obj_path.parent
+    dst_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Convert/downscale texture maps
+    tex_map_replacements = {}
+    for idx, src_img in enumerate(src_texture_images):
+        suffix = f".{target_format.lower()}"
+        out_tex_name = f"{dst_obj_path.stem}_tex_{idx}{suffix}" if len(src_texture_images) > 1 else f"{dst_obj_path.stem}_texture{suffix}"
+        out_tex_path = dst_dir / out_tex_name
+
+        try:
+            with Image.open(src_img) as img:
+                w, h = img.size
+                if downscale_max_dim and max(w, h) > downscale_max_dim:
+                    scale = downscale_max_dim / max(w, h)
+                    nw = max(1, int(w * scale))
+                    nh = max(1, int(h * scale))
+                    img_out = img.resize((nw, nh), Image.Resampling.LANCZOS)
+                else:
+                    img_out = img.copy()
+
+                if target_format.lower() in ("jpg", "jpeg"):
+                    img_out.convert("RGB").save(str(out_tex_path), format="JPEG", quality=jpg_quality, optimize=True)
+                else:
+                    img_out.save(str(out_tex_path), format="PNG", optimize=True)
+
+            tex_map_replacements[src_img.name] = out_tex_name
+            logger.info(f"Generated {target_format.upper()} texture: {out_tex_name} ({img_out.size[0]}x{img_out.size[1]})")
+        except Exception as e:
+            logger.warning(f"Failed converting texture {src_img}: {e}")
+
+    # 2. Generate destination MTL file
+    mtl_lines = []
+    if src_mtl_path and src_mtl_path.is_file():
+        try:
+            with open(src_mtl_path, "r", encoding="utf-8", errors="ignore") as mf:
+                for line in mf:
+                    clean_l = line.rstrip("\r\n")
+                    # Replace texture image references
+                    replaced = False
+                    for old_name, new_name in tex_map_replacements.items():
+                        if old_name in clean_l:
+                            clean_l = clean_l.replace(old_name, new_name)
+                            replaced = True
+                    # Fallback if map_Kd had path or different name
+                    if not replaced and any(clean_l.strip().startswith(p) for p in ["map_Kd", "map_Ka"]):
+                        if tex_map_replacements:
+                            first_new = list(tex_map_replacements.values())[0]
+                            parts = clean_l.split(maxsplit=1)
+                            clean_l = f"{parts[0]} {first_new}"
+                    mtl_lines.append(clean_l + "\n")
+        except Exception as e:
+            logger.warning(f"Error reading source MTL: {e}")
+
+    # Default MTL template if none was found
+    if not mtl_lines:
+        first_tex = list(tex_map_replacements.values())[0] if tex_map_replacements else f"{dst_obj_path.stem}_texture.{target_format.lower()}"
+        mtl_lines = [
+            f"# Material file for {dst_obj_path.name}\n",
+            "newmtl material_0\n",
+            "Ka 1.000000 1.000000 1.000000\n",
+            "Kd 1.000000 1.000000 1.000000\n",
+            "Ks 0.000000 0.000000 0.000000\n",
+            "d 1.000000\n",
+            "illum 1\n",
+            f"map_Kd {first_tex}\n",
+        ]
+
+    with open(dst_mtl_path, "w", encoding="utf-8") as f:
+        f.writelines(mtl_lines)
+    logger.info(f"Saved material definition: {dst_mtl_path.name}")
+
+    # 3. Write destination OBJ file with correct mtllib directive
+    obj_lines = []
+    has_mtllib = False
+    has_usemtl = False
+
+    with open(src_obj_path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if line.startswith("mtllib "):
+                obj_lines.append(f"mtllib {dst_mtl_path.name}\n")
+                has_mtllib = True
+            elif line.startswith("usemtl "):
+                obj_lines.append(line)
+                has_usemtl = True
+            else:
+                obj_lines.append(line)
+
+    if not has_mtllib:
+        obj_lines.insert(0, f"mtllib {dst_mtl_path.name}\n")
+    if not has_usemtl:
+        obj_lines.insert(1, "usemtl material_0\n")
+
+    with open(dst_obj_path, "w", encoding="utf-8") as f:
+        f.writelines(obj_lines)
+    logger.info(f"Saved packaged OBJ model: {dst_obj_path.name}")
+
+    # Clean up any extraneous temporary files like *.obj.mtl
+    for extra in dst_dir.glob("*.obj.mtl"):
+        try:
+            extra.unlink()
+        except Exception:
+            pass
+
+
 def export_multi_lod_bundle(
     cleaned_mesh_path: str,
     textured_obj_path: Optional[str],
@@ -88,14 +262,14 @@ def export_multi_lod_bundle(
 ) -> Dict[str, Any]:
     """
     Generates all deliverables matching Cloudflare R2 and RunPod specifications:
-      output_dir/obj/high/model_high.obj
-      output_dir/obj/low/model_low.obj
+      output_dir/obj/high/model_high.obj (+ model_high.mtl + PNG texture)
+      output_dir/obj/low/model_low.obj (+ model_low.mtl + downscaled JPG texture)
       output_dir/stl/high_model.stl
       output_dir/stl/low_model.stl
       output_dir/3mf/high_model.3mf
       output_dir/3mf/low_model.3mf
-      output_dir/glb/high_model.glb
-      output_dir/glb/low_model.glb
+      output_dir/glb/high_model.glb (embedded PNG texture)
+      output_dir/glb/low_model.glb (embedded JPG texture)
       output_dir/output.zip
     """
     out_base = Path(output_dir).resolve()
@@ -110,6 +284,7 @@ def export_multi_lod_bundle(
 
     # 1. High-Poly Assets
     high_obj = obj_high_dir / "model_high.obj"
+    high_mtl = obj_high_dir / "model_high.mtl"
     high_stl = stl_dir / "high_model.stl"
     high_3mf = mf_dir / "high_model.3mf"
     high_glb = glb_dir / "high_model.glb"
@@ -127,49 +302,92 @@ def export_multi_lod_bundle(
     except Exception as e:
         logger.warning(f"3MF export warning: {e}")
 
-    # High OBJ and GLB (with textures if available from OpenMVS TextureMesh)
-    if textured_obj_path and Path(textured_obj_path).is_file():
+    # Low-Poly Assets paths
+    low_obj = obj_low_dir / "model_low.obj"
+    low_mtl = obj_low_dir / "model_low.mtl"
+    low_stl = stl_dir / "low_model.stl"
+    low_3mf = mf_dir / "low_model.3mf"
+    low_glb = glb_dir / "low_model.glb"
+
+    has_textures = bool(textured_obj_path and Path(textured_obj_path).is_file())
+
+    if has_textures:
         tex_p = Path(textured_obj_path)
-        # Copy textured OBJ and all associated MTL and texture maps
-        shutil.copy2(tex_p, high_obj)
-        mtl_candidates = list(tex_p.parent.glob(f"{tex_p.stem}*.mtl"))
-        png_candidates = list(tex_p.parent.glob(f"{tex_p.stem}*.png"))
+        src_mtl, src_tex_imgs = find_source_mtl_and_textures(tex_p)
 
-        for mtl in mtl_candidates:
-            shutil.copy2(mtl, obj_high_dir / mtl.name)
-        for png in png_candidates:
-            shutil.copy2(png, obj_high_dir / png.name)
+        # 1. Package High-Poly OBJ with PNG textures (lossless)
+        package_textured_model(
+            src_obj_path=tex_p,
+            dst_obj_path=high_obj,
+            dst_mtl_path=high_mtl,
+            src_mtl_path=src_mtl,
+            src_texture_images=src_tex_imgs,
+            target_format="png",
+            downscale_max_dim=None,
+        )
 
-        # Load textured mesh for GLB export
+        # 2. Decimate high-poly mesh to low-poly OBJ
+        decimate_mesh(
+            input_mesh_path=str(high_obj),
+            output_mesh_path=str(low_obj),
+            target_faces=config.cleaning.target_low_poly_faces,
+        )
+
+        # 3. Package Low-Poly OBJ with downscaled JPG textures + model_low.mtl
+        package_textured_model(
+            src_obj_path=low_obj,
+            dst_obj_path=low_obj,
+            dst_mtl_path=low_mtl,
+            src_mtl_path=high_mtl,
+            src_texture_images=src_tex_imgs,
+            target_format="jpg",
+            downscale_max_dim=2048,
+            jpg_quality=85,
+        )
+
+        # 4. Generate High-Poly GLB from model_high.obj (contains embedded PNG texture)
         try:
-            textured_scene = trimesh.load(str(high_obj), process=False)
-            textured_scene.export(str(high_glb), file_type="glb")
+            textured_high_scene = trimesh.load(str(high_obj), process=False)
+            textured_high_scene.export(str(high_glb), file_type="glb")
             telemetry.record_mesh(str(high_glb))
+            logger.info(f"Exported textured High-Poly GLB (PNG): {high_glb.name}")
         except Exception as ge:
-            logger.warning(f"Textured GLB export warning: {ge}. Using cleaned mesh for GLB.")
+            logger.warning(f"High GLB export warning: {ge}. Using cleaned mesh for GLB.")
             cleaned_trimesh.export(str(high_glb), file_type="glb")
             telemetry.record_mesh(str(high_glb))
 
+        # 5. Generate Low-Poly GLB from model_low.obj (contains embedded downscaled JPG texture)
+        try:
+            textured_low_scene = trimesh.load(str(low_obj), process=False)
+            textured_low_scene.export(str(low_glb), file_type="glb")
+            telemetry.record_mesh(str(low_glb))
+            logger.info(f"Exported textured Low-Poly GLB (JPG): {low_glb.name}")
+        except Exception as ge:
+            logger.warning(f"Low GLB export warning: {ge}. Using low-poly mesh for GLB.")
+            cleaned_trimesh.export(str(low_glb), file_type="glb")
+            telemetry.record_mesh(str(low_glb))
+
         telemetry.record_mesh(str(high_obj))
+        telemetry.record_mesh(str(low_obj))
+
     else:
-        # Fallback to cleaned mesh without textures
+        # Fallback to untextured mesh
         cleaned_trimesh.export(str(high_obj), file_type="obj")
         cleaned_trimesh.export(str(high_glb), file_type="glb")
         telemetry.record_mesh(str(high_obj))
         telemetry.record_mesh(str(high_glb))
 
-    # 2. Low-Poly Assets (Decimated)
-    low_obj = obj_low_dir / "model_low.obj"
-    low_stl = stl_dir / "low_model.stl"
-    low_3mf = mf_dir / "low_model.3mf"
-    low_glb = glb_dir / "low_model.glb"
+        decimate_mesh(
+            input_mesh_path=cleaned_mesh_path,
+            output_mesh_path=str(low_obj),
+            target_faces=config.cleaning.target_low_poly_faces,
+        )
+        loaded_low = trimesh.load(str(low_obj), process=False)
+        loaded_low.export(str(low_glb), file_type="glb")
+        telemetry.record_mesh(str(low_obj))
+        telemetry.record_mesh(str(low_glb))
 
-    decimate_mesh(
-        input_mesh_path=cleaned_mesh_path,
-        output_mesh_path=str(low_obj),
-        target_faces=config.cleaning.target_low_poly_faces,
-    )
-
+    # Low-poly STL and 3MF
     loaded_low = trimesh.load(str(low_obj), process=False)
     if isinstance(loaded_low, trimesh.Scene):
         geoms = [g for g in loaded_low.geometry.values() if isinstance(g, trimesh.Trimesh)]
@@ -178,7 +396,6 @@ def export_multi_lod_bundle(
         low_trimesh = loaded_low
 
     low_trimesh.export(str(low_stl), file_type="stl")
-    telemetry.record_mesh(str(low_obj))
     telemetry.record_mesh(str(low_stl))
 
     try:
@@ -186,12 +403,6 @@ def export_multi_lod_bundle(
         telemetry.record_mesh(str(low_3mf))
     except Exception as e:
         logger.warning(f"Low-poly 3MF export warning: {e}")
-
-    try:
-        low_trimesh.export(str(low_glb), file_type="glb")
-        telemetry.record_mesh(str(low_glb))
-    except Exception as e:
-        logger.warning(f"Low-poly GLB export warning: {e}")
 
     # 3. Create output.zip containing the entire tree
     zip_path = out_base / config.zip_name
