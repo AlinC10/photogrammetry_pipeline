@@ -29,39 +29,120 @@ DEFAULT_FOCAL_LENGTH_MM: float = 6.0  # Common M12 lens default
 # OpenMVS Binary Locator
 # ==============================================================================
 
-def find_openmvs_binary(name: str) -> Optional[str]:
+def find_openmvs_binary(name: str, custom_dir: Optional[str] = None) -> Optional[str]:
     """
     Locates an OpenMVS executable across system PATH, custom environment variables,
-    and standard installation directories on Windows and Linux.
+    CLI argument, and standard installation directories on Windows and Linux.
+    Automatically checks subfolders like 'bin/' and versioned directories.
     """
-    exe_name = f"{name}.exe" if sys.platform == "win32" else name
+    exe_names = [f"{name}.exe", name] if sys.platform == "win32" else [name]
 
-    # 1. Custom ENV directory
+    # 1. Custom directory passed via argument or OPENMVS_BIN_DIR env var
+    search_dirs = []
+    if custom_dir:
+        search_dirs.append(Path(custom_dir))
     env_dir = os.environ.get("OPENMVS_BIN_DIR")
     if env_dir:
-        candidate = Path(env_dir) / exe_name
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate.resolve())
+        search_dirs.append(Path(env_dir))
+
+    for d in search_dirs:
+        for ename in exe_names:
+            for cand in [
+                d / ename,
+                d / "bin" / ename,
+                d / "vc17" / "x64" / "Release" / ename,
+                d / "vc16" / "x64" / "Release" / ename,
+                d / "x64" / "Release" / ename,
+                d / "x64" / ename,
+            ]:
+                if cand.is_file():
+                    return str(cand.resolve())
+            # Recursive check inside custom directory
+            try:
+                for cand in d.glob(f"**/{ename}"):
+                    if cand.is_file():
+                        return str(cand.resolve())
+            except Exception:
+                pass
 
     # 2. Check system PATH
-    which_path = shutil.which(exe_name)
-    if which_path:
-        return str(Path(which_path).resolve())
+    for ename in exe_names:
+        which_path = shutil.which(ename)
+        if which_path:
+            return str(Path(which_path).resolve())
 
-    # 3. Known fallback paths
+    # 3. Known fallback paths (Windows & Linux)
     fallback_dirs = [
+        # Linux
         "/usr/local/bin/OpenMVS",
-        "/opt/openmvs/bin",
         "/usr/local/bin",
-        "C:\\Program Files\\OpenMVS",
-        "C:\\OpenMVS",
+        "/opt/openmvs/bin",
         str(Path.home() / "openMVS" / "bin"),
         str(Path.home() / "openMVS_build" / "bin"),
+        # Windows Visual Studio Builds (vc17 = VS2022, vc16 = VS2019)
+        "C:\\OpenMVS\\vc17\\x64\\Release",
+        "C:\\openMVS\\vc17\\x64\\Release",
+        "C:\\OpenMVS\\vc16\\x64\\Release",
+        "C:\\openMVS\\vc16\\x64\\Release",
+        "C:\\OpenMVS\\x64\\Release",
+        "C:\\openMVS\\x64\\Release",
+        # Windows Standard & Bin
+        "C:\\OpenMVS",
+        "C:\\OpenMVS\\bin",
+        "C:\\openMVS",
+        "C:\\openMVS\\bin",
+        "C:\\openMVS_v2.4.0",
+        "C:\\openMVS_v2.4.0\\bin",
+        "C:\\openMVS_v2.4.0_win64",
+        "C:\\openMVS_v2.4.0_win64\\bin",
+        "C:\\openMVS_v2.4.0_win64\\vc17\\x64\\Release",
+        "C:\\openMVS_v2.3.0",
+        "C:\\openMVS_v2.3.0\\bin",
+        "C:\\Program Files\\OpenMVS",
+        "C:\\Program Files\\OpenMVS\\bin",
+        # Windows Drive D (project drive)
+        "D:\\OpenMVS\\vc17\\x64\\Release",
+        "D:\\openMVS\\vc17\\x64\\Release",
+        "D:\\OpenMVS",
+        "D:\\OpenMVS\\bin",
+        "D:\\openMVS",
+        "D:\\openMVS\\bin",
+        "D:\\openMVS_v2.4.0",
+        "D:\\openMVS_v2.4.0\\bin",
+        "D:\\openMVS_v2.4.0_win64",
+        "D:\\openMVS_v2.4.0_win64\\bin",
     ]
     for d in fallback_dirs:
-        candidate = Path(d) / exe_name
-        if candidate.is_file():
-            return str(candidate.resolve())
+        for ename in exe_names:
+            candidate = Path(d) / ename
+            if candidate.is_file():
+                return str(candidate.resolve())
+
+    # 4. Glob search on drive roots (C:\ and D:\) for any openmvs folder recursively
+    if sys.platform == "win32":
+        for drive in ["C:\\", "D:\\"]:
+            d_path = Path(drive)
+            if not d_path.is_dir():
+                continue
+            try:
+                for match_dir in d_path.glob("*[Oo]pen[Mm][Vv][Ss]*"):
+                    if match_dir.is_dir():
+                        for ename in exe_names:
+                            # Direct check common subpaths
+                            for cand in [
+                                match_dir / "vc17" / "x64" / "Release" / ename,
+                                match_dir / "x64" / "Release" / ename,
+                                match_dir / "bin" / ename,
+                                match_dir / ename,
+                            ]:
+                                if cand.is_file():
+                                    return str(cand.resolve())
+                            # Recursive fallback
+                            for cand in match_dir.glob(f"**/{ename}"):
+                                if cand.is_file():
+                                    return str(cand.resolve())
+            except Exception:
+                pass
 
     return None
 
@@ -90,11 +171,11 @@ class OpenMVSConfig:
     def __post_init__(self):
         if self.bin_dir:
             os.environ["OPENMVS_BIN_DIR"] = str(self.bin_dir)
-        self.interface_colmap = self.interface_colmap or find_openmvs_binary("InterfaceCOLMAP")
-        self.densify_point_cloud = self.densify_point_cloud or find_openmvs_binary("DensifyPointCloud")
-        self.reconstruct_mesh = self.reconstruct_mesh or find_openmvs_binary("ReconstructMesh")
-        self.refine_mesh = self.refine_mesh or find_openmvs_binary("RefineMesh")
-        self.texture_mesh = self.texture_mesh or find_openmvs_binary("TextureMesh")
+        self.interface_colmap = self.interface_colmap or find_openmvs_binary("InterfaceCOLMAP", self.bin_dir)
+        self.densify_point_cloud = self.densify_point_cloud or find_openmvs_binary("DensifyPointCloud", self.bin_dir)
+        self.reconstruct_mesh = self.reconstruct_mesh or find_openmvs_binary("ReconstructMesh", self.bin_dir)
+        self.refine_mesh = self.refine_mesh or find_openmvs_binary("RefineMesh", self.bin_dir)
+        self.texture_mesh = self.texture_mesh or find_openmvs_binary("TextureMesh", self.bin_dir)
 
     def validate(self) -> list[str]:
         """Returns missing binaries if any."""

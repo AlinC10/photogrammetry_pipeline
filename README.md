@@ -129,6 +129,7 @@ You can run Turntable Studio directly on Windows without Docker:
 | `--input_dir`, `-i` | `str` | `./input_images` | Path to images directory |
 | `--output_dir`, `-o` | `str` | `./output` | Path for deliverables |
 | `--rig_mode` | `flag` | `False` | Enables dual-camera rig layout (`rig/0`, `rig/1`) |
+| `--openmvs_bin_dir`, `--bin_dir` | `str` | `None` | Path to OpenMVS directory (e.g. `C:\OpenMVS` or `C:\OpenMVS\bin`) |
 | `--resolution_level` | `int` | `1` | OpenMVS downscale (`0` = 4K full, `1` = 2K, `2` = 1K) |
 | `--step_deg` | `float` | `18.0` | Turntable rotation step in degrees (20 steps/turn) |
 | `--mock_openmvs` | `flag` | `False` | Simulates OpenMVS for testing without binaries |

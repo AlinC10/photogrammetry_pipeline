@@ -80,6 +80,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         output_dir=output_dir,
         rig_mode=rig_mode,
         openmvs=OpenMVSConfig(
+            bin_dir=job.get("openmvs_bin_dir"),
             resolution_level=job.get("resolution_level", 1),
             smooth_mesh=job.get("smooth_mesh", 2),
             min_resolution=job.get("min_resolution", 640),
@@ -180,8 +181,23 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                 runner.run_reconstruct_mesh()
 
             # Identify raw reconstructed surface geometry (.ply or .obj)
-            if not Path(raw_reconstructed_mesh).is_file():
-                raw_reconstructed_mesh = str(openmvs_dir / "scene_mesh.obj")
+            candidate_raw_meshes = [
+                openmvs_dir / "scene_mesh.ply",
+                openmvs_dir / "scene_mesh.obj",
+                openmvs_dir / "scene_dense_mesh.ply",
+                openmvs_dir / "scene_dense_mesh.obj",
+            ]
+            raw_reconstructed_mesh = None
+            for cand in candidate_raw_meshes:
+                if cand.is_file():
+                    raw_reconstructed_mesh = str(cand)
+                    break
+            if not raw_reconstructed_mesh:
+                any_meshes = list(openmvs_dir.glob("*.ply")) + list(openmvs_dir.glob("*.obj"))
+                if any_meshes:
+                    raw_reconstructed_mesh = str(any_meshes[0])
+                else:
+                    raw_reconstructed_mesh = str(openmvs_dir / "scene_mesh.ply")
 
             # ----------------------------------------------------------------------
             # STEP 5: Watertight Base Slicing & Mesh Cleaning (BEFORE Texturing!)
@@ -263,6 +279,7 @@ def parse_args():
     parser.add_argument("--input_dir", "-i", default="./input_images", help="Path to input images directory")
     parser.add_argument("--output_dir", "-o", default="./output", help="Path to output deliverables directory")
     parser.add_argument("--rig_mode", action="store_true", help="Enable rig mode (input_images/rig/0 and rig/1)")
+    parser.add_argument("--openmvs_bin_dir", "--bin_dir", default=None, help="Custom path to OpenMVS binaries directory (e.g. C:\\OpenMVS or C:\\openMVS\\bin)")
     parser.add_argument("--resolution_level", type=int, default=1, help="OpenMVS densify downscale (0=full, 1=2x, 2=4x)")
     parser.add_argument("--step_deg", type=float, default=18.0, help="Turntable step angle in degrees")
     parser.add_argument("--mock_openmvs", action="store_true", help="Simulate OpenMVS for fast testing")
@@ -275,6 +292,7 @@ def main():
         "input_dir": args.input_dir,
         "output_dir": args.output_dir,
         "rig_mode": args.rig_mode,
+        "openmvs_bin_dir": args.openmvs_bin_dir,
         "resolution_level": args.resolution_level,
         "step_deg": args.step_deg,
         "mock_openmvs": args.mock_openmvs,

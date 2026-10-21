@@ -54,6 +54,22 @@ class TestBridgeSFM(unittest.TestCase):
         self.assertEqual(len(dist), 5)
         self.assertAlmostEqual(dist[0], 0.01)
 
+    def test_camera_matrix_with_offset_principal_point(self):
+        intr = {
+            "intrinsicId": "1",
+            "width": 4056,
+            "height": 3040,
+            "sensorWidth": 6.287,
+            "focalLength": 6.0,
+            "principalPoint": ["1.25", "-2.50"],  # AliceVision offset from (w/2, h/2)
+            "distortionParams": [0.0],
+        }
+        K, dist, w, h = build_camera_matrix_and_distortion(intr)
+        self.assertEqual(w, 4056)
+        self.assertEqual(h, 3040)
+        self.assertAlmostEqual(K[0, 2], 2028.0 + 1.25, places=2)
+        self.assertAlmostEqual(K[1, 2], 1520.0 - 2.50, places=2)
+
     def test_quaternion_ordering_and_translation(self):
         # 90-degree rotation around Y axis
         R = np.array([
@@ -105,7 +121,7 @@ class TestBridgeSFM(unittest.TestCase):
                 "pose": {
                     "transform": {
                         "rotation": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-                        "center": [0.0, 0.0, 0.35],
+                        "center": [0.0, 0.0, -0.35],
                     }
                 }
             }],
@@ -127,6 +143,9 @@ class TestBridgeSFM(unittest.TestCase):
         self.assertTrue((colmap_out / "cameras.txt").is_file())
         self.assertTrue((colmap_out / "images.txt").is_file())
         self.assertTrue((colmap_out / "points3D.txt").is_file())
+        self.assertTrue((colmap_out / "sparse" / "cameras.txt").is_file())
+        self.assertTrue((colmap_out / "sparse" / "images.txt").is_file())
+        self.assertTrue((colmap_out / "sparse" / "points3D.txt").is_file())
 
         with open(colmap_out / "cameras.txt") as f:
             cam_content = f.read()
@@ -139,6 +158,86 @@ class TestBridgeSFM(unittest.TestCase):
         with open(colmap_out / "points3D.txt") as f:
             pts_content = f.read()
             self.assertIn("128 128 128", pts_content)
+
+    def test_multiview_turntable_tracks(self):
+        test_path = Path(self.test_dir) / "multiview"
+        test_path.mkdir(parents=True, exist_ok=True)
+
+        # Create dummy image
+        img_file = test_path / "cam_img.jpg"
+        cv2.imwrite(str(img_file), np.zeros((3040, 4056, 3), dtype=np.uint8))
+
+        # Generate 4 turntable camera poses around the origin looking inward
+        sfm = {
+            "version": ["1", "0", "0"],
+            "intrinsics": [{
+                "intrinsicId": "0",
+                "width": 4056,
+                "height": 3040,
+                "sensorWidth": 6.287,
+                "focalLength": 6.0,
+                "principalPoint": ["0.5", "-1.2"],
+                "distortionParams": [0.0, 0.0],
+            }],
+            "views": [],
+            "poses": [],
+        }
+
+        dist = 0.35
+        for i in range(4):
+            angle = i * (np.pi / 2.0)
+            C = np.array([dist * np.sin(angle), 0.08, dist * np.cos(angle)])
+            # Camera orientation looking towards origin in OpenCV coords (X right, Y down, Z forward)
+            forward = -C / np.linalg.norm(C)
+            down = np.array([0.0, 1.0, 0.0])
+            right = np.cross(down, forward)
+            right /= np.linalg.norm(right)
+            down_cam = np.cross(forward, right)
+            R = np.vstack([right, down_cam, forward])
+
+            pose_id = str(100 + i)
+            view_id = str(200 + i)
+
+            sfm["views"].append({
+                "viewId": view_id,
+                "poseId": pose_id,
+                "intrinsicId": "0",
+                "path": str(img_file),
+            })
+            sfm["poses"].append({
+                "poseId": pose_id,
+                "pose": {
+                    "transform": {
+                        "rotation": R.flatten(order="F").tolist(),
+                        "center": C.tolist(),
+                    }
+                }
+            })
+
+        sfm_file = test_path / "cameras_known.sfm"
+        with open(sfm_file, "w") as f:
+            json.dump(sfm, f)
+
+        colmap_out = test_path / "colmap"
+        undist_out = test_path / "undistorted"
+
+        res = convert_sfm_to_colmap(
+            sfm_json_path=str(sfm_file),
+            output_colmap_dir=str(colmap_out),
+            undistorted_images_dir=str(undist_out),
+        )
+
+        self.assertEqual(res["registered_views"], 4)
+        # Verify valid proxy points with multi-view coverage
+        with open(colmap_out / "points3D.txt") as f:
+            lines = [l for l in f if not l.startswith("#")]
+            self.assertGreater(len(lines), 100)
+            # Verify tracks in points3D have at least 2 camera views
+            for line in lines:
+                parts = line.strip().split()
+                # Line format: id, x, y, z, r, g, b, err, (img_id, pt2d_idx)...
+                track_elements = parts[8:]
+                self.assertGreaterEqual(len(track_elements), 4)  # at least 2 pairs (img_id, pt2d_idx)
 
 
 if __name__ == "__main__":
