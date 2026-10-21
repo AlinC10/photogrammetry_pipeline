@@ -167,6 +167,7 @@ class OpenMVSConfig:
     min_point_distance: float = 0.5   # mm distance filter
     texture_resolution: int = 4096    # high-res texture atlas
     low_poly_texture_res: int = 2048  # low-poly texture atlas
+    empty_color: int = 0              # 0 = black (prevents neon orange on unobserved/bottom faces)
 
     def __post_init__(self):
         if self.bin_dir:

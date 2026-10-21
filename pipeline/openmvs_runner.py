@@ -234,6 +234,7 @@ class OpenMVSRunner:
             "-o", str(out_file),
             "--export-type", "obj",
             "--resolution-level", "0",
+            "--empty-color", str(self.config.empty_color),
             "-v", "2",
         ]
         if mesh_file and Path(mesh_file).is_file():
