@@ -100,7 +100,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         alicevision=AliceVisionConfig(
             bin_dir=alicevision_bin,
             texture_side=job.get("texture_resolution", 4096),
-            unwrap_method=job.get("unwrap_method", "LSCM"),
+            unwrap_method=job.get("unwrap_method", "Basic"),
             use_udim=job.get("use_udim", False),
             fill_holes=job.get("fill_holes", True),
             correct_ev=job.get("correct_ev", True),
@@ -374,6 +374,7 @@ def parse_args():
     parser.add_argument("--local_seam_leveling", type=int, default=1, help="OpenMVS local seam edge blending (1=enabled, 0=disabled)")
     parser.add_argument("--target_low_poly_faces", type=int, default=50000, help="Target face count for low-poly mesh (default: 50,000)")
     parser.add_argument("--texturing_engine", choices=["alicevision", "openmvs"], default="alicevision", help="Texturing engine: 'alicevision' (LSCM, multi-band, zero holes) or 'openmvs'")
+    parser.add_argument("--unwrap_method", choices=["Basic", "LSCM", "ABF"], default="Basic", help="AliceVision UV unwrapping method: 'Basic' (fast & robust on high-poly), 'LSCM', or 'ABF'")
     parser.add_argument("--alicevision_bin", default=None, help="Custom path to AliceVision bin directory or aliceVision_texturing executable (e.g. C:\\Meshroom\\aliceVision\\bin)")
     parser.add_argument("--mock_openmvs", action="store_true", help="Simulate OpenMVS for fast testing")
     return parser.parse_args()
@@ -386,6 +387,7 @@ def main():
         "output_dir": args.output_dir,
         "rig_mode": args.rig_mode,
         "texturing_engine": args.texturing_engine,
+        "unwrap_method": args.unwrap_method,
         "alicevision_bin": args.alicevision_bin,
         "openmvs_bin_dir": args.openmvs_bin_dir,
         "resolution_level": args.resolution_level,

@@ -227,7 +227,7 @@ class AliceVisionConfig:
     bin_dir: Optional[str] = None
     texturing_bin: Optional[str] = None
     texture_side: int = 4096
-    unwrap_method: str = "LSCM"        # LSCM (<=600k faces), ABF, Basic
+    unwrap_method: str = "Basic"       # Basic (fast, robust on high-poly), LSCM, ABF
     use_udim: bool = False             # False = single standard (0,1) UV atlas for maximum 3D software compatibility
     fill_holes: bool = True            # Inpainting for texture holes (eliminates black spots)
     correct_ev: bool = True            # Exposure compensation across camera angles
