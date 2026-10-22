@@ -30,7 +30,7 @@ def build_camera_matrix_and_distortion(
     w = int(intr["width"])
     h = int(intr["height"])
     sensor_w = float(intr.get("sensorWidth") or 6.287)
-    focal_mm = float(intr.get("focalLength") or 6.0)
+    focal_mm = float(intr.get("focalLength") or 3.9)
     pixel_ratio = float(intr.get("pixelRatio") or 1.0)
 
     # Calculate focal length in pixels

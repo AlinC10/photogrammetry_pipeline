@@ -24,6 +24,7 @@ logging.basicConfig(
 logger = logging.getLogger("TurntableStudio")
 
 from pipeline.alicevision_runner import AliceVisionRunner, find_alicevision_binary
+from pipeline.texrecon_runner import TexReconRunner, find_texrecon_binary
 from pipeline.bridge_sfm import convert_sfm_to_colmap
 from pipeline.camera_init import (
     generate_camera_init_sfm,
@@ -32,6 +33,7 @@ from pipeline.camera_init import (
 )
 from pipeline.config import (
     AliceVisionConfig,
+    TexReconConfig,
     MeshCleaningConfig,
     OpenMVSConfig,
     PipelineConfig,
@@ -76,19 +78,38 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
     logger.info(f"Output Directory : {output_dir}")
     logger.info(f"Rig Mode Enabled : {rig_mode}")
 
-    texturing_engine = job.get("texturing_engine", "alicevision")
+    texturing_engine = job.get("texturing_engine", "texrecon")
+    texrecon_bin = job.get("texrecon_bin") or job.get("texrecon_bin_dir")
     alicevision_bin = job.get("alicevision_bin") or job.get("alicevision_bin_dir")
 
+    # If texrecon is requested, verify availability or fall back gracefully
+    if texturing_engine == "texrecon":
+        detected_tr = find_texrecon_binary(custom_dir=texrecon_bin)
+        if not detected_tr and not job.get("mock_openmvs"):
+            logger.warning(
+                "texrecon executable not detected on system. "
+                "Checking for AliceVision as fallback..."
+            )
+            detected_av = find_alicevision_binary("aliceVision_texturing", custom_dir=alicevision_bin)
+            if detected_av:
+                logger.info(f"Using AliceVision Texturing as fallback: {detected_av}")
+                texturing_engine = "alicevision"
+            else:
+                logger.warning("Defaulting to OpenMVS texturing engine.")
+                texturing_engine = "openmvs"
+        elif detected_tr:
+            logger.info(f"Using mvs-texturing (texrecon): {detected_tr}")
+
     # If AliceVision is requested but binary is not found anywhere, warn and fall back to openmvs
-    if texturing_engine == "alicevision":
+    elif texturing_engine == "alicevision":
         detected_av = find_alicevision_binary("aliceVision_texturing", custom_dir=alicevision_bin)
-        if not detected_av:
+        if not detected_av and not job.get("mock_openmvs"):
             logger.warning(
                 "aliceVision_texturing executable not detected on system. "
                 "Defaulting to OpenMVS texturing engine."
             )
             texturing_engine = "openmvs"
-        else:
+        elif detected_av:
             logger.info(f"Using AliceVision Texturing: {detected_av}")
 
     # Build Configuration
@@ -97,6 +118,13 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         output_dir=output_dir,
         rig_mode=rig_mode,
         texturing_engine=texturing_engine,
+        texrecon=TexReconConfig(
+            bin_dir=texrecon_bin,
+            data_term=job.get("data_term", "gmi"),
+            smoothness_term=job.get("smoothness_term", "potts"),
+            outlier_removal=job.get("outlier_removal", "gauss_damping"),
+            num_threads=job.get("num_threads"),
+        ),
         alicevision=AliceVisionConfig(
             bin_dir=alicevision_bin,
             texture_side=job.get("texture_resolution", 4096),
@@ -122,6 +150,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         turntable=TurntableConfig(
             step_deg=job.get("step_deg", 18.0),
             tag_scale=job.get("tag_scale", 1.0),
+            default_focal_mm=job.get("focal_length_mm", 3.9),
         ),
         cleaning=MeshCleaningConfig(
             slice_y_m=job.get("slice_y_m", 0.003),
@@ -139,6 +168,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             views, intrinsics, name_regex = scan_input_directory(
                 input_dir=config.input_dir,
                 rig_mode=config.rig_mode,
+                default_focal_mm=job.get("focal_length_mm", 3.9),
             )
             config.turntable.name_regex = name_regex
 
@@ -275,7 +305,29 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             # ----------------------------------------------------------------------
             # STEP 4.4: Texture Mesh on Watertight Sealed Geometry
             # ----------------------------------------------------------------------
-            if config.texturing_engine == "alicevision":
+            if config.texturing_engine == "texrecon":
+                try:
+                    with telemetry.step("4.4 mvs-texturing (texrecon)"):
+                        tr_runner = TexReconRunner(
+                            config=config.texrecon,
+                            work_dir=str(out_path / "texrecon"),
+                        )
+                        textured_obj_path, _ = tr_runner.run_texturing(
+                            sfm_data_path=cameras_known_sfm,
+                            input_mesh_path=cleaned_obj_path,
+                            images_folder=undistorted_dir,
+                            mock_mode=job.get("mock_openmvs", False),
+                        )
+                except Exception as tr_err:
+                    logger.warning(
+                        f"mvs-texturing failed ({tr_err}). Falling back to OpenMVS texturing."
+                    )
+                    with telemetry.step("4.4 OpenMVS TextureMesh (Fallback)"):
+                        _, textured_obj_path = runner.run_texture_mesh(
+                            input_mvs=mvs_project,
+                            mesh_file=cleaned_obj_path,
+                        )
+            elif config.texturing_engine == "alicevision":
                 try:
                     with telemetry.step("4.4 AliceVision Texturing (Multi-Band & LSCM)"):
                         av_runner = AliceVisionRunner(
@@ -317,7 +369,19 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                     output_obj_path=cleaned_obj_path,
                     config=config.cleaning,
                 )
-            textured_obj_path = cleaned_obj_path
+            if config.texturing_engine == "texrecon":
+                tr_runner = TexReconRunner(
+                    config=config.texrecon,
+                    work_dir=str(out_path / "texrecon"),
+                )
+                textured_obj_path, _ = tr_runner.run_texturing(
+                    sfm_data_path=cameras_known_sfm,
+                    input_mesh_path=cleaned_obj_path,
+                    images_folder=undistorted_dir,
+                    mock_mode=True,
+                )
+            else:
+                textured_obj_path = cleaned_obj_path
 
         # ----------------------------------------------------------------------
         # STEP 6: Multi-LOD Asset Packaging & Cloud Archive (output.zip)
@@ -366,6 +430,7 @@ def parse_args():
     parser.add_argument("--rig_mode", action="store_true", help="Enable rig mode (input_images/rig/0 and rig/1)")
     parser.add_argument("--openmvs_bin_dir", "--bin_dir", default=None, help="Custom path to OpenMVS binaries directory (e.g. C:\\OpenMVS\\vc17\\x64\\Release)")
     parser.add_argument("--resolution_level", type=int, default=1, help="OpenMVS densify downscale (0=full 4K, 1=2x 2K, 2=4x 1K)")
+    parser.add_argument("--focal_length_mm", "--focal_mm", type=float, default=3.9, help="Camera lens focal length in mm (default: 3.9 for Sony IMX477 M12 lens)")
     parser.add_argument("--step_deg", type=float, default=18.0, help="Turntable step angle in degrees (default: 18.0 for 20 steps)")
     parser.add_argument("--resume", action="store_true", help="Resume from existing OpenMVS dense cloud or mesh if available")
     parser.add_argument("--cost_smoothness_ratio", type=float, default=1.0, help="OpenMVS texturing smoothness ratio (1.0 = large continuous charts)")
@@ -374,7 +439,11 @@ def parse_args():
     parser.add_argument("--global_seam_leveling", type=int, default=0, help="OpenMVS global Poisson seam leveling (0=disabled to avoid dark bleeding, 1=enabled)")
     parser.add_argument("--local_seam_leveling", type=int, default=1, help="OpenMVS local seam edge blending (1=enabled, 0=disabled)")
     parser.add_argument("--target_low_poly_faces", type=int, default=50000, help="Target face count for low-poly mesh (default: 50,000)")
-    parser.add_argument("--texturing_engine", choices=["alicevision", "openmvs"], default="alicevision", help="Texturing engine: 'alicevision' (LSCM, multi-band, zero holes) or 'openmvs'")
+    parser.add_argument("--texturing_engine", choices=["texrecon", "alicevision", "openmvs"], default="texrecon", help="Texturing engine: 'texrecon' (mvs-texturing, default), 'alicevision', or 'openmvs'")
+    parser.add_argument("--texrecon_bin", default=None, help="Custom path to texrecon executable or directory (e.g. C:\\texrecon\\bin or /usr/local/bin/texrecon)")
+    parser.add_argument("--data_term", choices=["gmi", "color"], default="gmi", help="texrecon data term: 'gmi' (default) or 'color'")
+    parser.add_argument("--smoothness_term", default="potts", help="texrecon smoothness term (default: 'potts')")
+    parser.add_argument("--outlier_removal", choices=["gauss_damping", "none", "gauss_clamping"], default="gauss_damping", help="texrecon outlier removal (default: 'gauss_damping')")
     parser.add_argument("--unwrap_method", choices=["Basic", "LSCM", "ABF"], default="Basic", help="AliceVision UV unwrapping method: 'Basic' (fast & robust on high-poly), 'LSCM', or 'ABF'")
     parser.add_argument("--visibility_remapping_method", choices=["MeshItself", "PullPush", "Pull", "Push"], default="MeshItself", help="AliceVision visibility remapping: 'MeshItself' (direct mesh raycasting) or 'PullPush'")
     parser.add_argument("--alicevision_bin", default=None, help="Custom path to AliceVision bin directory or aliceVision_texturing executable (e.g. C:\\Meshroom\\aliceVision\\bin)")
@@ -389,10 +458,15 @@ def main():
         "output_dir": args.output_dir,
         "rig_mode": args.rig_mode,
         "texturing_engine": args.texturing_engine,
+        "texrecon_bin": args.texrecon_bin,
+        "data_term": args.data_term,
+        "smoothness_term": args.smoothness_term,
+        "outlier_removal": args.outlier_removal,
         "unwrap_method": args.unwrap_method,
         "visibility_remapping_method": args.visibility_remapping_method,
         "alicevision_bin": args.alicevision_bin,
         "openmvs_bin_dir": args.openmvs_bin_dir,
+        "focal_length_mm": args.focal_length_mm,
         "resolution_level": args.resolution_level,
         "step_deg": args.step_deg,
         "resume": args.resume,

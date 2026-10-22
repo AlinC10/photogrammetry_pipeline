@@ -8,13 +8,19 @@ Turntable Studio is a high-precision, studio-grade 3D photogrammetry pipeline de
 
 ```mermaid
 flowchart TD
-    A["Input Images<br/>(Flat or rig/0 & rig/1)"] --> B["1. CameraInit<br/>(Extract EXIF / IMX477 presets)"]
+    A["Input Images<br/>(Flat or rig/0 & rig/1)"] --> B["1. CameraInit<br/>(IMX477 3.9mm preset / EXIF)"]
     B --> C["2. TurntablePoses<br/>(Rigidly LOCKED Poses & Calibration)"]
     C --> D["3. Bridge SFM<br/>(OpenCV Undistort & COLMAP Exporter)"]
-    D --> E["4. OpenMVS Pipeline<br/>(InterfaceCOLMAP &rarr; Densify &rarr; Reconstruct &rarr; Texture)"]
+    D --> E["4. OpenMVS Geometry<br/>(InterfaceCOLMAP &rarr; Densify &rarr; ReconstructMesh)"]
     E --> F["5. Watertight Mesh Cleaner<br/>(Planar Slice at 3mm &rarr; Skirt &rarr; Ear-Clipping Base)"]
-    F --> G["6. Multi-LOD Exporter<br/>(OBJ, STL, 3MF, Draco GLB & output.zip)"]
-    G --> H["7. Telemetry & Stats<br/>(Peak RAM, Peak VRAM, per-step timing, stats.json)"]
+    F --> G{"Texturing Engine Selection"}
+    G -->|Default / Recommended| H1["mvs-texturing (texrecon)<br/>• MRF Graph-Cut + GMI<br/>• Poisson Global & Local Seam Leveling"]
+    G -->|Multi-Band LSCM| H2["AliceVision Texturing<br/>• Frequency decomposition"]
+    G -->|Fast Built-in| H3["OpenMVS TextureMesh<br/>• Direct mesh texturing"]
+    H1 --> I["6. Multi-LOD Exporter<br/>(OBJ, STL, 3MF, Draco GLB & output.zip)"]
+    H2 --> I
+    H3 --> I
+    I --> J["7. Telemetry & Stats<br/>(Peak RAM, Peak VRAM, per-step timing, stats.json)"]
 ```
 
 ---
@@ -107,24 +113,26 @@ docker run --gpus all --rm \
 
 You can run Turntable Studio directly on Windows without Docker:
 
-1. **Download OpenMVS for Windows:**
-   - Download the latest pre-compiled Windows x64 release from [OpenMVS Releases](https://github.com/cdcseacave/openMVS/releases) (e.g. `openMVS_v2.4.0_win64.zip`).
-   - Extract it to `C:\OpenMVS`. The pipeline automatically scans all standard subfolders:
-     * `C:\OpenMVS\vc17\x64\Release` (Visual Studio 2022 release)
-     * `C:\OpenMVS\vc16\x64\Release` (Visual Studio 2019 release)
+1. **Install OpenMVS and Optional Texturing Engines:**
+   - **OpenMVS:** Download the latest pre-compiled Windows x64 release from [OpenMVS Releases](https://github.com/cdcseacave/openMVS/releases) (e.g. `openMVS_v2.4.0_win64.zip`) and extract it to `C:\OpenMVS`. The pipeline automatically scans subfolders:
+     * `C:\OpenMVS\vc17\x64\Release` (Visual Studio 2022)
+     * `C:\OpenMVS\vc16\x64\Release` (Visual Studio 2019)
      * `C:\OpenMVS\bin`
-     * Or directly `C:\OpenMVS`
-   - You can also point directly to your binary folder via the CLI argument `--openmvs_bin_dir "C:\OpenMVS\vc17\x64\Release"` or set the environment variable:
-     ```powershell
-     $env:OPENMVS_BIN_DIR = "C:\OpenMVS\vc17\x64\Release"
-     ```
+   - **mvs-texturing (`texrecon` - Recommended):** Extract `texrecon.exe` and its OpenMP DLLs to `C:\texrecon\bin` or specify `--texrecon_bin "C:\texrecon\bin"`.
+   - **AliceVision (Alternative):** If you have Meshroom installed (e.g. `D:\Meshroom-2025.1.0`), point to its binary folder with `--alicevision_bin "D:\Meshroom-2025.1.0\aliceVision\bin"`.
 
 2. **Run the Python Pipeline:**
    ```powershell
-   # Standard full execution (dual-camera rig)
-   python main.py --input_dir .\input_images --output_dir .\output --rig_mode
+   # Default Studio Pipeline (mvs-texturing + IMX477 3.9mm lens)
+   python main.py --input_dir .\input_images --output_dir .\output --rig_mode --focal_length_mm 3.9
 
-   # Fast resume (reuses dense point cloud / reconstructed mesh)
+   # Run with AliceVision Texturing (Multi-Band frequency blending)
+   python main.py --texturing_engine alicevision --alicevision_bin "D:\Meshroom-2025.1.0\aliceVision\bin" --rig_mode
+
+   # Run with OpenMVS TextureMesh
+   python main.py --texturing_engine openmvs --openmvs_bin_dir "C:\OpenMVS\vc17\x64\Release" --rig_mode
+
+   # Fast resume (reuses existing dense point cloud and mesh, running only texturing and export)
    python main.py --resume
    ```
 
@@ -132,21 +140,44 @@ You can run Turntable Studio directly on Windows without Docker:
 
 ## 6. CLI Arguments & Configuration
 
+### A. I/O & Execution Modes
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `--input_dir`, `--input`, `-i` | `str` | `./input_images` | Path to images directory |
 | `--output_dir`, `--output`, `-o` | `str` | `./output` | Path for deliverables |
 | `--rig_mode` | `flag` | `False` | Enables dual-camera rig layout (`rig/0`, `rig/1`) |
-| `--openmvs_bin_dir`, `--bin_dir` | `str` | `None` | Path to OpenMVS binaries directory |
-| `--resolution_level` | `int` | `1` | OpenMVS densify downscale (`0` = 4K full, `1` = 2K, `2` = 4K) |
-| `--step_deg` | `float` | `18.0` | Turntable rotation step in degrees (20 steps/turn) |
 | `--resume` | `flag` | `False` | Skips densification/reconstruction if point cloud/mesh already exists |
-| `--cost_smoothness_ratio` | `float` | `1.0` | Texturing data-to-smoothness weight (`1.0` prevents chart confetti) |
-| `--empty_color` | `int` | `0` | Decimal RGB fill for unobserved faces (`0` = Black, `16744231` = Orange) |
-| `--global_seam_leveling` | `int` | `0` | Poisson global leveling (`0` disables dark background bleeding) |
-| `--local_seam_leveling` | `int` | `1` | Local boundary edge smoothing across texture charts |
+| `--mock_openmvs` | `flag` | `False` | Simulates OpenMVS and texturing for fast unit/smoke testing |
+
+### B. Camera Optics & Calibration
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--focal_length_mm`, `--focal_mm` | `float` | `3.9` | Camera lens focal length in mm (calibrated for IMX477 M12 lens) |
+| `--step_deg` | `float` | `18.0` | Turntable rotation step in degrees (`18.0` for 20 steps/turn) |
+
+### C. Texturing Engine Selection & Settings
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--texturing_engine` | `choice` | `texrecon` | Texturing engine: `texrecon` (mvs-texturing, default), `alicevision`, or `openmvs` |
+| `--texrecon_bin` | `str` | `None` | Path to `texrecon` executable or directory (e.g. `C:\texrecon\bin`) |
+| `--data_term` | `choice` | `gmi` | `texrecon` data term: `gmi` (gradient magnitude + intensity, default) or `color` |
+| `--smoothness_term` | `str` | `potts` | `texrecon` smoothness term MRF regularizer (default: `potts`) |
+| `--outlier_removal` | `choice` | `gauss_damping` | `texrecon` photometric outlier removal: `gauss_damping`, `none`, or `gauss_clamping` |
+| `--alicevision_bin` | `str` | `None` | Path to AliceVision binary directory (e.g. `C:\Meshroom\aliceVision\bin`) |
+| `--unwrap_method` | `choice` | `Basic` | AliceVision UV unwrapping method: `Basic` (fast & robust on high-poly), `LSCM`, or `ABF` |
+| `--visibility_remapping_method` | `choice` | `MeshItself` | AliceVision visibility test: `MeshItself` (direct mesh raycasting) or `PullPush` |
+| `--cost_smoothness_ratio` | `float` | `1.0` | OpenMVS texturing smoothness ratio (`1.0` prevents chart confetti) |
+| `--outlier_threshold` | `float` | `0.0` | OpenMVS outlier rejection (`0.0` disabled to texture shiny plastics without holes) |
+| `--empty_color` | `int` | `0` | OpenMVS empty/unobserved face color in decimal RGB (`0` = Black, `16744231` = Orange) |
+| `--global_seam_leveling` | `int` | `0` | OpenMVS global Poisson seam leveling (`0` disables dark background bleeding) |
+| `--local_seam_leveling` | `int` | `1` | OpenMVS local seam edge blending (`1` = enabled) |
+
+### D. OpenMVS Geometry & Mesh Cleaning
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--openmvs_bin_dir`, `--bin_dir` | `str` | `None` | Path to OpenMVS binaries directory (e.g. `C:\OpenMVS\vc17\x64\Release`) |
+| `--resolution_level` | `int` | `1` | OpenMVS densify downscale (`0` = 4K full, `1` = 2K, `2` = 1K) |
 | `--target_low_poly_faces` | `int` | `50000` | Target triangle count for decimated low-poly model |
-| `--mock_openmvs` | `flag` | `False` | Simulates OpenMVS for fast smoke testing |
 
 ---
 
@@ -182,18 +213,33 @@ output/
 
 ---
 
-## 8. Texturing Quality & Seam Leveling Optimization
+## 8. Multi-Engine Texturing & Optics Optimization
 
-Photogrammetry on dark/semi-gloss technical plastics (such as power tools) inside photo booths requires specialized texturing parameters to avoid visual artifacts:
+### A. Tri-Engine Texturing Architecture
 
-1. **Large Continuous Charts (`--cost-smoothness-ratio 1.0`):**  
-   The default OpenMVS ratio (`0.3`) allows slight lighting differences between photos to fragment the mesh into thousands of microscopic triangles (confetti islands). Raising the ratio to `1.0` forces adjacent triangles to share the same camera projection, creating coherent, readable texture charts (labels, rubber grips, branding text).
-2. **Eliminating Black Bleed (`--global-seam-leveling 0`):**  
-   Global seam leveling solves a Poisson gradient equation across all photo boundaries. When photos have dark or black photo booth backgrounds, the solver pulls the black background across the surface of the object. Setting `--global-seam-leveling 0` disables this global distortion while keeping `--local-seam-leveling 1` for seamless boundaries.
-3. **Black Pedestal Base (`--empty-color 0`):**  
-   Faces that cannot be seen by the cameras (such as the flat base cut at $Y=0$) default to neon orange (`16744231`) in OpenMVS. Setting `--empty-color 0` fills unobserved surfaces and empty atlas space with clean black (`RGB 0,0,0`).
-4. **Texture-Preserving Low-Poly Decimation:**  
-   The low-poly model uses PyMeshLab's `meshing_decimation_quadric_edge_collapse_with_texture`, ensuring that all texture coordinates (`vt`) are recalculated and preserved during mesh simplification, preventing the model from rendering flat white in 3D viewers.
+Turntable Studio supports three interchangeable texturing engines via `--texturing_engine`:
+
+1. **`texrecon` (`mvs-texturing` - TU Darmstadt — Default & Recommended):**
+   - Implements the ECCV 2014 paper *"Let There Be Color! — Large-Scale Texturing of 3D Reconstructions"*.
+   - Uses Markov Random Field (MRF) Graph-Cut energy minimization with the GMI (Gradient Magnitude + Intensity) data term to choose the sharpest, least-occluded camera for each polygon chart.
+   - Applies global Poisson seam leveling and local image-space edge blending without matrix singularities.
+   - Natively textures watertight CAD meshes with zero black holes and clean UV charts.
+
+2. **`alicevision` (Meshroom Multi-Band Texturing):**
+   - Decomposes images into low and high frequency bands, blending low-frequency color gradients seamlessly while retaining crisp high-frequency details (branding, fine plastic texture).
+   - Uses direct raycasting visibility (`visibility_remapping_method="MeshItself"`).
+
+3. **`openmvs` (`TextureMesh`):**
+   - High-speed direct texturing from the reconstruction mesh.
+   - Optimized with `--cost-smoothness-ratio 1.0` (encouraging continuous charts rather than micro-confetti) and `--empty-color 0` (clean black for unobserved underside faces).
+
+### B. Optical Calibration: IMX477 3.9mm Lens (`--focal_length_mm 3.9`)
+
+> [!IMPORTANT]
+> The Arducam / Raspberry Pi HQ Camera (Sony IMX477 12MP, sensor width $6.287\text{ mm}$, resolution $4056 \times 3040$) uses manual M12 lenses **without electronic EXIF contacts**.
+> - **Lens Focal Length:** $3.9\text{ mm}$ (FOV $\approx 78^\circ$).
+> - **Focal Length in Pixels:** $f_x = 3.9 \cdot \frac{4056}{6.287} \approx \mathbf{2516.19\text{ px}}$.
+> - If left to generic defaults ($6.0\text{ mm} \implies 3870.8\text{ px}$), the $54\%$ focal length discrepancy throws camera projection rays completely off target, causing textures to appear scrambled or full of black voids. Turntable Studio defaults to $3.9\text{ mm}$ across all modules.
 
 ---
 

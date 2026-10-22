@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Turntable Studio - Proiectie 3D Camere Rig Dual</title>
+  <style>
+    body { margin: 0; padding: 0; overflow: hidden; background: #0f172a; font-family: 'Segoe UI', sans-serif; color: #f8fafc; }
+    #canvas-container { width: 100vw; height: 100vh; display: block; }
+    #ui-panel {
+      position: absolute; top: 20px; left: 20px; background: rgba(15, 23, 42, 0.85);
+      backdrop-filter: blur(8px); border: 1px solid #334155; border-radius: 12px;
+      padding: 18px 24px; max-width: 380px; box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+    }
+    h2 { margin: 0 0 8px 0; font-size: 18px; color: #38bdf8; }
+    p { margin: 4px 0; font-size: 13px; color: #94a3b8; line-height: 1.4; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-weight: bold; font-size: 11px; margin-right: 6px; }
+    .badge-c0 { background: #00e5ff; color: #000; }
+    .badge-c1 { background: #ff9100; color: #000; }
+    .stat-row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid #1e293b; font-size: 12px; }
+    .controls-hint { margin-top: 12px; font-size: 11px; color: #64748b; font-style: italic; }
+  </style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+</head>
+<body>
+  <div id="ui-panel">
+    <h2>Rig Dual-Camera pe Turntable</h2>
+    <p>Proiecția spațială a celor 40 de poziții ale camerelor (2 nivele x 20 pași a câte 18°).</p>
+    <div style="margin: 10px 0;">
+      <div><span class="badge badge-c0">Cam 0</span> Nivel Jos: H = 160 mm | Unghi: -15.0°</div>
+      <div style="margin-top: 4px;"><span class="badge badge-c1">Cam 1</span> Nivel Sus: H = 170 mm | Unghi: -15.0°</div>
+    </div>
+    <div class="stat-row"><span>Distanță axă (D):</span><strong>360 mm</strong></div>
+    <div class="stat-row"><span>Decalaj vertical (ΔH):</span><strong style="color:#f59e0b">10 mm (1 cm)</strong></div>
+    <div class="stat-row"><span>Pas rotație:</span><strong>18.0° (20 pași = 360°)</strong></div>
+    <div class="stat-row"><span>Diametru Platan:</span><strong>260 mm</strong></div>
+    <div class="stat-row"><span>Punct Focar (Țintă):</span><strong>Y ~ 65-75 mm (Centru piesă)</strong></div>
+    <div class="controls-hint">Click stânga + Drag: Rotește scena 3D<br>Scroll: Zoom | Click dreapta + Drag: Panning</div>
+  </div>
+  <div id="canvas-container"></div>
+
+  <script>
+    const container = document.getElementById('canvas-container');
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0f172a);
+    scene.fog = new THREE.FogExp2(0x0f172a, 0.0008);
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 1, 3000);
+    camera.position.set(450, 320, 550);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    container.appendChild(renderer.domElement);
+
+    const controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.target.set(0, 80, 0);
+
+    // Lights
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+    scene.add(ambientLight);
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    dirLight.position.set(200, 500, 200);
+    scene.add(dirLight);
+
+    // Grid floor
+    const grid = new THREE.GridHelper(1000, 50, 0x334155, 0x1e293b);
+    grid.position.y = 0;
+    scene.add(grid);
+
+    // Coordinate Axes (+Y is UP, +X is Right, +Z is Front)
+    const axes = new THREE.AxesHelper(150);
+    axes.position.y = 0.1;
+    scene.add(axes);
+
+    // Turntable Disc (Radius 130mm, Ø 260mm)
+    const discGeo = new THREE.CylinderGeometry(130, 130, 4, 64);
+    const discMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.4, metalness: 0.6 });
+    const disc = new THREE.Mesh(discGeo, discMat);
+    disc.position.y = -2;
+    scene.add(disc);
+
+    // AprilTag ring guide (radius 100mm)
+    const ringGeo = new THREE.RingGeometry(95, 105, 64);
+    const ringMat = new THREE.MeshBasicMaterial({ color: 0x475569, side: THREE.DoubleSide });
+    const ring = new THREE.Mesh(ringGeo, ringMat);
+    ring.rotation.x = Math.PI / 2;
+    ring.position.y = 0.2;
+    scene.add(ring);
+
+    // Central target object mockup (Height 140mm, Diameter 70mm)
+    const objGeo = new THREE.CylinderGeometry(35, 35, 140, 32);
+    const objMat = new THREE.MeshStandardMaterial({ color: 0x3b82f6, transparent: true, opacity: 0.4, roughness: 0.7 });
+    const objMesh = new THREE.Mesh(objGeo, objMat);
+    objMesh.position.y = 70;
+    scene.add(objMesh);
+
+    // Target focal point
+    const focalGeo = new THREE.SphereGeometry(4, 16, 16);
+    const focalMat = new THREE.MeshBasicMaterial({ color: 0xf59e0b });
+    const focalMesh = new THREE.Mesh(focalGeo, focalMat);
+    focalMesh.position.set(0, 68, 0);
+    scene.add(focalMesh);
+
+    // Rig Parameters
+    const D = 360.0;
+    const H1 = 160.0;
+    const H2 = 170.0;
+    const pitch = 15.0 * Math.PI / 180.0;
+    const steps = 20;
+    const stepAngle = 18.0 * Math.PI / 180.0;
+
+    // Helper to create small camera frustum wireframe
+    function createCameraFrustum(colorHex) {
+      const group = new THREE.Group();
+      // Body
+      const bodyGeo = new THREE.BoxGeometry(16, 12, 18);
+      const bodyMat = new THREE.MeshStandardMaterial({ color: colorHex, roughness: 0.3 });
+      const body = new THREE.Mesh(bodyGeo, bodyMat);
+      body.position.z = -9;
+      group.add(body);
+      // Lens
+      const lensGeo = new THREE.ConeGeometry(8, 14, 16);
+      lensGeo.rotateX(Math.PI / 2);
+      const lensMat = new THREE.MeshBasicMaterial({ color: colorHex, wireframe: true });
+      const lens = new THREE.Mesh(lensGeo, lensMat);
+      lens.position.z = 7;
+      group.add(lens);
+      return group;
+    }
+
+    // Material for optical rays
+    const rayMat0 = new THREE.LineBasicMaterial({ color: 0x00e5ff, transparent: true, opacity: 0.35 });
+    const rayMat1 = new THREE.LineBasicMaterial({ color: 0xff9100, transparent: true, opacity: 0.35 });
+    const bracketMat = new THREE.LineBasicMaterial({ color: 0x94a3b8, linewidth: 2 });
+
+    for (let i = 0; i < steps; i++) {
+      const yaw = i * stepAngle;
+      
+      // Positions
+      const x0 = D * Math.sin(yaw);
+      const z0 = D * Math.cos(yaw);
+      const y0 = H1;
+
+      const x1 = D * Math.sin(yaw);
+      const z1 = D * Math.cos(yaw);
+      const y1 = H2;
+
+      // Targets (pitch 15 deg down)
+      const targetY0 = H1 - D * Math.tan(pitch);
+      const targetY1 = H2 - D * Math.tan(pitch);
+      const target0 = new THREE.Vector3(0, targetY0, 0);
+      const target1 = new THREE.Vector3(0, targetY1, 0);
+
+      // Camera 0
+      const cam0 = createCameraFrustum(0x00e5ff);
+      cam0.position.set(x0, y0, z0);
+      cam0.lookAt(target0);
+      scene.add(cam0);
+
+      // Camera 1
+      const cam1 = createCameraFrustum(0xff9100);
+      cam1.position.set(x1, y1, z1);
+      cam1.lookAt(target1);
+      scene.add(cam1);
+
+      // Physical rod connecting dual cameras
+      const bracketGeo = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(x0, y0 - 15, z0),
+        new THREE.Vector3(x1, y1 + 15, z1)
+      ]);
+      const bracketLine = new THREE.Line(bracketGeo, bracketMat);
+      scene.add(bracketLine);
+
+      // Optical rays to center (every 2nd step to avoid visual clutter)
+      if (i % 2 === 0) {
+        const ray0Geo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(x0, y0, z0), target0]);
+        scene.add(new THREE.Line(ray0Geo, rayMat0));
+        const ray1Geo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(x1, y1, z1), target1]);
+        scene.add(new THREE.Line(ray1Geo, rayMat1));
+      }
+    }
+
+    // Camera orbit ring guides
+    function createOrbitRing(radius, height, colorHex) {
+      const ringPts = [];
+      for (let a = 0; a <= Math.PI * 2 + 0.05; a += 0.05) {
+        ringPts.push(new THREE.Vector3(radius * Math.sin(a), height, radius * Math.cos(a)));
+      }
+      const geo = new THREE.BufferGeometry().setFromPoints(ringPts);
+      const mat = new THREE.LineDashedMaterial({ color: colorHex, dashSize: 8, gapSize: 4, opacity: 0.5, transparent: true });
+      const l = new THREE.Line(geo, mat);
+      l.computeLineDistances();
+      return l;
+    }
+    scene.add(createOrbitRing(D, H1, 0x00e5ff));
+    scene.add(createOrbitRing(D, H2, 0xff9100));
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    function animate() {
+      requestAnimationFrame(animate);
+      controls.update();
+      renderer.render(scene, camera);
+    }
+    animate();
+  </script>
+</body>
+</html>

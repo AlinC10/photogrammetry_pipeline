@@ -28,14 +28,16 @@ from .config import (
 logger = logging.getLogger("TurntableStudio.CameraInit")
 
 
-def extract_image_metadata(img_path: str) -> Dict[str, Any]:
+def extract_image_metadata(
+    img_path: str, default_focal_mm: Optional[float] = None
+) -> Dict[str, Any]:
     """
     Extracts image dimensions and EXIF metadata (focal length, sensor size).
     Falls back to Sony IMX477 defaults if EXIF is absent or incomplete.
     """
     width = DEFAULT_IMAGE_WIDTH
     height = DEFAULT_IMAGE_HEIGHT
-    focal_length_mm = DEFAULT_FOCAL_LENGTH_MM
+    focal_length_mm = default_focal_mm if default_focal_mm is not None else DEFAULT_FOCAL_LENGTH_MM
     sensor_width_mm = DEFAULT_SENSOR_WIDTH_MM
     make = ""
     model = ""
@@ -75,7 +77,9 @@ def extract_image_metadata(img_path: str) -> Dict[str, Any]:
 
 
 def scan_input_directory(
-    input_dir: str, rig_mode: bool = False
+    input_dir: str,
+    rig_mode: bool = False,
+    default_focal_mm: Optional[float] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]], str]:
     """
     Discovers images in input_dir, automatically detecting rig structure
@@ -116,7 +120,7 @@ def scan_input_directory(
             logger.info(f"Found {len(img_files)} images for Camera {cam_id}")
 
             for f in img_files:
-                meta = extract_image_metadata(str(f))
+                meta = extract_image_metadata(str(f), default_focal_mm=default_focal_mm)
 
                 # Register intrinsic for camera if not present
                 if cam_id not in intrinsics:
@@ -173,7 +177,7 @@ def scan_input_directory(
         view_counter = 1000
 
         for f in img_files:
-            meta = extract_image_metadata(str(f))
+            meta = extract_image_metadata(str(f), default_focal_mm=default_focal_mm)
             cam_id = "0"
 
             if cam_id not in intrinsics:

@@ -207,7 +207,7 @@ class AliceVisionRunner:
             w = float(intr.get("width", 4056))
             h = float(intr.get("height", 3040))
             sw = float(intr.get("sensorWidth", 6.287))
-            f_mm = float(intr.get("focalLength", 6.0))
+            f_mm = float(intr.get("focalLength", 3.9))
             px_f = f_mm * (w / sw)
 
             intr["serialNumber"] = intr.get("serialNumber") or f"camera_{iid}"

@@ -22,7 +22,7 @@ from typing import Optional
 DEFAULT_SENSOR_WIDTH_MM: float = 6.287
 DEFAULT_IMAGE_WIDTH: int = 4056
 DEFAULT_IMAGE_HEIGHT: int = 3040
-DEFAULT_FOCAL_LENGTH_MM: float = 6.0  # Common M12 lens default
+DEFAULT_FOCAL_LENGTH_MM: float = 3.9  # Arducam IMX477 M12 wide-angle lens (3.9 mm)
 
 
 # ==============================================================================
@@ -222,6 +222,22 @@ class MeshCleaningConfig:
 
 
 @dataclass
+class TexReconConfig:
+    """Paths and settings for mvs-texturing (texrecon) from TU Darmstadt."""
+    bin_dir: Optional[str] = None
+    texrecon_bin: Optional[str] = None
+    data_term: str = "gmi"              # "gmi" (gradient magnitude + intensity) or "color"
+    smoothness_term: str = "potts"      # Potts model MRF regularizer
+    outlier_removal: str = "gauss_damping" # "gauss_damping", "none", "gauss_clamping"
+    tone_mapping: str = "none"          # "none"
+    skip_global_seam_leveling: bool = False # False = Poisson global seam leveling enabled
+    skip_local_seam_leveling: bool = False  # False = local image-space seam blending enabled
+    num_threads: Optional[int] = None   # None = auto-detect all available CPU cores
+    write_timings: bool = True
+    write_intermediate_results: bool = False
+
+
+@dataclass
 class AliceVisionConfig:
     """Paths and settings for optional AliceVision multi-band texturing."""
     bin_dir: Optional[str] = None
@@ -246,7 +262,8 @@ class PipelineConfig:
     two_sides_mode: bool = False       # True if images are in rig1/ and rig2/
     use_masks: bool = True
     masks_dir: Optional[str] = None
-    texturing_engine: str = "alicevision" # "alicevision" (multi-band LSCM, zero holes) or "openmvs"
+    texturing_engine: str = "texrecon" # "texrecon" (mvs-texturing), "alicevision", or "openmvs"
+    texrecon: TexReconConfig = field(default_factory=TexReconConfig)
     openmvs: OpenMVSConfig = field(default_factory=OpenMVSConfig)
     alicevision: AliceVisionConfig = field(default_factory=AliceVisionConfig)
     turntable: TurntableConfig = field(default_factory=TurntableConfig)

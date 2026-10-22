@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libopencv-dev \
     libcgal-dev \
     libeigen3-dev \
+    libtbb-dev \
     ca-certificates \
     wget \
     curl \
@@ -46,6 +47,14 @@ RUN git clone https://github.com/cdcseacave/openMVS.git openMVS && \
     make -j$(nproc) && \
     make install
 
+# Build mvs-texturing (texrecon from TU Darmstadt)
+WORKDIR /opt
+RUN git clone https://github.com/nmoehrle/mvs-texturing.git mvs-texturing && \
+    mkdir -p mvs-texturing/build && \
+    cd mvs-texturing/build && \
+    cmake -DCMAKE_BUILD_TYPE=Release .. && \
+    make -j$(nproc)
+
 # ==============================================================================
 # Final Runtime Stage
 # ==============================================================================
@@ -54,6 +63,7 @@ FROM nvidia/cuda:12.2.2-runtime-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV OPENMVS_BIN_DIR=/usr/local/bin/OpenMVS
+ENV TEXRECON_BIN=/usr/local/bin/texrecon
 ENV PATH="${OPENMVS_BIN_DIR}:${PATH}"
 
 # Install Python 3.10 runtime & graphic libraries
@@ -64,6 +74,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1-mesa-glx \
     libglib2.0-0 \
     libgomp1 \
+    libtbb2 \
     libboost-iostreams1.74.0 \
     libboost-program-options1.74.0 \
     libboost-serialization1.74.0 \
@@ -76,8 +87,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy OpenMVS binaries from builder stage
+# Copy OpenMVS and texrecon binaries from builder stage
 COPY --from=builder /opt/openmvs_bin/bin /usr/local/bin/OpenMVS
+COPY --from=builder /opt/mvs-texturing/build/apps/texrecon/texrecon /usr/local/bin/texrecon
 
 # Setup workspace
 WORKDIR /workspace/turntable_studio
