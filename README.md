@@ -108,16 +108,24 @@ docker run --gpus all --rm \
 You can run Turntable Studio directly on Windows without Docker:
 
 1. **Download OpenMVS for Windows:**
-   - Download the latest pre-compiled Windows x64 release from [OpenMVS Releases](https://github.com/cdcseacave/openMVS/releases) (e.g. `openMVS_v2.3.0_win64.zip`).
-   - Extract it to `C:\OpenMVS`.
-   - Add `C:\OpenMVS` to your system `PATH` or set the environment variable:
+   - Download the latest pre-compiled Windows x64 release from [OpenMVS Releases](https://github.com/cdcseacave/openMVS/releases) (e.g. `openMVS_v2.4.0_win64.zip`).
+   - Extract it to `C:\OpenMVS`. The pipeline automatically scans all standard subfolders:
+     * `C:\OpenMVS\vc17\x64\Release` (Visual Studio 2022 release)
+     * `C:\OpenMVS\vc16\x64\Release` (Visual Studio 2019 release)
+     * `C:\OpenMVS\bin`
+     * Or directly `C:\OpenMVS`
+   - You can also point directly to your binary folder via the CLI argument `--openmvs_bin_dir "C:\OpenMVS\vc17\x64\Release"` or set the environment variable:
      ```powershell
-     $env:OPENMVS_BIN_DIR = "C:\OpenMVS"
+     $env:OPENMVS_BIN_DIR = "C:\OpenMVS\vc17\x64\Release"
      ```
 
 2. **Run the Python Pipeline:**
    ```powershell
+   # Standard full execution (dual-camera rig)
    python main.py --input_dir .\input_images --output_dir .\output --rig_mode
+
+   # Fast resume (reuses dense point cloud / reconstructed mesh)
+   python main.py --resume
    ```
 
 ---
@@ -126,42 +134,70 @@ You can run Turntable Studio directly on Windows without Docker:
 
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `--input_dir`, `-i` | `str` | `./input_images` | Path to images directory |
-| `--output_dir`, `-o` | `str` | `./output` | Path for deliverables |
+| `--input_dir`, `--input`, `-i` | `str` | `./input_images` | Path to images directory |
+| `--output_dir`, `--output`, `-o` | `str` | `./output` | Path for deliverables |
 | `--rig_mode` | `flag` | `False` | Enables dual-camera rig layout (`rig/0`, `rig/1`) |
-| `--openmvs_bin_dir`, `--bin_dir` | `str` | `None` | Path to OpenMVS directory (e.g. `C:\OpenMVS` or `C:\OpenMVS\bin`) |
-| `--resolution_level` | `int` | `1` | OpenMVS downscale (`0` = 4K full, `1` = 2K, `2` = 1K) |
+| `--openmvs_bin_dir`, `--bin_dir` | `str` | `None` | Path to OpenMVS binaries directory |
+| `--resolution_level` | `int` | `1` | OpenMVS densify downscale (`0` = 4K full, `1` = 2K, `2` = 4K) |
 | `--step_deg` | `float` | `18.0` | Turntable rotation step in degrees (20 steps/turn) |
-| `--mock_openmvs` | `flag` | `False` | Simulates OpenMVS for testing without binaries |
+| `--resume` | `flag` | `False` | Skips densification/reconstruction if point cloud/mesh already exists |
+| `--cost_smoothness_ratio` | `float` | `1.0` | Texturing data-to-smoothness weight (`1.0` prevents chart confetti) |
+| `--empty_color` | `int` | `0` | Decimal RGB fill for unobserved faces (`0` = Black, `16744231` = Orange) |
+| `--global_seam_leveling` | `int` | `0` | Poisson global leveling (`0` disables dark background bleeding) |
+| `--local_seam_leveling` | `int` | `1` | Local boundary edge smoothing across texture charts |
+| `--target_low_poly_faces` | `int` | `50000` | Target triangle count for decimated low-poly model |
+| `--mock_openmvs` | `flag` | `False` | Simulates OpenMVS for fast smoke testing |
 
 ---
 
-## 7. Deliverables & Output Structure
+## 7. Deliverables & Multi-LOD Assets
 
-Once complete, the `output/` directory contains:
+Once complete, the `output/` directory contains complete production assets matching Cloudflare R2 / RunPod specifications:
+
 ```text
 output/
-├── output.zip                  # Full package ready for Cloudflare R2 / S3
-├── stats.json                  # JSON telemetry report (RAM, VRAM, timing)
-├── turntable_report.txt        # TurntablePoses angular accuracy report
-├── model_cleaned_watertight.obj# Cleaned watertight model
+├── output.zip                  # Compressed bundle ready for Cloudflare R2 / S3
+├── stats.json                  # JSON telemetry report (RAM, VRAM, timing, step metrics)
+├── turntable_report.txt        # TurntablePoses angular accuracy and calibration report
+├── model_cleaned_watertight.obj# Intermediate watertight model (pedestal-sealed)
 ├── obj/
-│   ├── high/model_high.obj     # High-poly OBJ + PNG textures
-│   └── low/model_low.obj       # Low-poly OBJ (50k faces) + JPG textures
+│   ├── high/
+│   │   ├── model_high.obj      # High-poly textured OBJ (with mtllib model_high.mtl)
+│   │   ├── model_high.mtl      # Material file referencing PNG texture
+│   │   └── model_high_texture.png # Lossless, uncompressed master texture atlas
+│   └── low/
+│       ├── model_low.obj       # Decimated low-poly OBJ (texture-preserved UVs)
+│       ├── model_low.mtl       # Material file referencing JPG texture
+│       └── model_low_texture.jpg # Web-optimized downscaled JPG texture atlas (max 2048px)
 ├── stl/
-│   ├── high_model.stl          # Watertight 3D printing STL
-│   └── low_model.stl           # Decimated STL
+│   ├── high_model.stl          # Watertight 3D printing STL (manifold sealed base)
+│   └── low_model.stl           # Decimated STL for rapid slicing
 ├── 3mf/
-│   ├── high_model.3mf          # Slicer-ready 3MF
+│   ├── high_model.3mf          # Slicer-ready 3MF asset
 │   └── low_model.3mf
 └── glb/
-    ├── high_model.glb          # Full-res web / AR 3D asset
-    └── low_model.glb           # Draco-compressed low-poly GLB
+    ├── high_model.glb          # Full-res web / AR 3D asset (embedded PNG texture)
+    └── low_model.glb           # Low-poly web / AR 3D asset (embedded JPG texture)
 ```
 
 ---
 
-## 8. Telemetry & Performance Monitoring
+## 8. Texturing Quality & Seam Leveling Optimization
+
+Photogrammetry on dark/semi-gloss technical plastics (such as power tools) inside photo booths requires specialized texturing parameters to avoid visual artifacts:
+
+1. **Large Continuous Charts (`--cost-smoothness-ratio 1.0`):**  
+   The default OpenMVS ratio (`0.3`) allows slight lighting differences between photos to fragment the mesh into thousands of microscopic triangles (confetti islands). Raising the ratio to `1.0` forces adjacent triangles to share the same camera projection, creating coherent, readable texture charts (labels, rubber grips, branding text).
+2. **Eliminating Black Bleed (`--global-seam-leveling 0`):**  
+   Global seam leveling solves a Poisson gradient equation across all photo boundaries. When photos have dark or black photo booth backgrounds, the solver pulls the black background across the surface of the object. Setting `--global-seam-leveling 0` disables this global distortion while keeping `--local-seam-leveling 1` for seamless boundaries.
+3. **Black Pedestal Base (`--empty-color 0`):**  
+   Faces that cannot be seen by the cameras (such as the flat base cut at $Y=0$) default to neon orange (`16744231`) in OpenMVS. Setting `--empty-color 0` fills unobserved surfaces and empty atlas space with clean black (`RGB 0,0,0`).
+4. **Texture-Preserving Low-Poly Decimation:**  
+   The low-poly model uses PyMeshLab's `meshing_decimation_quadric_edge_collapse_with_texture`, ensuring that all texture coordinates (`vt`) are recalculated and preserved during mesh simplification, preventing the model from rendering flat white in 3D viewers.
+
+---
+
+## 9. Telemetry & Performance Monitoring
 
 The pipeline automatically benchmarks each stage and outputs a telemetry summary:
 
@@ -186,3 +222,21 @@ The pipeline automatically benchmarks each stage and outputs a telemetry summary
  6. Multi-LOD Export              |      8.93s |         1850.0 |        -
 ------------------------------------------------------------------------------
 ```
+
+---
+
+## 10. Troubleshooting & FAQs
+
+### Q: Why did my model appear pitch black in Blender?
+- **Cause 1 (Stale `--resume` cache):** If you ran `--resume` after changing camera intrinsics or script code, OpenMVS skipped `InterfaceCOLMAP` and projected textures using the old camera calibration, missing the object and sampling the black background. Run without `--resume` (or delete `output/openmvs`) to re-import the camera calibration.
+- **Cause 2 (Viewport Shading in Blender):** In Blender, switch from "Solid" mode to **"Material Preview"** (Z &rarr; Material Preview) or **"Rendered"** mode. Ensure your material has the image texture connected to the *Base Color* of the Principled BSDF node.
+
+### Q: Why did the low-poly model appear completely white?
+- **Cause:** Standard quadric decimation strips away vertex texture coordinates (`vt`). Turntable Studio uses `meshing_decimation_quadric_edge_collapse_with_texture` to ensure UV mapping is preserved on the decimated mesh. Ensure you are running the latest version from `main`.
+
+### Q: How do I re-texture without waiting 11 minutes for DensifyPointCloud?
+- If your point cloud `output/openmvs/scene_dense.mvs` and mesh `output/openmvs/scene_mesh.ply` are already reconstructed with the correct camera calibration:
+  ```powershell
+  python main.py --resume
+  ```
+  The pipeline will detect the existing mesh, perform base slicing, and proceed directly to `TextureMesh` and multi-LOD packaging in seconds!

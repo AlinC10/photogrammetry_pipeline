@@ -85,6 +85,10 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             smooth_mesh=job.get("smooth_mesh", 2),
             min_resolution=job.get("min_resolution", 640),
             texture_resolution=job.get("texture_resolution", 4096),
+            empty_color=job.get("empty_color", 0),
+            cost_smoothness_ratio=job.get("cost_smoothness_ratio", 1.0),
+            global_seam_leveling=job.get("global_seam_leveling", 0),
+            local_seam_leveling=job.get("local_seam_leveling", 1),
         ),
         turntable=TurntableConfig(
             step_deg=job.get("step_deg", 18.0),
@@ -94,6 +98,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             slice_y_m=job.get("slice_y_m", 0.003),
             skirt_bottom_y_m=job.get("skirt_bottom_y_m", 0.000),
             max_radius_m=job.get("max_radius_m", 0.12),
+            target_low_poly_faces=job.get("target_low_poly_faces", 50000),
         ),
     )
 
@@ -305,13 +310,18 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Turntable Studio - Studio Grade 3D Photogrammetry")
-    parser.add_argument("--input_dir", "-i", default="./input_images", help="Path to input images directory")
-    parser.add_argument("--output_dir", "-o", default="./output", help="Path to output deliverables directory")
+    parser.add_argument("--input_dir", "--input", "-i", default="./input_images", help="Path to input images directory")
+    parser.add_argument("--output_dir", "--output", "-o", default="./output", help="Path to output deliverables directory")
     parser.add_argument("--rig_mode", action="store_true", help="Enable rig mode (input_images/rig/0 and rig/1)")
-    parser.add_argument("--openmvs_bin_dir", "--bin_dir", default=None, help="Custom path to OpenMVS binaries directory (e.g. C:\\OpenMVS or C:\\openMVS\\bin)")
-    parser.add_argument("--resolution_level", type=int, default=1, help="OpenMVS densify downscale (0=full, 1=2x, 2=4x)")
-    parser.add_argument("--step_deg", type=float, default=18.0, help="Turntable step angle in degrees")
+    parser.add_argument("--openmvs_bin_dir", "--bin_dir", default=None, help="Custom path to OpenMVS binaries directory (e.g. C:\\OpenMVS\\vc17\\x64\\Release)")
+    parser.add_argument("--resolution_level", type=int, default=1, help="OpenMVS densify downscale (0=full 4K, 1=2x 2K, 2=4x 1K)")
+    parser.add_argument("--step_deg", type=float, default=18.0, help="Turntable step angle in degrees (default: 18.0 for 20 steps)")
     parser.add_argument("--resume", action="store_true", help="Resume from existing OpenMVS dense cloud or mesh if available")
+    parser.add_argument("--cost_smoothness_ratio", type=float, default=1.0, help="OpenMVS texturing smoothness ratio (1.0 = large continuous charts)")
+    parser.add_argument("--empty_color", type=int, default=0, help="OpenMVS empty/unobserved face color in decimal RGB (0=black, 16744231=orange)")
+    parser.add_argument("--global_seam_leveling", type=int, default=0, help="OpenMVS global Poisson seam leveling (0=disabled to avoid dark bleeding, 1=enabled)")
+    parser.add_argument("--local_seam_leveling", type=int, default=1, help="OpenMVS local seam edge blending (1=enabled, 0=disabled)")
+    parser.add_argument("--target_low_poly_faces", type=int, default=50000, help="Target face count for low-poly mesh (default: 50,000)")
     parser.add_argument("--mock_openmvs", action="store_true", help="Simulate OpenMVS for fast testing")
     return parser.parse_args()
 
@@ -326,6 +336,11 @@ def main():
         "resolution_level": args.resolution_level,
         "step_deg": args.step_deg,
         "resume": args.resume,
+        "cost_smoothness_ratio": args.cost_smoothness_ratio,
+        "empty_color": args.empty_color,
+        "global_seam_leveling": args.global_seam_leveling,
+        "local_seam_leveling": args.local_seam_leveling,
+        "target_low_poly_faces": args.target_low_poly_faces,
         "mock_openmvs": args.mock_openmvs,
     }
     run_pipeline(job)
