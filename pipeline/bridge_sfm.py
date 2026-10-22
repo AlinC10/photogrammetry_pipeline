@@ -283,31 +283,43 @@ def convert_sfm_to_colmap(
         # Undistort mask if available
         mask_candidates = [
             src_img_path.parent / f"{src_img_path.stem}.mask.png",
-            src_img_path.parent / f"{src_img_path.stem}.png",
+            src_img_path.parent / f"{src_img_path.stem}_mask.png",
         ]
         if masks_src_dir:
             m_src = Path(masks_src_dir)
             mask_candidates.extend([
                 m_src / f"{src_img_path.stem}.mask.png",
+                m_src / f"{src_img_path.stem}_mask.png",
                 m_src / f"{src_img_path.stem}.png",
                 m_src / f"{src_img_path.name}",
                 m_src / src_img_path.parent.name / f"{src_img_path.stem}.mask.png",
+                m_src / src_img_path.parent.name / f"{src_img_path.stem}_mask.png",
                 m_src / src_img_path.parent.name / f"{src_img_path.stem}.png",
                 m_src / "rig" / src_img_path.parent.name / f"{src_img_path.stem}.mask.png",
+                m_src / "rig" / src_img_path.parent.name / f"{src_img_path.stem}_mask.png",
                 m_src / "rig" / src_img_path.parent.name / f"{src_img_path.stem}.png",
             ])
 
-        if masks_dst_dir:
-            for m_cand in mask_candidates:
-                if m_cand.is_file():
-                    # OpenMVS expects masks formatted as: <image_name>.mask.png
-                    dst_mask_name = f"{dst_img_name}.mask.png"
+        found_mask = False
+        for m_cand in mask_candidates:
+            if m_cand.is_file() and m_cand.resolve() != src_img_path.resolve():
+                # OpenMVS expects masks formatted as: <image_name>.mask.png
+                dst_mask_name = f"{dst_img_name}.mask.png"
+                dst_mask_in_undist = undist_img_path / dst_mask_name
+
+                # Undistort mask directly alongside image for TextureMesh
+                undistort_single_image(
+                    str(m_cand), str(dst_mask_in_undist),
+                    c_info["K_orig"], c_info["dist"], K_new, is_mask=True
+                )
+
+                # Also save to masks_dst_dir if configured
+                if masks_dst_dir:
                     dst_mask_path = Path(masks_dst_dir) / dst_mask_name
-                    undistort_single_image(
-                        str(m_cand), str(dst_mask_path),
-                        c_info["K_orig"], c_info["dist"], K_new, is_mask=True
-                    )
-                    break
+                    shutil.copy2(dst_mask_in_undist, dst_mask_path)
+
+                found_mask = True
+                break
 
         colmap_image_id = len(registered_views) + 1
         registered_views.append({

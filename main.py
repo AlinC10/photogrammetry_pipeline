@@ -87,6 +87,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             texture_resolution=job.get("texture_resolution", 4096),
             empty_color=job.get("empty_color", 0),
             cost_smoothness_ratio=job.get("cost_smoothness_ratio", 1.0),
+            outlier_threshold=job.get("outlier_threshold", 0.0),
             global_seam_leveling=job.get("global_seam_leveling", 0),
             local_seam_leveling=job.get("local_seam_leveling", 1),
         ),
@@ -318,6 +319,7 @@ def parse_args():
     parser.add_argument("--step_deg", type=float, default=18.0, help="Turntable step angle in degrees (default: 18.0 for 20 steps)")
     parser.add_argument("--resume", action="store_true", help="Resume from existing OpenMVS dense cloud or mesh if available")
     parser.add_argument("--cost_smoothness_ratio", type=float, default=1.0, help="OpenMVS texturing smoothness ratio (1.0 = large continuous charts)")
+    parser.add_argument("--outlier_threshold", type=float, default=0.0, help="OpenMVS texturing outlier rejection threshold (0.0=disabled to texture shiny surfaces without black holes, 0.05=strict)")
     parser.add_argument("--empty_color", type=int, default=0, help="OpenMVS empty/unobserved face color in decimal RGB (0=black, 16744231=orange)")
     parser.add_argument("--global_seam_leveling", type=int, default=0, help="OpenMVS global Poisson seam leveling (0=disabled to avoid dark bleeding, 1=enabled)")
     parser.add_argument("--local_seam_leveling", type=int, default=1, help="OpenMVS local seam edge blending (1=enabled, 0=disabled)")
@@ -337,6 +339,7 @@ def main():
         "step_deg": args.step_deg,
         "resume": args.resume,
         "cost_smoothness_ratio": args.cost_smoothness_ratio,
+        "outlier_threshold": args.outlier_threshold,
         "empty_color": args.empty_color,
         "global_seam_leveling": args.global_seam_leveling,
         "local_seam_leveling": args.local_seam_leveling,

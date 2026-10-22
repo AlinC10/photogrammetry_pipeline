@@ -236,6 +236,7 @@ class OpenMVSRunner:
             "--resolution-level", "0",
             "--empty-color", str(self.config.empty_color),
             "--cost-smoothness-ratio", str(self.config.cost_smoothness_ratio),
+            "--outlier-threshold", str(self.config.outlier_threshold),
             "--global-seam-leveling", str(self.config.global_seam_leveling),
             "--local-seam-leveling", str(self.config.local_seam_leveling),
             "-v", "2",

@@ -169,6 +169,7 @@ class OpenMVSConfig:
     low_poly_texture_res: int = 2048  # low-poly texture atlas
     empty_color: int = 0              # 0 = black (prevents neon orange on unobserved/bottom faces)
     cost_smoothness_ratio: float = 1.0 # 1.0 prevents micro-patch fragmentation; encourages large continuous charts
+    outlier_threshold: float = 0.0     # 0.0 disables statistical outlier view rejection (crucial for shiny plastics on turntable)
     global_seam_leveling: int = 0      # 0 disables global Poisson solver that bleeds black background into patches
     local_seam_leveling: int = 1       # 1 preserves smooth edge blending at seams
 
