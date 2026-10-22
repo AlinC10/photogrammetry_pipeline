@@ -235,6 +235,9 @@ class OpenMVSRunner:
             "--export-type", "obj",
             "--resolution-level", "0",
             "--empty-color", str(self.config.empty_color),
+            "--cost-smoothness-ratio", str(self.config.cost_smoothness_ratio),
+            "--global-seam-leveling", str(self.config.global_seam_leveling),
+            "--local-seam-leveling", str(self.config.local_seam_leveling),
             "-v", "2",
         ]
         if mesh_file and Path(mesh_file).is_file():

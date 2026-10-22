@@ -40,15 +40,28 @@ def decimate_mesh(
         import pymeshlab
         ms = pymeshlab.MeshSet()
         ms.load_new_mesh(str(in_p))
-        logger.info(f"Decimating mesh from {ms.current_mesh().face_number():,d} to {target_faces:,d} faces...")
-        ms.meshing_decimation_quadric_edge_collapse(
-            targetfacenum=target_faces,
-            preserveboundary=True,
-            preservenormal=True,
-            preservetopology=True,
-            planarquadric=True,
-        )
-        ms.save_current_mesh(str(out_p))
+        curr_faces = ms.current_mesh().face_number()
+        logger.info(f"Decimating mesh from {curr_faces:,d} to {target_faces:,d} faces...")
+
+        # 1. Try texture-preserving quadric decimation to preserve UV texture coordinates (vt)
+        try:
+            ms.meshing_decimation_quadric_edge_collapse_with_texture(
+                targetfacenum=target_faces,
+                preserveboundary=True,
+                optimalplacement=True,
+            )
+            logger.info(f"Texture-preserving decimation succeeded: {ms.current_mesh().face_number():,d} faces.")
+        except Exception as tex_e:
+            logger.warning(f"Texture-preserving decimation failed ({tex_e}), trying standard decimation.")
+            ms.meshing_decimation_quadric_edge_collapse(
+                targetfacenum=target_faces,
+                preserveboundary=True,
+                preservenormal=True,
+                preservetopology=True,
+                planarquadric=True,
+            )
+
+        ms.save_current_mesh(str(out_p), save_textures=False)
         logger.info(f"Decimated mesh saved to: {out_p}")
         return
     except Exception as e:
@@ -250,6 +263,23 @@ def package_textured_model(
             extra.unlink()
         except Exception:
             pass
+
+    # Clean up conflicting texture formats (e.g. remove unwanted PNG from low-poly JPG folder)
+    if target_format.lower() in ("jpg", "jpeg"):
+        for png_leftover in dst_dir.glob("*.png"):
+            if png_leftover.name != dst_mtl_path.name:
+                try:
+                    png_leftover.unlink()
+                    logger.debug(f"Removed extraneous PNG from JPG folder: {png_leftover.name}")
+                except Exception:
+                    pass
+    elif target_format.lower() == "png":
+        for jpg_leftover in list(dst_dir.glob("*.jpg")) + list(dst_dir.glob("*.jpeg")):
+            try:
+                jpg_leftover.unlink()
+                logger.debug(f"Removed extraneous JPG from PNG folder: {jpg_leftover.name}")
+            except Exception:
+                pass
 
 
 def export_multi_lod_bundle(

@@ -110,6 +110,8 @@ class TestExporter(unittest.TestCase):
 
         low_jpgs = list(low_dir.glob("*.jpg"))
         self.assertGreaterEqual(len(low_jpgs), 1, "Low poly folder must have at least one JPG texture image")
+        low_pngs = list(low_dir.glob("*.png"))
+        self.assertEqual(len(low_pngs), 0, "Low poly folder must NOT contain PNG textures")
 
         # Verify model_low.obj references model_low.mtl
         low_obj_content = (low_dir / "model_low.obj").read_text()
