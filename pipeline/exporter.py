@@ -61,7 +61,7 @@ def decimate_mesh(
                 planarquadric=True,
             )
 
-        ms.save_current_mesh(str(out_p), save_textures=False)
+        ms.save_current_mesh(str(out_p), save_wedge_texcoord=True)
         logger.info(f"Decimated mesh saved to: {out_p}")
         return
     except Exception as e:
@@ -145,6 +145,30 @@ def find_source_mtl_and_textures(tex_p: Path) -> Tuple[Optional[Path], List[Path
     return mtl_file, tex_images
 
 
+def inpaint_texture_atlas(img_path: Path, max_black_thresh: int = 5, inpaint_radius: int = 5) -> None:
+    """
+    Detects unmapped black/empty pixels on the texture atlas and fills them
+    seamlessly using Navier-Stokes/Telea inpainting from neighboring valid pixels.
+    """
+    try:
+        import cv2
+        import numpy as np
+        img = cv2.imread(str(img_path))
+        if img is None:
+            return
+        # Find pixels where all BGR channels are below threshold
+        black_mask = np.all(img <= max_black_thresh, axis=-1).astype(np.uint8) * 255
+        # Only inpaint if there is a mix of painted and black pixels
+        if 0 < black_mask.sum() < black_mask.size * 255 * 0.90:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            dilated_mask = cv2.dilate(black_mask, kernel)
+            inpainted = cv2.inpaint(img, dilated_mask, inpaintRadius=inpaint_radius, flags=cv2.INPAINT_TELEA)
+            cv2.imwrite(str(img_path), inpainted)
+            logger.info(f"Auto-inpainting filled empty seam gaps on {img_path.name}")
+    except Exception as e:
+        logger.warning(f"Inpainting warning on {img_path.name}: {e}")
+
+
 def package_textured_model(
     src_obj_path: Path,
     dst_obj_path: Path,
@@ -185,6 +209,9 @@ def package_textured_model(
                     img_out.convert("RGB").save(str(out_tex_path), format="JPEG", quality=jpg_quality, optimize=True)
                 else:
                     img_out.save(str(out_tex_path), format="PNG", optimize=True)
+
+            # Apply auto-inpainting to fill any residual black seam pixels
+            inpaint_texture_atlas(out_tex_path)
 
             tex_map_replacements[src_img.name] = out_tex_name
             logger.info(f"Generated {target_format.upper()} texture: {out_tex_name} ({img_out.size[0]}x{img_out.size[1]})")
@@ -251,7 +278,8 @@ def package_textured_model(
     if not has_mtllib:
         obj_lines.insert(0, f"mtllib {dst_mtl_path.name}\n")
     if not has_usemtl:
-        obj_lines.insert(1, "usemtl material_0\n")
+        first_face_idx = next((i for i, l in enumerate(obj_lines) if l.startswith("f ")), len(obj_lines))
+        obj_lines.insert(first_face_idx, "usemtl material_0\n")
 
     with open(dst_obj_path, "w", encoding="utf-8") as f:
         f.writelines(obj_lines)
@@ -375,25 +403,36 @@ def export_multi_lod_bundle(
             jpg_quality=85,
         )
 
+        # Helper: GLB postprocessor for unlit, double-sided photogrammetry materials
+        def gltf_unlit_postproc(tree):
+            tree.setdefault('extensionsUsed', []).append('KHR_materials_unlit')
+            for mat in tree.get('materials', []):
+                mat['doubleSided'] = True
+                mat.setdefault('extensions', {})['KHR_materials_unlit'] = {}
+
         # 4. Generate High-Poly GLB from model_high.obj (contains embedded PNG texture)
         try:
             textured_high_scene = trimesh.load(str(high_obj), process=False)
-            textured_high_scene.export(str(high_glb), file_type="glb")
+            glb_data = trimesh.exchange.gltf.export_glb(textured_high_scene, tree_postprocessor=gltf_unlit_postproc)
+            with open(str(high_glb), "wb") as gf:
+                gf.write(glb_data)
             telemetry.record_mesh(str(high_glb))
-            logger.info(f"Exported textured High-Poly GLB (PNG): {high_glb.name}")
+            logger.info(f"Exported textured High-Poly GLB (Unlit/PNG): {high_glb.name}")
         except Exception as ge:
-            logger.warning(f"High GLB export warning: {ge}. Using cleaned mesh for GLB.")
+            logger.warning(f"High GLB export warning: {ge}. Using standard GLB export.")
             cleaned_trimesh.export(str(high_glb), file_type="glb")
             telemetry.record_mesh(str(high_glb))
 
         # 5. Generate Low-Poly GLB from model_low.obj (contains embedded downscaled JPG texture)
         try:
             textured_low_scene = trimesh.load(str(low_obj), process=False)
-            textured_low_scene.export(str(low_glb), file_type="glb")
+            glb_data = trimesh.exchange.gltf.export_glb(textured_low_scene, tree_postprocessor=gltf_unlit_postproc)
+            with open(str(low_glb), "wb") as gf:
+                gf.write(glb_data)
             telemetry.record_mesh(str(low_glb))
-            logger.info(f"Exported textured Low-Poly GLB (JPG): {low_glb.name}")
+            logger.info(f"Exported textured Low-Poly GLB (Unlit/JPG): {low_glb.name}")
         except Exception as ge:
-            logger.warning(f"Low GLB export warning: {ge}. Using low-poly mesh for GLB.")
+            logger.warning(f"Low GLB export warning: {ge}. Using standard GLB export.")
             cleaned_trimesh.export(str(low_glb), file_type="glb")
             telemetry.record_mesh(str(low_glb))
 

@@ -284,6 +284,18 @@ def clean_and_repair_mesh(
         ms.meshing_repair_non_manifold_vertices()
         ms.meshing_close_holes(maxholesize=30)
 
+        # Volume-preserving Taubin smoothing (eliminates 2-4mm ripples without shrinkage)
+        if getattr(config, "smooth_iterations", 0) > 0:
+            logger.info(f"Applying volume-preserving Taubin smoothing ({config.smooth_iterations} steps)...")
+            try:
+                ms.apply_coord_taubin_smoothing(
+                    lambda_=0.5,
+                    mu=-0.53,
+                    stepsmoothnum=config.smooth_iterations,
+                )
+            except Exception as se:
+                logger.warning(f"Taubin smoothing warning: {se}")
+
         # Save repaired mesh
         ms.save_current_mesh(str(out_p))
 

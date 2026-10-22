@@ -23,6 +23,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("TurntableStudio")
 
+from pipeline.alicevision_runner import AliceVisionRunner, find_alicevision_binary
 from pipeline.bridge_sfm import convert_sfm_to_colmap
 from pipeline.camera_init import (
     generate_camera_init_sfm,
@@ -30,6 +31,7 @@ from pipeline.camera_init import (
     scan_input_directory,
 )
 from pipeline.config import (
+    AliceVisionConfig,
     MeshCleaningConfig,
     OpenMVSConfig,
     PipelineConfig,
@@ -74,11 +76,36 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
     logger.info(f"Output Directory : {output_dir}")
     logger.info(f"Rig Mode Enabled : {rig_mode}")
 
+    texturing_engine = job.get("texturing_engine", "alicevision")
+    alicevision_bin = job.get("alicevision_bin") or job.get("alicevision_bin_dir")
+
+    # If AliceVision is requested but binary is not found anywhere, warn and fall back to openmvs
+    if texturing_engine == "alicevision":
+        detected_av = find_alicevision_binary("aliceVision_texturing", custom_dir=alicevision_bin)
+        if not detected_av:
+            logger.warning(
+                "aliceVision_texturing executable not detected on system. "
+                "Defaulting to OpenMVS texturing engine."
+            )
+            texturing_engine = "openmvs"
+        else:
+            logger.info(f"Using AliceVision Texturing: {detected_av}")
+
     # Build Configuration
     config = PipelineConfig(
         input_dir=input_dir,
         output_dir=output_dir,
         rig_mode=rig_mode,
+        texturing_engine=texturing_engine,
+        alicevision=AliceVisionConfig(
+            bin_dir=alicevision_bin,
+            texture_side=job.get("texture_resolution", 4096),
+            unwrap_method=job.get("unwrap_method", "LSCM"),
+            use_udim=job.get("use_udim", False),
+            fill_holes=job.get("fill_holes", True),
+            correct_ev=job.get("correct_ev", True),
+            color_mapping_type=job.get("color_mapping_type", "png"),
+        ),
         openmvs=OpenMVSConfig(
             bin_dir=job.get("openmvs_bin_dir"),
             resolution_level=job.get("resolution_level", 1),
@@ -245,13 +272,35 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                     mvs_project = "scene.mvs"
 
             # ----------------------------------------------------------------------
-            # STEP 4.4: OpenMVS TextureMesh on Watertight Sealed Geometry
+            # STEP 4.4: Texture Mesh on Watertight Sealed Geometry
             # ----------------------------------------------------------------------
-            with telemetry.step("4.4 OpenMVS TextureMesh (Watertight)"):
-                _, textured_obj_path = runner.run_texture_mesh(
-                    input_mvs=mvs_project,
-                    mesh_file=cleaned_obj_path,
-                )
+            if config.texturing_engine == "alicevision":
+                try:
+                    with telemetry.step("4.4 AliceVision Texturing (Multi-Band & LSCM)"):
+                        av_runner = AliceVisionRunner(
+                            config=config.alicevision,
+                            work_dir=str(out_path / "alicevision"),
+                        )
+                        textured_obj_path, _ = av_runner.run_texturing(
+                            sfm_data_path=cameras_known_sfm,
+                            input_mesh_path=cleaned_obj_path,
+                            images_folder=undistorted_dir,
+                        )
+                except Exception as av_err:
+                    logger.warning(
+                        f"AliceVision texturing failed ({av_err}). Falling back to OpenMVS texturing."
+                    )
+                    with telemetry.step("4.4 OpenMVS TextureMesh (Fallback)"):
+                        _, textured_obj_path = runner.run_texture_mesh(
+                            input_mvs=mvs_project,
+                            mesh_file=cleaned_obj_path,
+                        )
+            else:
+                with telemetry.step("4.4 OpenMVS TextureMesh (Watertight)"):
+                    _, textured_obj_path = runner.run_texture_mesh(
+                        input_mvs=mvs_project,
+                        mesh_file=cleaned_obj_path,
+                    )
 
         else:
             logger.info("[MOCK] Creating mock OpenMVS geometry.")
@@ -324,6 +373,8 @@ def parse_args():
     parser.add_argument("--global_seam_leveling", type=int, default=0, help="OpenMVS global Poisson seam leveling (0=disabled to avoid dark bleeding, 1=enabled)")
     parser.add_argument("--local_seam_leveling", type=int, default=1, help="OpenMVS local seam edge blending (1=enabled, 0=disabled)")
     parser.add_argument("--target_low_poly_faces", type=int, default=50000, help="Target face count for low-poly mesh (default: 50,000)")
+    parser.add_argument("--texturing_engine", choices=["alicevision", "openmvs"], default="alicevision", help="Texturing engine: 'alicevision' (LSCM, multi-band, zero holes) or 'openmvs'")
+    parser.add_argument("--alicevision_bin", default=None, help="Custom path to AliceVision bin directory or aliceVision_texturing executable (e.g. C:\\Meshroom\\aliceVision\\bin)")
     parser.add_argument("--mock_openmvs", action="store_true", help="Simulate OpenMVS for fast testing")
     return parser.parse_args()
 
@@ -334,6 +385,8 @@ def main():
         "input_dir": args.input_dir,
         "output_dir": args.output_dir,
         "rig_mode": args.rig_mode,
+        "texturing_engine": args.texturing_engine,
+        "alicevision_bin": args.alicevision_bin,
         "openmvs_bin_dir": args.openmvs_bin_dir,
         "resolution_level": args.resolution_level,
         "step_deg": args.step_deg,
@@ -344,6 +397,8 @@ def main():
         "global_seam_leveling": args.global_seam_leveling,
         "local_seam_leveling": args.local_seam_leveling,
         "target_low_poly_faces": args.target_low_poly_faces,
+        "mock_openmvs": args.mock_openmvs,
+    }
         "mock_openmvs": args.mock_openmvs,
     }
     run_pipeline(job)

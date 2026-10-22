@@ -218,6 +218,22 @@ class MeshCleaningConfig:
     keep_largest_only: bool = True
     remove_duplicate_faces: bool = True
     target_low_poly_faces: int = 50000
+    smooth_iterations: int = 12       # Taubin volume-preserving smoothing (eliminates 2-4mm ripples)
+
+
+@dataclass
+class AliceVisionConfig:
+    """Paths and settings for optional AliceVision multi-band texturing."""
+    bin_dir: Optional[str] = None
+    texturing_bin: Optional[str] = None
+    texture_side: int = 4096
+    unwrap_method: str = "LSCM"        # LSCM (<=600k faces), ABF, Basic
+    use_udim: bool = False             # False = single standard (0,1) UV atlas for maximum 3D software compatibility
+    fill_holes: bool = True            # Inpainting for texture holes (eliminates black spots)
+    correct_ev: bool = True            # Exposure compensation across camera angles
+    color_mapping_type: str = "png"    # png (lossless) or jpg
+    padding: int = 5
+    multi_band_downscale: int = 4
 
 
 @dataclass
@@ -229,7 +245,9 @@ class PipelineConfig:
     two_sides_mode: bool = False       # True if images are in rig1/ and rig2/
     use_masks: bool = True
     masks_dir: Optional[str] = None
+    texturing_engine: str = "alicevision" # "alicevision" (multi-band LSCM, zero holes) or "openmvs"
     openmvs: OpenMVSConfig = field(default_factory=OpenMVSConfig)
+    alicevision: AliceVisionConfig = field(default_factory=AliceVisionConfig)
     turntable: TurntableConfig = field(default_factory=TurntableConfig)
     cleaning: MeshCleaningConfig = field(default_factory=MeshCleaningConfig)
 
