@@ -399,8 +399,6 @@ def main():
         "target_low_poly_faces": args.target_low_poly_faces,
         "mock_openmvs": args.mock_openmvs,
     }
-        "mock_openmvs": args.mock_openmvs,
-    }
     run_pipeline(job)
 
 
