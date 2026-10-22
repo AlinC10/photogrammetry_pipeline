@@ -105,6 +105,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             fill_holes=job.get("fill_holes", True),
             correct_ev=job.get("correct_ev", True),
             color_mapping_type=job.get("color_mapping_type", "png"),
+            visibility_remapping_method=job.get("visibility_remapping_method", "MeshItself"),
         ),
         openmvs=OpenMVSConfig(
             bin_dir=job.get("openmvs_bin_dir"),
@@ -375,6 +376,7 @@ def parse_args():
     parser.add_argument("--target_low_poly_faces", type=int, default=50000, help="Target face count for low-poly mesh (default: 50,000)")
     parser.add_argument("--texturing_engine", choices=["alicevision", "openmvs"], default="alicevision", help="Texturing engine: 'alicevision' (LSCM, multi-band, zero holes) or 'openmvs'")
     parser.add_argument("--unwrap_method", choices=["Basic", "LSCM", "ABF"], default="Basic", help="AliceVision UV unwrapping method: 'Basic' (fast & robust on high-poly), 'LSCM', or 'ABF'")
+    parser.add_argument("--visibility_remapping_method", choices=["MeshItself", "PullPush", "Pull", "Push"], default="MeshItself", help="AliceVision visibility remapping: 'MeshItself' (direct mesh raycasting) or 'PullPush'")
     parser.add_argument("--alicevision_bin", default=None, help="Custom path to AliceVision bin directory or aliceVision_texturing executable (e.g. C:\\Meshroom\\aliceVision\\bin)")
     parser.add_argument("--mock_openmvs", action="store_true", help="Simulate OpenMVS for fast testing")
     return parser.parse_args()
@@ -388,6 +390,7 @@ def main():
         "rig_mode": args.rig_mode,
         "texturing_engine": args.texturing_engine,
         "unwrap_method": args.unwrap_method,
+        "visibility_remapping_method": args.visibility_remapping_method,
         "alicevision_bin": args.alicevision_bin,
         "openmvs_bin_dir": args.openmvs_bin_dir,
         "resolution_level": args.resolution_level,

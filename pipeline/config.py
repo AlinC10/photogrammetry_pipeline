@@ -233,7 +233,8 @@ class AliceVisionConfig:
     correct_ev: bool = True            # Exposure compensation across camera angles
     color_mapping_type: str = "png"    # png (lossless) or jpg
     padding: int = 5
-    multi_band_downscale: int = 4
+    multi_band_downscale: int = 2       # 2 = finer frequency decomposition (studio grade sharpness)
+    visibility_remapping_method: str = "MeshItself"  # MeshItself (direct raycasting on mesh, no dense point cloud required)
 
 
 @dataclass
