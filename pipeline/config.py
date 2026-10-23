@@ -168,10 +168,10 @@ class OpenMVSConfig:
     texture_resolution: int = 4096    # high-res texture atlas
     low_poly_texture_res: int = 2048  # low-poly texture atlas
     empty_color: int = 0              # 0 = black (prevents neon orange on unobserved/bottom faces)
-    cost_smoothness_ratio: float = 0.2 # 0.2 balances sharp front-facing projection angles and continuous charts
+    cost_smoothness_ratio: float = 1.0 # 1.0 enforces continuous charts and prevents micro-confetti / inverted patches (RULE 8)
     patch_packing_heuristic: int = 3   # 3 = Best/tightest UV chart packing heuristic in OpenMVS
     close_holes: int = 1               # 1 = Inpaint/extrapolate unobserved/occluded texture holes
-    outlier_threshold: float = 0.0     # 0.0 disables statistical outlier view rejection (crucial for shiny plastics on turntable)
+    outlier_threshold: float = 0.05    # 0.05 rejects specular reflections on semi-gloss plastics
     global_seam_leveling: int = 0      # 0 disables global Poisson solver that bleeds black background into patches
     local_seam_leveling: int = 1       # 1 preserves smooth edge blending at seams
 
@@ -270,6 +270,10 @@ class PipelineConfig:
     alicevision: AliceVisionConfig = field(default_factory=AliceVisionConfig)
     turntable: TurntableConfig = field(default_factory=TurntableConfig)
     cleaning: MeshCleaningConfig = field(default_factory=MeshCleaningConfig)
+
+    # Scaling and units
+    export_scale: float = 100.0        # Default 100.0 scales raw photogrammetry mesh (2.2mm) to real-world scale (22cm / 220mm)
+    scale_stl_to_mm: bool = True
 
     # Cloud & Artifact export
     export_zip: bool = True

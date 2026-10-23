@@ -82,28 +82,48 @@ input_images/
 
 ---
 
-## 4. Running with Docker (Linux Server / RunPod / Cloud)
+## 4. Running with Docker (Linux Server / RunPod / Cloud / Local)
 
-Docker is the recommended deployment method for cloud servers (RunPod, AWS, GCP) with NVIDIA GPUs.
+Docker is the recommended deployment method for automated, isolated photogrammetry on Linux servers, cloud instances (RunPod, AWS, GCP), or locally via Docker Desktop with NVIDIA GPU passthrough.
 
-### Build and Run with Docker Compose:
+### A. How Host Volume Mounting Works
+The container uses two host directory mounts configured in [`docker-compose.yml`](file:///home/alin/Desktop/template_meshroom/turntable_studio/docker-compose.yml):
+* **`./input_images` &rarr; `/workspace/input_images:ro`**: Put your input photos in the `turntable_studio/input_images/` directory on your computer.
+* **`./output` &rarr; `/workspace/output:rw`**: As soon as the reconstruction pipeline finishes, all multi-LOD 3D models and archives appear **directly on your host machine** inside `turntable_studio/output/`.
+
+### B. Build the Container
 ```bash
-# Build the CUDA 12 + OpenMVS container
+# Build the headless CUDA 12 + OpenMVS v2.3.0 + mvs-texturing container
 docker compose build
-
-# Run the pipeline
-docker compose up
 ```
 
-### Run Directly via Docker CLI:
+### C. Run with Docker Compose
+
+1. **Run with OpenMVS Texturing Engine:**
+   ```bash
+   docker compose run --rm turntable-studio --input_dir /workspace/input_images --output_dir /workspace/output --rig_mode --texturing_engine openmvs
+   ```
+
+2. **Run with `mvs-texturing` (`texrecon` - Recommended):**
+   ```bash
+   docker compose run --rm turntable-studio --input_dir /workspace/input_images --output_dir /workspace/output --rig_mode --texturing_engine texrecon
+   ```
+
+3. **Default execution (`docker compose up`):**
+   ```bash
+   docker compose up
+   ```
+
+### D. Run Directly via Docker CLI (Standalone)
 ```bash
 docker run --gpus all --rm \
-  -v $(pwd)/input_images:/workspace/input_images:ro \
-  -v $(pwd)/output:/workspace/output:rw \
+  -v "$(pwd)/input_images:/workspace/input_images:ro" \
+  -v "$(pwd)/output:/workspace/output:rw" \
   turntable-studio:latest \
   --input_dir /workspace/input_images \
   --output_dir /workspace/output \
   --rig_mode \
+  --texturing_engine openmvs \
   --resolution_level 1
 ```
 
@@ -181,35 +201,44 @@ You can run Turntable Studio directly on Windows without Docker:
 
 ---
 
-## 7. Deliverables & Multi-LOD Assets
+## 7. Deliverables & Multi-LOD Assets (Where to Find Generated Models)
 
-Once complete, the `output/` directory contains complete production assets matching Cloudflare R2 / RunPod specifications:
+Once the pipeline completes (`Pipeline completed successfully`), all deliverables are immediately accessible on your host computer inside the **`turntable_studio/output/`** folder:
 
 ```text
-output/
-├── output.zip                  # Compressed bundle ready for Cloudflare R2 / S3
-├── stats.json                  # JSON telemetry report (RAM, VRAM, timing, step metrics)
-├── turntable_report.txt        # TurntablePoses angular accuracy and calibration report
-├── model_cleaned_watertight.obj# Intermediate watertight model (pedestal-sealed)
+turntable_studio/output/
+├── glb/
+│   ├── high_model.glb          # Full-res 3D model with embedded PNG texture (Double-click to open in Windows 3D Viewer or Blender)
+│   └── low_model.glb           # Web/AR-optimized 3D model with embedded JPG texture (~50,000 faces)
+│
 ├── obj/
 │   ├── high/
-│   │   ├── model_high.obj      # High-poly textured OBJ (with mtllib model_high.mtl)
-│   │   ├── model_high.mtl      # Material file referencing PNG texture
-│   │   └── model_high_texture.png # Lossless, uncompressed master texture atlas
+│   │   ├── model_high.obj      # High-poly OBJ scaled to real-world dimensions (100x scale, ~22 cm)
+│   │   ├── model_high.mtl      # Material definition pointing to lossless PNG texture
+│   │   └── model_high_texture.png # Uncompressed master texture atlas
 │   └── low/
-│       ├── model_low.obj       # Decimated low-poly OBJ (texture-preserved UVs)
-│       ├── model_low.mtl       # Material file referencing JPG texture
-│       └── model_low_texture.jpg # Web-optimized downscaled JPG texture atlas (max 2048px)
+│       ├── model_low.obj       # Decimated low-poly OBJ with preserved UV mapping coordinates
+│       ├── model_low.mtl       # Material definition pointing to JPG texture
+│       └── model_low_texture.jpg # Downscaled web texture atlas (max 2048px)
+│
 ├── stl/
-│   ├── high_model.stl          # Watertight 3D printing STL (manifold sealed base)
-│   └── low_model.stl           # Decimated STL for rapid slicing
+│   ├── high_model.stl          # Watertight (2-manifold) STL with planar sliced pedestal base (Y=0mm) for 3D printing
+│   └── low_model.stl           # Decimated STL for fast slicing in Bambu Studio / PrusaSlicer / Cura
+│
 ├── 3mf/
-│   ├── high_model.3mf          # Slicer-ready 3MF asset
+│   ├── high_model.3mf          # Modern CAD/3D printing asset with physical millimeter scale
 │   └── low_model.3mf
-└── glb/
-    ├── high_model.glb          # Full-res web / AR 3D asset (embedded PNG texture)
-    └── low_model.glb           # Low-poly web / AR 3D asset (embedded JPG texture)
+│
+├── stats.json                  # JSON telemetry report (RAM, VRAM, per-step execution timing, face counts)
+├── turntable_report.txt        # AprilTag disc calibration and angular step accuracy report
+└── output.zip                  # Complete multi-LOD archive ready for Cloudflare R2 / AWS S3 deployment
 ```
+
+### Quick Guide to Opening & Using the Models:
+1. **Instant Visual Inspection:** Double-click `output/glb/high_model.glb` to open it directly in **Windows 3D Viewer** or drag-and-drop it into any web glTF viewer ([gltf-viewer.donmccurdy.com](https://gltf-viewer.donmccurdy.com/)).
+2. **3D Printing (Slicers):** Drag `output/stl/high_model.stl` or `output/3mf/high_model.3mf` directly into **Bambu Studio**, **PrusaSlicer**, or **UltiMaker Cura**. The flat base is already sliced at $Y = 0\text{ mm}$ with inward-facing normals, sitting completely flat on the virtual print bed without requiring manual mesh cutting.
+3. **CAD & VFX (Blender / Maya / 3ds Max):** Import `output/obj/high/model_high.obj` (the `.mtl` and `.png` textures are automatically linked).
+4. **Cloud Distribution:** Upload `output.zip` directly to Cloudflare R2 or Amazon S3 buckets.
 
 ---
 

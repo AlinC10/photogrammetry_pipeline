@@ -158,6 +158,8 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             max_radius_m=job.get("max_radius_m", 0.12),
             target_low_poly_faces=job.get("target_low_poly_faces", 50000),
         ),
+        export_scale=job.get("export_scale", 100.0),
+        scale_stl_to_mm=job.get("scale_stl_to_mm", True),
     )
 
     try:
@@ -530,11 +532,13 @@ def parse_args():
     parser.add_argument("--step_deg", type=float, default=18.0, help="Turntable step angle in degrees (default: 18.0 for 20 steps)")
     parser.add_argument("--resume", action="store_true", help="Resume from existing OpenMVS dense cloud or mesh if available")
     parser.add_argument("--cost_smoothness_ratio", type=float, default=1.0, help="OpenMVS texturing smoothness ratio (1.0 = large continuous charts)")
-    parser.add_argument("--outlier_threshold", type=float, default=0.0, help="OpenMVS texturing outlier rejection threshold (0.0=disabled to texture shiny surfaces without black holes, 0.05=strict)")
+    parser.add_argument("--outlier_threshold", type=float, default=0.05, help="OpenMVS texturing outlier rejection threshold (default: 0.05 for plastics)")
     parser.add_argument("--empty_color", type=int, default=0, help="OpenMVS empty/unobserved face color in decimal RGB (0=black, 16744231=orange)")
     parser.add_argument("--global_seam_leveling", type=int, default=0, help="OpenMVS global Poisson seam leveling (0=disabled to avoid dark bleeding, 1=enabled)")
     parser.add_argument("--local_seam_leveling", type=int, default=1, help="OpenMVS local seam edge blending (1=enabled, 0=disabled)")
     parser.add_argument("--target_low_poly_faces", type=int, default=50000, help="Target face count for low-poly mesh (default: 50,000)")
+    parser.add_argument("--export_scale", type=float, default=100.0, help="Scale factor applied to exported assets (default: 100.0 for real-world scale: 2.2mm -> 22cm)")
+    parser.add_argument("--scale_to_mm", action="store_true", help="Shortcut to export OBJ in millimeters (sets export_scale=1000.0)")
     parser.add_argument("--texturing_engine", choices=["texrecon", "alicevision", "openmvs"], default="texrecon", help="Texturing engine: 'texrecon' (mvs-texturing, default), 'alicevision', or 'openmvs'")
     parser.add_argument("--texrecon_bin", default=None, help="Custom path to texrecon executable or directory (e.g. C:\\texrecon\\bin or /usr/local/bin/texrecon)")
     parser.add_argument("--data_term", choices=["gmi", "color"], default="gmi", help="texrecon data term: 'gmi' (default) or 'color'")
@@ -549,6 +553,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    export_scale = 1000.0 if args.scale_to_mm else args.export_scale
     job = {
         "input_dir": args.input_dir,
         "output_dir": args.output_dir,
@@ -572,6 +577,8 @@ def main():
         "global_seam_leveling": args.global_seam_leveling,
         "local_seam_leveling": args.local_seam_leveling,
         "target_low_poly_faces": args.target_low_poly_faces,
+        "export_scale": export_scale,
+        "scale_stl_to_mm": True,
         "mock_openmvs": args.mock_openmvs,
     }
     run_pipeline(job)

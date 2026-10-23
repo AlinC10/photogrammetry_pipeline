@@ -123,9 +123,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libboost-system1.74.0 \
     libgmp10 \
     libmpfr6 \
-    libopencv-core4.5d \
-    libopencv-imgproc4.5d \
-    libceres2 \
+    libopencv-dev \
+    libceres-dev \
+    libsuitesparse-dev \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

@@ -178,6 +178,7 @@ def package_textured_model(
     target_format: str,            # "png" for high-poly, "jpg" for low-poly
     downscale_max_dim: Optional[int] = None, # e.g. 2048 for low-poly
     jpg_quality: int = 85,
+    scale: float = 1.0,
 ) -> None:
     """
     Packages a textured OBJ model with an explicitly named MTL and converted/downscaled textures.
@@ -198,9 +199,9 @@ def package_textured_model(
             with Image.open(src_img) as img:
                 w, h = img.size
                 if downscale_max_dim and max(w, h) > downscale_max_dim:
-                    scale = downscale_max_dim / max(w, h)
-                    nw = max(1, int(w * scale))
-                    nh = max(1, int(h * scale))
+                    scale_f = downscale_max_dim / max(w, h)
+                    nw = max(1, int(w * scale_f))
+                    nh = max(1, int(h * scale_f))
                     img_out = img.resize((nw, nh), Image.Resampling.LANCZOS)
                 else:
                     img_out = img.copy()
@@ -209,9 +210,6 @@ def package_textured_model(
                     img_out.convert("RGB").save(str(out_tex_path), format="JPEG", quality=jpg_quality, optimize=True)
                 else:
                     img_out.save(str(out_tex_path), format="PNG", optimize=True)
-
-            # Apply auto-inpainting to fill any residual black seam pixels
-            inpaint_texture_atlas(out_tex_path)
 
             tex_map_replacements[src_img.name] = out_tex_name
             logger.info(f"Generated {target_format.upper()} texture: {out_tex_name} ({img_out.size[0]}x{img_out.size[1]})")
@@ -266,6 +264,19 @@ def package_textured_model(
 
     with open(src_obj_path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
+            if scale != 1.0 and line.startswith("v "):
+                parts = line.split()
+                if len(parts) >= 4:
+                    try:
+                        scaled_v = [float(p) * scale for p in parts[1:4]]
+                        rest = parts[4:]
+                        v_str = f"v {scaled_v[0]:.6f} {scaled_v[1]:.6f} {scaled_v[2]:.6f}"
+                        if rest:
+                            v_str += " " + " ".join(rest)
+                        obj_lines.append(v_str + "\n")
+                        continue
+                    except ValueError:
+                        pass
             if line.startswith("mtllib "):
                 obj_lines.append(f"mtllib {dst_mtl_path.name}\n")
                 has_mtllib = True
@@ -350,13 +361,19 @@ def export_multi_lod_bundle(
 
     # Base geometry for 3D printing (watertight from mesh_cleaner)
     cleaned_trimesh = trimesh.load(cleaned_mesh_path, process=False)
+    exp_scale = float(getattr(config, "export_scale", 100.0))
+    if exp_scale != 1.0:
+        high_print_mesh = cleaned_trimesh.copy()
+        high_print_mesh.apply_scale(exp_scale)
+    else:
+        high_print_mesh = cleaned_trimesh
 
-    # Export watertight STL and 3MF
-    cleaned_trimesh.export(str(high_stl), file_type="stl")
+    # Export watertight STL and 3MF at real-world scale
+    high_print_mesh.export(str(high_stl), file_type="stl")
     telemetry.record_mesh(str(high_stl))
 
     try:
-        cleaned_trimesh.export(str(high_3mf), file_type="3mf")
+        high_print_mesh.export(str(high_3mf), file_type="3mf")
         telemetry.record_mesh(str(high_3mf))
     except Exception as e:
         logger.warning(f"3MF export warning: {e}")
@@ -383,6 +400,7 @@ def export_multi_lod_bundle(
             src_texture_images=src_tex_imgs,
             target_format="png",
             downscale_max_dim=None,
+            scale=exp_scale,
         )
 
         # 2. Package Low-Poly OBJ:
@@ -400,6 +418,7 @@ def export_multi_lod_bundle(
                 target_format="jpg",
                 downscale_max_dim=2048,
                 jpg_quality=85,
+                scale=exp_scale,
             )
             logger.info("Successfully packaged Low-Poly OBJ from dedicated branching texturing!")
         else:
@@ -417,6 +436,7 @@ def export_multi_lod_bundle(
                 target_format="jpg",
                 downscale_max_dim=2048,
                 jpg_quality=85,
+                scale=exp_scale,
             )
 
         # Helper: GLB postprocessor for unlit, double-sided photogrammetry materials
@@ -494,13 +514,13 @@ def export_multi_lod_bundle(
         telemetry.record_mesh(str(low_obj))
         telemetry.record_mesh(str(low_glb))
 
-    # Low-poly STL and 3MF
+    # Low-poly STL and 3MF (loaded from low_obj, which is already scaled to real-world scale exp_scale)
     loaded_low = trimesh.load(str(low_obj), process=False)
     if isinstance(loaded_low, trimesh.Scene):
         geoms = [g for g in loaded_low.geometry.values() if isinstance(g, trimesh.Trimesh)]
-        low_trimesh = trimesh.util.concatenate(geoms) if geoms else cleaned_trimesh
+        low_trimesh = trimesh.util.concatenate(geoms) if geoms else cleaned_trimesh.copy()
     else:
-        low_trimesh = loaded_low
+        low_trimesh = loaded_low.copy()
 
     low_trimesh.export(str(low_stl), file_type="stl")
     telemetry.record_mesh(str(low_stl))
