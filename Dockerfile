@@ -11,7 +11,6 @@ ENV TZ=UTC
 # Install system build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    cmake \
     git \
     pkg-config \
     libpng-dev \
@@ -30,12 +29,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Build VCGLib
+# Install modern CMake (>= 3.24 required by modern OpenMVS)
+RUN wget -qO- "https://github.com/Kitware/CMake/releases/download/v3.28.3/cmake-3.28.3-linux-x86_64.tar.gz" | tar --strip-components=1 -xz -C /usr/local
+
+# Build VCGLib, OpenMVS, and mvs-texturing
 WORKDIR /opt
+
+# 1. VCGLib
 RUN git clone https://github.com/cnr-isti-vclab/vcglib.git vcglib
 
-# Build OpenMVS with CUDA support
-WORKDIR /opt
+# 2. OpenMVS with CUDA support
 RUN git clone https://github.com/cdcseacave/openMVS.git openMVS && \
     mkdir -p openMVS_build && \
     cd openMVS_build && \
@@ -47,12 +50,11 @@ RUN git clone https://github.com/cdcseacave/openMVS.git openMVS && \
     make -j$(nproc) && \
     make install
 
-# Build mvs-texturing (texrecon from TU Darmstadt)
-WORKDIR /opt
+# 3. mvs-texturing (texrecon from TU Darmstadt)
 RUN git clone https://github.com/nmoehrle/mvs-texturing.git mvs-texturing && \
     mkdir -p mvs-texturing/build && \
     cd mvs-texturing/build && \
-    cmake -DCMAKE_BUILD_TYPE=Release .. && \
+    cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-Wno-template-body -Wno-template-id-cdtor" .. && \
     make -j$(nproc)
 
 # ==============================================================================
@@ -72,9 +74,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     python3-dev \
     libgl1-mesa-glx \
+    libglu1-mesa \
     libglib2.0-0 \
     libgomp1 \
     libtbb2 \
+    libpng16-16 \
+    libjpeg-turbo8 \
+    libtiff5 \
     libboost-iostreams1.74.0 \
     libboost-program-options1.74.0 \
     libboost-serialization1.74.0 \
