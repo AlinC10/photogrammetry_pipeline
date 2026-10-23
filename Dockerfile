@@ -19,11 +19,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglu1-mesa-dev \
     libxmu-dev \
     libxi-dev \
+    libglew-dev \
+    libglfw3-dev \
     libboost-all-dev \
     libopencv-dev \
     libcgal-dev \
     libeigen3-dev \
     libtbb-dev \
+    libsuitesparse-dev \
+    libceres-dev \
+    nlohmann-json3-dev \
     ca-certificates \
     wget \
     curl \
@@ -62,13 +67,18 @@ RUN git clone https://github.com/cdcseacave/TinyEXIF.git TinyEXIF && \
     make -j$(nproc) && \
     make install
 
-# 4. OpenMVS with CUDA support
-RUN git clone https://github.com/cdcseacave/openMVS.git openMVS && \
+# 4. OpenMVS with CUDA support (pinned strictly to stable release v2.3.0)
+RUN ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/libcuda.so || true && \
+    ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/libcuda.so.1 || true && \
+    ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 || true && \
+    git clone --branch v2.3.0 --depth 1 https://github.com/cdcseacave/openMVS.git openMVS && \
     mkdir -p openMVS_build && \
     cd openMVS_build && \
     cmake -DCMAKE_BUILD_TYPE=Release \
           -DVCG_ROOT=/opt/vcglib \
           -DOpenMVS_USE_CUDA=ON \
+          -DCUDA_CUDA_LIBRARY=/usr/local/cuda/lib64/stubs/libcuda.so \
+          -DCMAKE_LIBRARY_PATH=/usr/local/cuda/lib64/stubs \
           -DCMAKE_INSTALL_PREFIX=/opt/openmvs_bin \
           -DCMAKE_PREFIX_PATH="/usr/local" \
           ../openMVS && \
@@ -115,6 +125,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libmpfr6 \
     libopencv-core4.5d \
     libopencv-imgproc4.5d \
+    libceres2 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
