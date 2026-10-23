@@ -317,6 +317,7 @@ def export_multi_lod_bundle(
     telemetry: SystemTelemetry,
     config: PipelineConfig,
     stats_json_path: Optional[str] = None,
+    textured_low_obj_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Generates all deliverables matching Cloudflare R2 and RunPod specifications:
@@ -384,24 +385,39 @@ def export_multi_lod_bundle(
             downscale_max_dim=None,
         )
 
-        # 2. Decimate high-poly mesh to low-poly OBJ
-        decimate_mesh(
-            input_mesh_path=str(high_obj),
-            output_mesh_path=str(low_obj),
-            target_faces=config.cleaning.target_low_poly_faces,
-        )
-
-        # 3. Package Low-Poly OBJ with downscaled JPG textures + model_low.mtl
-        package_textured_model(
-            src_obj_path=low_obj,
-            dst_obj_path=low_obj,
-            dst_mtl_path=low_mtl,
-            src_mtl_path=high_mtl,
-            src_texture_images=src_tex_imgs,
-            target_format="jpg",
-            downscale_max_dim=2048,
-            jpg_quality=85,
-        )
+        # 2. Package Low-Poly OBJ:
+        # If textured_low_obj_path is provided from branching pipeline, package it directly (native UVs!).
+        # Otherwise, fall back to geometry decimation of high_obj.
+        if textured_low_obj_path and Path(textured_low_obj_path).is_file():
+            low_src_p = Path(textured_low_obj_path)
+            low_src_mtl, low_src_tex_imgs = find_source_mtl_and_textures(low_src_p)
+            package_textured_model(
+                src_obj_path=low_src_p,
+                dst_obj_path=low_obj,
+                dst_mtl_path=low_mtl,
+                src_mtl_path=low_src_mtl or high_mtl,
+                src_texture_images=low_src_tex_imgs or src_tex_imgs,
+                target_format="jpg",
+                downscale_max_dim=2048,
+                jpg_quality=85,
+            )
+            logger.info("Successfully packaged Low-Poly OBJ from dedicated branching texturing!")
+        else:
+            decimate_mesh(
+                input_mesh_path=str(high_obj),
+                output_mesh_path=str(low_obj),
+                target_faces=config.cleaning.target_low_poly_faces,
+            )
+            package_textured_model(
+                src_obj_path=low_obj,
+                dst_obj_path=low_obj,
+                dst_mtl_path=low_mtl,
+                src_mtl_path=high_mtl,
+                src_texture_images=src_tex_imgs,
+                target_format="jpg",
+                downscale_max_dim=2048,
+                jpg_quality=85,
+            )
 
         # Helper: GLB postprocessor for unlit, double-sided photogrammetry materials
         def gltf_unlit_postproc(tree):
@@ -413,6 +429,17 @@ def export_multi_lod_bundle(
         # 4. Generate High-Poly GLB from model_high.obj (contains embedded PNG texture)
         try:
             textured_high_scene = trimesh.load(str(high_obj), process=False)
+            high_pngs = list(obj_high_dir.glob("*.png"))
+            if high_pngs:
+                from trimesh.visual import TextureVisuals
+                tex_img = Image.open(str(high_pngs[0]))
+                if isinstance(textured_high_scene, trimesh.Scene):
+                    for geom in textured_high_scene.geometry.values():
+                        if hasattr(geom, "visual") and hasattr(geom.visual, "uv") and geom.visual.uv is not None and len(geom.visual.uv) > 0:
+                            geom.visual = TextureVisuals(uv=geom.visual.uv, image=tex_img)
+                elif hasattr(textured_high_scene, "visual") and hasattr(textured_high_scene.visual, "uv") and len(textured_high_scene.visual.uv) > 0:
+                    textured_high_scene.visual = TextureVisuals(uv=textured_high_scene.visual.uv, image=tex_img)
+
             glb_data = trimesh.exchange.gltf.export_glb(textured_high_scene, tree_postprocessor=gltf_unlit_postproc)
             with open(str(high_glb), "wb") as gf:
                 gf.write(glb_data)
@@ -426,6 +453,17 @@ def export_multi_lod_bundle(
         # 5. Generate Low-Poly GLB from model_low.obj (contains embedded downscaled JPG texture)
         try:
             textured_low_scene = trimesh.load(str(low_obj), process=False)
+            low_jpgs = list(obj_low_dir.glob("*.jpg")) + list(obj_low_dir.glob("*.jpeg"))
+            if low_jpgs:
+                from trimesh.visual import TextureVisuals
+                tex_img = Image.open(str(low_jpgs[0]))
+                if isinstance(textured_low_scene, trimesh.Scene):
+                    for geom in textured_low_scene.geometry.values():
+                        if hasattr(geom, "visual") and hasattr(geom.visual, "uv") and geom.visual.uv is not None and len(geom.visual.uv) > 0:
+                            geom.visual = TextureVisuals(uv=geom.visual.uv, image=tex_img)
+                elif hasattr(textured_low_scene, "visual") and hasattr(textured_low_scene.visual, "uv") and len(textured_low_scene.visual.uv) > 0:
+                    textured_low_scene.visual = TextureVisuals(uv=textured_low_scene.visual.uv, image=tex_img)
+
             glb_data = trimesh.exchange.gltf.export_glb(textured_low_scene, tree_postprocessor=gltf_unlit_postproc)
             with open(str(low_glb), "wb") as gf:
                 gf.write(glb_data)

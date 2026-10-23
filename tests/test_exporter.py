@@ -134,6 +134,72 @@ class TestExporter(unittest.TestCase):
         self.assertTrue((output_dir / "output.zip").is_file())
         self.assertGreater((output_dir / "output.zip").stat().st_size, 0)
 
+    def test_export_multi_lod_bundle_branching_low_poly(self):
+        """Verifies that providing a dedicated textured_low_obj_path produces textured low-poly deliverables."""
+        tpath = Path(self.test_dir) / "branching"
+        tpath.mkdir(parents=True, exist_ok=True)
+
+        # High poly source
+        high_dir = tpath / "high"
+        high_dir.mkdir(parents=True, exist_ok=True)
+        high_tex = high_dir / "texture.png"
+        Image.new("RGB", (256, 256), color="red").save(str(high_tex), format="PNG")
+        high_mtl = high_dir / "high.mtl"
+        high_mtl.write_text("newmtl mat_high\nKa 1 1 1\nKd 1 1 1\nmap_Kd texture.png\n")
+        high_obj = high_dir / "high.obj"
+        high_obj.write_text(
+            "mtllib high.mtl\n"
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\n"
+            "vt 0 0\nvt 1 0\nvt 0 1\n"
+            "vn 0 0 1\nvn 0 0 1\nvn 0 0 1\n"
+            "usemtl mat_high\n"
+            "f 1/1/1 2/2/2 3/3/3\n"
+        )
+
+        # Dedicated low poly textured source
+        low_src_dir = tpath / "low_src"
+        low_src_dir.mkdir(parents=True, exist_ok=True)
+        low_tex = low_src_dir / "texture_low.png"
+        Image.new("RGB", (128, 128), color="blue").save(str(low_tex), format="PNG")
+        low_src_mtl = low_src_dir / "low_branch.mtl"
+        low_src_mtl.write_text("newmtl mat_low\nKa 1 1 1\nKd 1 1 1\nmap_Kd texture_low.png\n")
+        low_src_obj = low_src_dir / "low_branch.obj"
+        low_src_obj.write_text(
+            "mtllib low_branch.mtl\n"
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\n"
+            "vt 0 0\nvt 1 0\nvt 0 1\n"
+            "vn 0 0 1\nvn 0 0 1\nvn 0 0 1\n"
+            "usemtl mat_low\n"
+            "f 1/1/1 2/2/2 3/3/3\n"
+        )
+
+        clean_obj = tpath / "clean.obj"
+        box = trimesh.creation.box(extents=(0.05, 0.05, 0.05))
+        box.export(str(clean_obj))
+
+        output_dir = tpath / "out"
+        config = PipelineConfig()
+
+        bundle = export_multi_lod_bundle(
+            cleaned_mesh_path=str(clean_obj),
+            textured_obj_path=str(high_obj),
+            output_dir=str(output_dir),
+            telemetry=self.telemetry,
+            config=config,
+            textured_low_obj_path=str(low_src_obj),
+        )
+
+        low_out_dir = output_dir / "obj" / "low"
+        self.assertTrue((low_out_dir / "model_low.obj").is_file())
+        self.assertTrue((low_out_dir / "model_low.mtl").is_file())
+        low_obj_content = (low_out_dir / "model_low.obj").read_text()
+        self.assertIn("vt ", low_obj_content, "model_low.obj must have texture coordinates vt from branching!")
+        self.assertIn("mtllib model_low.mtl", low_obj_content)
+
+        # Check GLB deliverables
+        self.assertTrue((output_dir / "glb" / "high_model.glb").is_file())
+        self.assertTrue((output_dir / "glb" / "low_model.glb").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

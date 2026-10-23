@@ -29,16 +29,40 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install modern CMake (>= 3.24 required by modern OpenMVS)
-RUN wget -qO- "https://github.com/Kitware/CMake/releases/download/v3.28.3/cmake-3.28.3-linux-x86_64.tar.gz" | tar --strip-components=1 -xz -C /usr/local
+# Install modern CMake (>= 3.24), nanoflann and tinyxml2 required by OpenMVS & TinyEXIF
+RUN wget -qO- "https://github.com/Kitware/CMake/releases/download/v3.28.3/cmake-3.28.3-linux-x86_64.tar.gz" | tar --strip-components=1 -xz -C /usr/local && \
+    apt-get update && apt-get install -y --no-install-recommends libnanoflann-dev libtinyxml2-dev && rm -rf /var/lib/apt/lists/*
 
-# Build VCGLib, OpenMVS, and mvs-texturing
+# Build VCGLib, TinyEXIF, OpenMVS, and mvs-texturing
 WORKDIR /opt
 
 # 1. VCGLib
 RUN git clone https://github.com/cnr-isti-vclab/vcglib.git vcglib
 
-# 2. OpenMVS with CUDA support
+# 2. tinyxml2 (required by TinyEXIF with modern CMake package config)
+RUN git clone --depth 1 https://github.com/leethomason/tinyxml2.git tinyxml2 && \
+    mkdir -p tinyxml2_build && \
+    cd tinyxml2_build && \
+    cmake -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX=/usr/local \
+          -DBUILD_SHARED_LIBS=OFF \
+          ../tinyxml2 && \
+    make -j$(nproc) && \
+    make install
+
+# 3. TinyEXIF (metadata parser required by OpenMVS)
+RUN git clone https://github.com/cdcseacave/TinyEXIF.git TinyEXIF && \
+    mkdir -p TinyEXIF_build && \
+    cd TinyEXIF_build && \
+    cmake -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX=/usr/local \
+          -DCMAKE_PREFIX_PATH="/usr/local" \
+          -DBUILD_SHARED_LIBS=OFF \
+          ../TinyEXIF && \
+    make -j$(nproc) && \
+    make install
+
+# 4. OpenMVS with CUDA support
 RUN git clone https://github.com/cdcseacave/openMVS.git openMVS && \
     mkdir -p openMVS_build && \
     cd openMVS_build && \
@@ -46,11 +70,12 @@ RUN git clone https://github.com/cdcseacave/openMVS.git openMVS && \
           -DVCG_ROOT=/opt/vcglib \
           -DOpenMVS_USE_CUDA=ON \
           -DCMAKE_INSTALL_PREFIX=/opt/openmvs_bin \
+          -DCMAKE_PREFIX_PATH="/usr/local" \
           ../openMVS && \
     make -j$(nproc) && \
     make install
 
-# 3. mvs-texturing (texrecon from TU Darmstadt)
+# 5. mvs-texturing (texrecon from TU Darmstadt)
 RUN git clone https://github.com/nmoehrle/mvs-texturing.git mvs-texturing && \
     mkdir -p mvs-texturing/build && \
     cd mvs-texturing/build && \

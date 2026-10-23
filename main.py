@@ -39,7 +39,7 @@ from pipeline.config import (
     PipelineConfig,
     TurntableConfig,
 )
-from pipeline.exporter import export_multi_lod_bundle
+from pipeline.exporter import decimate_mesh, export_multi_lod_bundle
 from pipeline.mesh_cleaner import clean_and_repair_mesh
 from pipeline.openmvs_runner import OpenMVSRunner
 from pipeline.telemetry import SystemTelemetry
@@ -233,6 +233,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         raw_reconstructed_mesh = str(openmvs_dir / "scene_mesh.ply")
         cleaned_obj_path = str(out_path / "model_cleaned_watertight.obj")
         textured_obj_path = str(openmvs_dir / "scene_textured.obj")
+        textured_low_obj_path: Optional[str] = None
 
         resume = bool(job.get("resume", False))
 
@@ -294,6 +295,18 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                     config=config.cleaning,
                 )
 
+            # Generate dedicated low-poly geometry for branching texturing (eliminates white untextured low-poly!)
+            cleaned_low_path = out_path / "cleaned_mesh_low.obj"
+            try:
+                decimate_mesh(
+                    input_mesh_path=cleaned_obj_path,
+                    output_mesh_path=str(cleaned_low_path),
+                    target_faces=config.cleaning.target_low_poly_faces,
+                )
+            except Exception as dec_err:
+                logger.warning(f"Pre-texturing low-poly decimation failed ({dec_err}). Will fall back to standard decimation.")
+                cleaned_low_path = None
+
             # Determine appropriate MVS project file for TextureMesh
             mvs_project = "scene_mesh.mvs"
             if not (openmvs_dir / "scene_mesh.mvs").is_file():
@@ -316,8 +329,21 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                             sfm_data_path=cameras_known_sfm,
                             input_mesh_path=cleaned_obj_path,
                             images_folder=undistorted_dir,
+                            out_prefix=str(out_path / "texrecon" / "model_textured"),
                             mock_mode=job.get("mock_openmvs", False),
                         )
+                        if cleaned_low_path and cleaned_low_path.is_file():
+                            try:
+                                logger.info("Running branching texturing on low-poly mesh (texrecon)...")
+                                textured_low_obj_path, _ = tr_runner.run_texturing(
+                                    sfm_data_path=cameras_known_sfm,
+                                    input_mesh_path=str(cleaned_low_path),
+                                    images_folder=undistorted_dir,
+                                    out_prefix=str(out_path / "texrecon" / "model_textured_low"),
+                                    mock_mode=job.get("mock_openmvs", False),
+                                )
+                            except Exception as tr_low_err:
+                                logger.warning(f"texrecon low-poly texturing failed ({tr_low_err}).")
                 except Exception as tr_err:
                     logger.warning(
                         f"mvs-texturing failed ({tr_err}). Falling back to OpenMVS texturing."
@@ -326,7 +352,17 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                         _, textured_obj_path = runner.run_texture_mesh(
                             input_mvs=mvs_project,
                             mesh_file=cleaned_obj_path,
+                            output_mvs="scene_texture.mvs",
                         )
+                        if cleaned_low_path and cleaned_low_path.is_file():
+                            try:
+                                _, textured_low_obj_path = runner.run_texture_mesh(
+                                    input_mvs=mvs_project,
+                                    mesh_file=str(cleaned_low_path),
+                                    output_mvs="scene_texture_low.mvs",
+                                )
+                            except Exception as omvs_low_err:
+                                logger.warning(f"OpenMVS fallback low-poly texturing failed ({omvs_low_err}).")
             elif config.texturing_engine == "alicevision":
                 try:
                     with telemetry.step("4.4 AliceVision Texturing (Multi-Band & LSCM)"):
@@ -338,7 +374,23 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                             sfm_data_path=cameras_known_sfm,
                             input_mesh_path=cleaned_obj_path,
                             images_folder=undistorted_dir,
+                            output_mesh_name="texturedMesh.obj",
                         )
+                        if cleaned_low_path and cleaned_low_path.is_file():
+                            try:
+                                logger.info("Running branching texturing on low-poly mesh (AliceVision)...")
+                                av_low_runner = AliceVisionRunner(
+                                    config=config.alicevision,
+                                    work_dir=str(out_path / "alicevision" / "low"),
+                                )
+                                textured_low_obj_path, _ = av_low_runner.run_texturing(
+                                    sfm_data_path=cameras_known_sfm,
+                                    input_mesh_path=str(cleaned_low_path),
+                                    images_folder=undistorted_dir,
+                                    output_mesh_name="texturedMesh.obj",
+                                )
+                            except Exception as av_low_err:
+                                logger.warning(f"AliceVision low-poly texturing failed ({av_low_err}).")
                 except Exception as av_err:
                     logger.warning(
                         f"AliceVision texturing failed ({av_err}). Falling back to OpenMVS texturing."
@@ -347,13 +399,34 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                         _, textured_obj_path = runner.run_texture_mesh(
                             input_mvs=mvs_project,
                             mesh_file=cleaned_obj_path,
+                            output_mvs="scene_texture.mvs",
                         )
+                        if cleaned_low_path and cleaned_low_path.is_file():
+                            try:
+                                _, textured_low_obj_path = runner.run_texture_mesh(
+                                    input_mvs=mvs_project,
+                                    mesh_file=str(cleaned_low_path),
+                                    output_mvs="scene_texture_low.mvs",
+                                )
+                            except Exception as omvs_low_err:
+                                logger.warning(f"OpenMVS fallback low-poly texturing failed ({omvs_low_err}).")
             else:
                 with telemetry.step("4.4 OpenMVS TextureMesh (Watertight)"):
                     _, textured_obj_path = runner.run_texture_mesh(
                         input_mvs=mvs_project,
                         mesh_file=cleaned_obj_path,
+                        output_mvs="scene_texture.mvs",
                     )
+                    if cleaned_low_path and cleaned_low_path.is_file():
+                        try:
+                            logger.info("Running branching texturing on low-poly mesh (OpenMVS)...")
+                            _, textured_low_obj_path = runner.run_texture_mesh(
+                                input_mvs=mvs_project,
+                                mesh_file=str(cleaned_low_path),
+                                output_mvs="scene_texture_low.mvs",
+                            )
+                        except Exception as omvs_low_err:
+                            logger.warning(f"OpenMVS low-poly texturing failed ({omvs_low_err}).")
 
         else:
             logger.info("[MOCK] Creating mock OpenMVS geometry.")
@@ -369,6 +442,18 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                     output_obj_path=cleaned_obj_path,
                     config=config.cleaning,
                 )
+
+            cleaned_low_path = out_path / "cleaned_mesh_low.obj"
+            try:
+                decimate_mesh(
+                    input_mesh_path=cleaned_obj_path,
+                    output_mesh_path=str(cleaned_low_path),
+                    target_faces=config.cleaning.target_low_poly_faces,
+                )
+            except Exception as dec_err:
+                logger.warning(f"Mock decimation failed: {dec_err}")
+                cleaned_low_path = None
+
             if config.texturing_engine == "texrecon":
                 tr_runner = TexReconRunner(
                     config=config.texrecon,
@@ -378,10 +463,20 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                     sfm_data_path=cameras_known_sfm,
                     input_mesh_path=cleaned_obj_path,
                     images_folder=undistorted_dir,
+                    out_prefix=str(out_path / "texrecon" / "model_textured"),
                     mock_mode=True,
                 )
+                if cleaned_low_path and cleaned_low_path.is_file():
+                    textured_low_obj_path, _ = tr_runner.run_texturing(
+                        sfm_data_path=cameras_known_sfm,
+                        input_mesh_path=str(cleaned_low_path),
+                        images_folder=undistorted_dir,
+                        out_prefix=str(out_path / "texrecon" / "model_textured_low"),
+                        mock_mode=True,
+                    )
             else:
                 textured_obj_path = cleaned_obj_path
+                textured_low_obj_path = str(cleaned_low_path) if cleaned_low_path and cleaned_low_path.is_file() else None
 
         # ----------------------------------------------------------------------
         # STEP 6: Multi-LOD Asset Packaging & Cloud Archive (output.zip)
@@ -397,6 +492,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                 telemetry=telemetry,
                 config=config,
                 stats_json_path=stats_file,
+                textured_low_obj_path=textured_low_obj_path,
             )
 
         logger.info("=" * 70)

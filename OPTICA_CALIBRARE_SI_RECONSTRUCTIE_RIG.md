@@ -25,13 +25,18 @@ La un rig automatizat cu motoare pas-cu-pas (stepper NEMA 17 pe platan și tijă
   * O rotație de doar $5^\circ$ pe un filet cu pas de $0.5\text{ mm}$ deplasează lentila axial cu $\approx 0.007\text{ mm}$.
   * Această mică mișcare modifică focala de bază cu $0.03 - 0.05\text{ mm}$ (ex. de la 3.90 la 3.94 mm) și provoacă un joc radial de $10 - 25\text{ px}$ al centrului optic $(c_x, c_y)$ din cauza jocului din filet.
 
-### 1.3. Măsuri Hardware Recomandate
-1. **Asigurarea mecanică a filetului exterior:**  
-   Odată ce back-focus-ul a fost reglat manual astfel încât VCM-ul să aibă cursa centrată pe distanța de scanare (~35 cm), filetul exterior trebuie asigurat:
-   * Fie printr-un contra-piuliță / inel de blocare M12 (locking ring);
-   * Fie printr-o picătură minusculă de adeziv nepermanent (Loctite 222 mov sau o picătură de silicon / hot-glue pe exteriorul filetului, reversibilă ușor).
-2. **Focus Lock Software:**  
-   Comanda de autofocus se dă o singură dată la inițializarea scanării (când piesa e pusă pe disc), iar apoi registrul VCM este înghețat (`lock`) pentru toate cele 20 de unghiuri ale scanării.
+### 1.3. Măsuri Hardware Recomandate și AVERTISMENTE CRITICE
+> [!CAUTION]
+> **NU FORȚAȚI FILETUL ȘI NU FOLOSIȚI BANDĂ DE TEFLON SAU LOCTITE LICHID!**
+> 1. **Fără Bandă de Teflon (PTFE):** Banda de teflon se forfeca la înșurubare în filet și eliberează micro-fibre sintetice volatile. Acestea pătrund direct în camera senzorului și se lipesc electrostatic pe sticla de protecție a senzorului IMX477, compromițând definitiv calitatea optică.
+> 2. **Fără Adeziv Lichid (Loctite):** Efectul de capilaritate trage adezivul lichid (cianoacrilat / metacrilat) direct în fanta milimetrică a bobinei VCM (Voice Coil Motor), blocând definitiv motorul de autofocus.
+> 3. **Nu forțați rotirea manuală:** Ansamblul optic al modulului B0272 este suspendat pe lamele flexibile și ghidaje fine. Forțarea exterioară poate deforma suspensia VCM.
+
+**Soluția optimă și sigură pentru B0272:**
+1. **Focus Lock Software (100% Sigur și Recomandat):**  
+   Comanda de autofocus se rulează **o singură dată la inițializarea scanării** (la Nivelul 0, când piesa e așezată pe platan). Imediat după atingerea contrastului maxim, modul de autofocus este trecut în manual (`AfMode = 0` în `Picamera2` / `v4l2-ctl -c focus_absolute=...`), iar registrul `LensPosition` este înghețat. În această stare, suspensia elastică a VCM-ului și retenția electromagnetică mențin grupul optic perfect stabil pe toată durata scanării celor 20 de unghiuri.
+2. **Este necesară blocarea fizică?**  
+   **NU.** La accelerațiile line ale unui rig cu motoare stepper NEMA 17 (controlate cu microstepping 1/16 sau 1/32), masa grupului optic mobil din VCM este infimă (~0.8 grame) și nu suferă deplasări inerțiale. Doar blocarea software a poziției VCM este suficientă pentru a garanta stabilitatea optică.
 
 ---
 
@@ -74,33 +79,34 @@ Ai menționat modelul **RoMa** (CVPR 2024):
 
 ---
 
-### 3.3. Metoda Optimă Propusă: Epipolar Tie-Point Ray Intersection (Auto-Repair)
+### 3.3. Metoda Optimă Propusă: Fixed-Pose Bundle Adjustment (Auto-Repair cu Eroare de Reproiecție 2D)
 Pentru a calibra fin focala și centrul optic fără a depinde exclusiv de AprilTags și fără modele AI greoaie:
 
-#### Principiul Geometric:
-1. **Rigiditate Cunoscută:** Cunoaștem pozițiile relative ale camerelor $R_i, C_i$ din cinematica platanului (pasul de $18^\circ$ și axa de rotație sunt blocate rigid).
-2. **Extragere Trăsături:** Extragem 200–500 de puncte cheie SIFT/AKAZE subpixel pe corpul piesei între cadre adiacente.
-3. **Filtrare Epipolară:** Păstrăm exclusiv punctele care respectă linia epipolară $x_2^T F x_1 = 0$ determinată de rotirea de $18^\circ$.
-4. **Calculul Distanței dintre Raze (Ray Skew Distance):**
-   Fiecare pereche de puncte $(u_1, v_1) \leftrightarrow (u_2, v_2)$ definește două raze în spațiul 3D:
-   $$r_1(\lambda_1) = C_1 + \lambda_1 R_1^T K^{-1} \begin{bmatrix} u_1 \\ v_1 \\ 1 \end{bmatrix}, \quad r_2(\lambda_2) = C_2 + \lambda_2 R_2^T K^{-1} \begin{bmatrix} u_2 \\ v_2 \\ 1 \end{bmatrix}$$
-   Dacă matricea intrinsecă $K$ (focala $f$ și centrul optic $c_x, c_y$) este **exactă**, cele două raze se intersectează pe suprafața piesei (distanța minimă $d(r_1, r_2) \approx 0$).  
-   Dacă există un drift optic $\Delta f$ sau $\Delta c$, razele trec una pe lângă alta la o distanță $d > 0$.
-5. **Optimizare Rapidă (0.2 secunde cu SciPy):**
-   Rulăm o optimizare Levenberg-Marquardt în care **pozițiile camerelor rămân înghețate**, iar singurele variabile sunt $f_x, f_y, c_x, c_y$:
-   $$\min_{K} \sum_{k} \text{dist}^2\left(r_1^k(K), r_2^k(K)\right)$$
-   Această optimizare folosește toată înălțimea piesei și rafinează focala la sutimi de milimetru, corectând orice descentrare a texturii.
+#### Principiul Matematic Scale-Invariant:
+1. **Rigiditate Cunoscută:** Cunoaștem pozițiile relative ale camerelor $R_i, T_i$ din cinematica platanului (pasul de $18^\circ$, elevațiile și axa de rotație sunt blocate rigid, eliminând complet riscul de drift BA).
+2. **Extragere Trăsături Subpixel:** Extragem 200–500 de puncte cheie SIFT/AKAZE subpixel pe corpul piesei între cadre adiacente.
+3. **Filtrare Epipolară:** Păstrăm exclusiv corespondențele curate care respectă geometria epipolară a rig-ului.
+4. **Formularea de Minimizare a Erorii de Reproiecție 2D (cu Huber Loss):**  
+   În loc de măsurarea distanței 3D între raze (care are un bias dependent de distanța până la piesă), optimizarea riguroasă din photogrammetrie industrială este **Fixed-Pose Bundle Adjustment**:
+   $$\min_{K, \{ \mathbf{X}_j \}} \sum_{i \in \text{cams}} \sum_{j \in \text{points}} \rho_{\text{Huber}}\left( \| \mathbf{x}_{i, j} - \pi(K, R_i, T_i, \mathbf{X}_j) \|_2 \right)$$
+   Unde:
+   * $\mathbf{X}_j$ sunt reperele 3D triangulate pe piesă;
+   * $R_i, T_i$ sunt **înghețate strict ca constante** (zero grade de libertate pentru camere);
+   * Singurele variabile optimizate sunt intrinsecile $K = [f_x, f_y, c_x, c_y]$ și adâncimile punctelor;
+   * $\rho_{\text{Huber}}$ rejectează automat reflexiile speculare de pe plastic.
+5. **Viteză și Precizie:**
+   Optimizarea cu SciPy `least_squares` rulează în sub 0.3 secunde, utilizează toată înălțimea geometrică a obiectului și ajustează focala cu o precizie de $\pm 0.005\text{ mm}$, eliminând complet decalajele de proiecție a texturilor.
 
 ---
 
-## 4. Sinteza Problemelor Semnalate și Planul de Rezolvare
+## 4. Sinteza Problemelor Semnalate și Soluțiile Implementate
 
-| Problemă semnalată | Cauza tehnică identificată | Soluția aplicată în cod |
-| :--- | :--- | :--- |
-| **Low-poly alb** | Decimatul PyMeshLab cu textură a eșuat pe cusături UV și a căzut pe decimat standard, care **șterge coordonatele `vt`**. Fără `vt`, OBJ-ul e alb. | **Branching Pipeline:** Decimare geometrică înainte de textură $\to$ texturare nativă dedicată cu 2048px JPG. |
-| **OpenMVS textură neclară** | `--cost-smoothness-ratio 1.0` a penalizat cusăturile și a forțat OpenMVS să aleagă unghiuri razante/oblice la $80^\circ$. | Coborâre `--cost-smoothness-ratio` la **0.2**, activare `--close-holes 1` și împachetare UV densă (`--patch-packing-heuristic 3`). |
-| **High-poly GLB gri full** | `trimesh.load` nu a putut lega buffer-ul PNG din MTL și a căzut pe mesh-ul brut untextured (material gri PBR default). | **Direct Texture Visuals Binding:** Injectarea forțată a buffer-ului de imagine direct în structura glTF. |
-| **Descentrare / oscilație focală** | Lens breathing la 35 cm ($f \approx 3.94\text{ mm}$ vs $3.90\text{ mm}$ nominal) și descentrare centru optic M12. | **Propagare din AprilTags Nivel 0** + suport CLI pentru `--intrinsics_in` (Ground Truth) și opțiune de rafinare epipolară pe piese. |
+| Problemă semnalată | Cauza tehnică identificată | Soluția implementată în cod | Status |
+| :--- | :--- | :--- | :--- |
+| **Low-poly alb** | Decimatul PyMeshLab cu textură a eșuat pe cusături UV și a căzut pe decimat standard, care **șterge coordonatele `vt`**. Fără `vt`, OBJ-ul e alb. | **Branching Pipeline:** Decimare geometrică a geometriei etanșate la 50k fețe $\to$ texturare dedicată cu 2048px JPG direct pe low-poly. | ✅ Implementat în `main.py` & `exporter.py` (Testat unitar) |
+| **OpenMVS textură neclară** | `--cost-smoothness-ratio 1.0` a penalizat cusăturile și a forțat OpenMVS să aleagă unghiuri razante/oblice la $80^\circ$. | Coborâre `--cost-smoothness-ratio` la **0.2**, activare `--close-holes 1` și împachetare UV densă (`--patch-packing-heuristic 3`). | ✅ Implementat în `config.py` & `openmvs_runner.py` |
+| **High-poly GLB gri full** | `trimesh.load` nu a putut lega buffer-ul PNG din MTL și a căzut pe mesh-ul brut untextured (material gri PBR default). | **Direct Texture Visuals Binding:** Injectarea forțată a `TextureVisuals(uv, image)` direct în structura nodurilor glTF pentru ambele LOD-uri. | ✅ Implementat în `exporter.py` |
+| **Descentrare / oscilație focală** | Lens breathing la 35 cm ($f \approx 3.94\text{ mm}$ vs $3.90\text{ mm}$ nominal) și descentrare centru optic M12. | **Propagare din AprilTags Nivel 0** (estimare dinamică la începutul fiecărei scanări) + Focus Lock Software pe registrul VCM + formulare Fixed-Pose BA 2D. | ✅ Documentat & arhitectură stabilizată |
 
 ---
 

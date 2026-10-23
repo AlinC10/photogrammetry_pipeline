@@ -239,6 +239,8 @@ class OpenMVSRunner:
             "--outlier-threshold", str(self.config.outlier_threshold),
             "--global-seam-leveling", str(self.config.global_seam_leveling),
             "--local-seam-leveling", str(self.config.local_seam_leveling),
+            "--patch-packing-heuristic", str(getattr(self.config, "patch_packing_heuristic", 3)),
+            "--close-holes", str(getattr(self.config, "close_holes", 1)),
             "-v", "2",
         ]
         if mesh_file and Path(mesh_file).is_file():
