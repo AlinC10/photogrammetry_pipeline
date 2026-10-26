@@ -246,11 +246,9 @@ class OpenMVSRunner:
         ]
         if mesh_file and Path(mesh_file).is_file():
             cmd.extend(["-m", str(Path(mesh_file).resolve())])
-        if masks_dir and Path(masks_dir).is_dir():
-            cmd.extend([
-                "--mask-path", str(Path(masks_dir).resolve()),
-                "--ignore-mask-label", "0",
-            ])
+        # TextureMesh in OpenMVS v2.3.0 (Dockerfile) has no --mask-path option ("unrecognised option")
+        # and aborts; the masks are already burned into the undistorted images (black background)
+        # by bridge_sfm, so masks_dir is accepted for API compatibility but not passed.
 
         self._execute_cmd(cmd, "TextureMesh")
 

@@ -325,9 +325,14 @@ def clean_and_repair_mesh(
                     targetfacenum=target_high,
                     preserveboundary=True,
                     preservenormal=True,
+                    preservetopology=True,
                     planarquadric=True,
                     optimalplacement=True,
                 )
+                # Edge collapses can still leave a few non-manifold edges: repair and re-close
+                ms.meshing_repair_non_manifold_edges()
+                ms.meshing_repair_non_manifold_vertices()
+                ms.meshing_close_holes(maxholesize=30)
             except Exception as de:
                 logger.warning(f"Quadric edge collapse decimation warning: {de}")
 
@@ -348,7 +353,7 @@ def clean_and_repair_mesh(
         # (CRITICAL: prevents unnormalized 2pi length normals causing Blender specular frosting!)
         logger.info("Computing angle-weighted vertex normals and normalizing strictly (||n|| = 1.0000)...")
         try:
-            ms.compute_normal_per_vertex(weightingmode=1)
+            ms.compute_normal_per_vertex(weightmode=1)  # 1 = weighted by angle
             ms.apply_normal_normalization_per_vertex()
         except Exception as ne:
             logger.warning(f"Normal computation/normalization warning: {ne}")

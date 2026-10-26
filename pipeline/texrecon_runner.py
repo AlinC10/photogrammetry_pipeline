@@ -587,8 +587,9 @@ class TexReconRunner:
             cmd.append(f"--num_threads={self.config.num_threads}")
         if self.config.write_timings:
             cmd.append("--write_timings")
-        if self.config.write_intermediate_results:
-            cmd.append("--write_intermediate_results")
+        # texrecon writes <prefix>_labeling.vec / _data_costs.spt by default; the only switch is the opt-out
+        if not self.config.write_intermediate_results:
+            cmd.append("--no_intermediate_results")
 
         # Positional arguments: IN_SCENE IN_MESH OUT_PREFIX
         cmd.extend([
