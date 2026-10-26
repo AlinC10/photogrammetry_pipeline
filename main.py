@@ -163,8 +163,6 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             bin_dir=job.get("openmvs_bin_dir"),
             resolution_level=job.get("resolution_level", 1),
             smooth_mesh=job.get("smooth_mesh", 2),
-            number_views_fuse=int(job.get("number_views_fuse", 3)),
-            refine_mesh_enabled=bool(job.get("refine_mesh", True)),
             min_resolution=job.get("min_resolution", 640),
             texture_resolution=job.get("texture_resolution", 4096),
             empty_color=job.get("empty_color", 0),
@@ -384,24 +382,6 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                     raw_reconstructed_mesh = str(any_meshes[0])
                 else:
                     raw_reconstructed_mesh = str(openmvs_dir / "scene_mesh.ply")
-
-            # ----------------------------------------------------------------------
-            # STEP 4.5: Photo-consistency mesh refinement (smooths dents on dark/glossy plastic)
-            # ----------------------------------------------------------------------
-            refined_mesh = openmvs_dir / "scene_mesh_refined.ply"
-            if config.openmvs.refine_mesh_enabled:
-                if resume and refined_mesh.is_file():
-                    logger.info(f"[RESUME] Reusing refined mesh {refined_mesh.name}.")
-                    raw_reconstructed_mesh = str(refined_mesh)
-                else:
-                    try:
-                        with telemetry.step("4.5 OpenMVS RefineMesh"):
-                            raw_reconstructed_mesh = runner.run_refine_mesh(
-                                input_mvs="scene_dense.mvs",
-                                mesh_file=raw_reconstructed_mesh,
-                            )
-                    except Exception as refine_err:
-                        logger.warning(f"RefineMesh failed ({refine_err}); using the unrefined mesh.")
 
             # ----------------------------------------------------------------------
             # STEP 5: Watertight Base Slicing & Mesh Cleaning (BEFORE Texturing!)
@@ -690,8 +670,6 @@ def parse_args():
     parser.add_argument("--empty_color", type=int, default=0, help="OpenMVS empty/unobserved face color in decimal RGB (0=black, 16744231=orange)")
     parser.add_argument("--global_seam_leveling", type=int, default=0, help="OpenMVS global Poisson seam leveling (0=disabled to avoid dark bleeding, 1=enabled)")
     parser.add_argument("--local_seam_leveling", type=int, default=1, help="OpenMVS local seam edge blending (1=enabled, 0=disabled)")
-    parser.add_argument("--number_views_fuse", type=int, default=3, help="DensifyPointCloud --number-views-fuse: views that must agree to keep a point (default: 3)")
-    parser.add_argument("--no_refine_mesh", action="store_true", help="Skip OpenMVS RefineMesh (photo-consistency surface refinement)")
     parser.add_argument("--target_low_poly_faces", type=int, default=50000, help="Target face count for low-poly mesh (default: 50,000)")
     parser.add_argument("--export_scale", type=float, default=100.0, help="Scale factor applied to exported assets (default: 100.0 for real-world scale: 2.2mm -> 22cm)")
     parser.add_argument("--scale_to_mm", action="store_true", help="Shortcut to export OBJ in millimeters (sets export_scale=1000.0)")
@@ -753,8 +731,6 @@ def main():
         "global_seam_leveling": args.global_seam_leveling,
         "local_seam_leveling": args.local_seam_leveling,
         "target_low_poly_faces": args.target_low_poly_faces,
-        "number_views_fuse": args.number_views_fuse,
-        "refine_mesh": not args.no_refine_mesh,
         "export_scale": export_scale,
         "scale_stl_to_mm": True,
         "mock_openmvs": args.mock_openmvs,

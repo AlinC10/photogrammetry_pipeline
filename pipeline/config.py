@@ -163,9 +163,6 @@ class OpenMVSConfig:
     max_resolution: int = 3200
     density_factor: float = 1.0
     number_views: int = 6             # min views for PatchMatch (6 for turntable precision)
-    number_views_fuse: int = 3        # views that must agree to keep a fused point (2 left dents on dark plastic)
-    refine_mesh_enabled: bool = True  # Photo-consistency RefineMesh after ReconstructMesh
-    refine_resolution_level: int = 1  # RefineMesh image downscale (1 = 2x)
     smooth_mesh: int = 2              # OpenMVS ReconstructMesh --smooth (default 2)
     min_point_distance: float = 0.5   # mm distance filter
     texture_resolution: int = 4096    # high-res texture atlas
