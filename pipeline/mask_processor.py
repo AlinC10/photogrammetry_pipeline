@@ -337,15 +337,39 @@ def batch_generate_masks(
             safety_dilation_px=safety_dilation_px,
         )
 
-        dst_mask_name = f"{src_path.name}.mask.png"
+        view_id = str(v.get("viewId", idx))
+        stem_name = src_path.stem
+
+        # Save with canonical OpenMVS naming: {viewId}_{stem}.mask.png
+        # (e.g. 1000_f_1000.mask.png matching scene.mvs view names)
+        dst_mask_name = f"{view_id}_{stem_name}.mask.png"
         dst_mask_path = out_dir / dst_mask_name
 
         if HAS_PIL:
-            Image.fromarray(mask).save(str(dst_mask_path), format="PNG")
+            p_mask = Image.fromarray(mask)
+            p_mask.save(str(dst_mask_path), format="PNG")
+            # Also save compatibility aliases:
+            # 1. Image name without viewId: f_1000.mask.png and f_1000.jpg.mask.png
+            p_mask.save(str(out_dir / f"{stem_name}.mask.png"), format="PNG")
+            p_mask.save(str(out_dir / f"{src_path.name}.mask.png"), format="PNG")
+            # 2. In rig mode, maintain subdirectory rig/0 or 0:
+            if src_path.parent.name in {"0", "1", "rig0", "rig1"}:
+                rig_sub = out_dir / src_path.parent.name
+                rig_sub.mkdir(parents=True, exist_ok=True)
+                p_mask.save(str(rig_sub / f"{stem_name}.mask.png"), format="PNG")
+                p_mask.save(str(rig_sub / f"{src_path.name}.mask.png"), format="PNG")
         elif HAS_CV2:
             cv2.imwrite(str(dst_mask_path), mask)
+            cv2.imwrite(str(out_dir / f"{stem_name}.mask.png"), mask)
+            cv2.imwrite(str(out_dir / f"{src_path.name}.mask.png"), mask)
+            if src_path.parent.name in {"0", "1", "rig0", "rig1"}:
+                rig_sub = out_dir / src_path.parent.name
+                rig_sub.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(rig_sub / f"{stem_name}.mask.png"), mask)
+                cv2.imwrite(str(rig_sub / f"{src_path.name}.mask.png"), mask)
 
         mask_map[src_path.name] = str(dst_mask_path)
+        mask_map[f"{view_id}_{src_path.name}"] = str(dst_mask_path)
 
         if (idx + 1) % 10 == 0 or (idx + 1) == total:
             logger.info(f"  Processed {idx + 1}/{total} masks ({(idx + 1)/total*100:.0f}%)")

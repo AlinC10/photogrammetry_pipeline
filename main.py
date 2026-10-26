@@ -323,7 +323,16 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                     runner.run_interface_colmap(colmap_dir, undistorted_dir)
 
                 with telemetry.step("4.2 OpenMVS DensifyPointCloud"):
-                    runner.run_densify(masks_dir=masks_out_dir if Path(masks_out_dir).is_dir() else None)
+                    # Architectural principle: DensifyPointCloud runs cleanly on the full scene
+                    # without mask constraints (preventing OpenMVS fail-fast aborts and edge depth voids).
+                    # Turntable disc is cleanly sliced at Y = 3.0mm by mesh_cleaner.py.
+                    # Masks are strictly used for Texturing (texrecon / TextureMesh).
+                    effective_densify_masks = (
+                        masks_out_dir
+                        if config.masking.enabled and config.masking.use_for_densify and Path(masks_out_dir).is_dir()
+                        else None
+                    )
+                    runner.run_densify(masks_dir=effective_densify_masks)
 
             if not skip_reconstruct:
                 with telemetry.step("4.3 OpenMVS ReconstructMesh"):

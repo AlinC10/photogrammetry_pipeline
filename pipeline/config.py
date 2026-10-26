@@ -251,6 +251,7 @@ class MaskingConfig:
     brightness_white_threshold: float = 135.0 # Threshold for white photo-booth wall
     safety_dilation_px: int = 1              # Edge safety margin
     apply_to_texturing_images: bool = True   # Set background to black RGB(0,0,0) for TextureMesh / texrecon
+    use_for_densify: bool = False            # False: Densify runs cleanly on full scene; turntable is sliced at Y=3mm by mesh_cleaner
 
 
 @dataclass

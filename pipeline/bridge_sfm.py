@@ -284,41 +284,49 @@ def convert_sfm_to_colmap(
         mask_candidates = [
             src_img_path.parent / f"{src_img_path.stem}.mask.png",
             src_img_path.parent / f"{src_img_path.stem}_mask.png",
+            src_img_path.parent / f"{src_img_path.name}.mask.png",
         ]
         if masks_src_dir:
             m_src = Path(masks_src_dir)
             mask_candidates.extend([
+                m_src / f"{v['viewId']}_{src_img_path.stem}.mask.png",
+                m_src / f"{v['viewId']}_{src_img_path.name}.mask.png",
                 m_src / f"{src_img_path.stem}.mask.png",
                 m_src / f"{src_img_path.stem}_mask.png",
+                m_src / f"{src_img_path.name}.mask.png",
                 m_src / f"{src_img_path.stem}.png",
                 m_src / f"{src_img_path.name}",
                 m_src / src_img_path.parent.name / f"{src_img_path.stem}.mask.png",
                 m_src / src_img_path.parent.name / f"{src_img_path.stem}_mask.png",
+                m_src / src_img_path.parent.name / f"{src_img_path.name}.mask.png",
                 m_src / src_img_path.parent.name / f"{src_img_path.stem}.png",
                 m_src / "rig" / src_img_path.parent.name / f"{src_img_path.stem}.mask.png",
                 m_src / "rig" / src_img_path.parent.name / f"{src_img_path.stem}_mask.png",
+                m_src / "rig" / src_img_path.parent.name / f"{src_img_path.name}.mask.png",
                 m_src / "rig" / src_img_path.parent.name / f"{src_img_path.stem}.png",
             ])
 
         found_mask = False
         for m_cand in mask_candidates:
             if m_cand.is_file() and m_cand.resolve() != src_img_path.resolve():
-                # OpenMVS expects masks formatted as: <image_name>.mask.png
-                dst_mask_name = f"{dst_img_name}.mask.png"
-                dst_mask_in_undist = undist_img_path / dst_mask_name
+                # OpenMVS expects masks formatted as: <image_stem>.mask.png and/or <image_name>.mask.png
+                dst_stem_mask_name = f"{Path(dst_img_name).stem}.mask.png"  # e.g. 1000_f_1000.mask.png
+                dst_full_mask_name = f"{dst_img_name}.mask.png"             # e.g. 1000_f_1000.jpg.mask.png
+                dst_mask_in_undist = undist_img_path / dst_stem_mask_name
 
-                # Undistort mask directly alongside image for TextureMesh
+                # Undistort mask directly alongside image for TextureMesh & texrecon
                 undistort_single_image(
                     str(m_cand), str(dst_mask_in_undist),
                     c_info["K_orig"], c_info["dist"], K_new, is_mask=True
                 )
 
-                # Also save to masks_dst_dir if configured
+                # Save canonical mask names in undistorted and masks_dst_dir
+                shutil.copy2(dst_mask_in_undist, undist_img_path / dst_full_mask_name)
                 if masks_dst_dir:
-                    dst_mask_path = Path(masks_dst_dir) / dst_mask_name
-                    shutil.copy2(dst_mask_in_undist, dst_mask_path)
-                    # Also write without viewId prefix for compatibility
-                    compat_mask_path = Path(masks_dst_dir) / f"{src_img_path.name}.mask.png"
+                    m_dst = Path(masks_dst_dir)
+                    shutil.copy2(dst_mask_in_undist, m_dst / dst_stem_mask_name)
+                    shutil.copy2(dst_mask_in_undist, m_dst / dst_full_mask_name)
+                    compat_mask_path = m_dst / f"{src_img_path.stem}.mask.png"
                     if not compat_mask_path.is_file():
                         shutil.copy2(dst_mask_in_undist, compat_mask_path)
 
