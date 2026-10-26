@@ -232,11 +232,25 @@ class TexReconConfig:
     smoothness_term: str = "potts"      # Potts model MRF regularizer
     outlier_removal: str = "gauss_damping" # "gauss_damping", "none", "gauss_clamping"
     tone_mapping: str = "none"          # "none"
-    skip_global_seam_leveling: bool = False # False = Poisson global seam leveling enabled
+    skip_global_seam_leveling: bool = True  # True disables global Poisson solver that bleeds background into patches (RULE 8)
     skip_local_seam_leveling: bool = False  # False = local image-space seam blending enabled
     num_threads: Optional[int] = None   # None = auto-detect all available CPU cores
     write_timings: bool = True
     write_intermediate_results: bool = False
+
+
+@dataclass
+class MaskingConfig:
+    """Settings for automated background matting, silhouette masking, and turntable disc elimination."""
+    enabled: bool = True
+    auto_generate: bool = True               # Automatically generate masks from 3D cylinder + chroma
+    cylinder_radius_m: float = 0.080         # Radial bounding cylinder (80 mm, tightly encloses tool, cuts outer disc)
+    cylinder_y_min_m: float = 0.003          # Base cut 3 mm above turntable surface (strictly eliminates disc at Y=0)
+    cylinder_y_max_m: float = 0.350          # Maximum object height 350 mm
+    chroma_threshold: float = 20.0           # Threshold for color vs neutral background
+    brightness_white_threshold: float = 135.0 # Threshold for white photo-booth wall
+    safety_dilation_px: int = 1              # Edge safety margin
+    apply_to_texturing_images: bool = True   # Set background to black RGB(0,0,0) for TextureMesh / texrecon
 
 
 @dataclass
@@ -265,6 +279,7 @@ class PipelineConfig:
     use_masks: bool = True
     masks_dir: Optional[str] = None
     texturing_engine: str = "texrecon" # "texrecon" (mvs-texturing), "alicevision", or "openmvs"
+    masking: MaskingConfig = field(default_factory=MaskingConfig)
     texrecon: TexReconConfig = field(default_factory=TexReconConfig)
     openmvs: OpenMVSConfig = field(default_factory=OpenMVSConfig)
     alicevision: AliceVisionConfig = field(default_factory=AliceVisionConfig)

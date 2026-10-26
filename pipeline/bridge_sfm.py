@@ -317,6 +317,20 @@ def convert_sfm_to_colmap(
                 if masks_dst_dir:
                     dst_mask_path = Path(masks_dst_dir) / dst_mask_name
                     shutil.copy2(dst_mask_in_undist, dst_mask_path)
+                    # Also write without viewId prefix for compatibility
+                    compat_mask_path = Path(masks_dst_dir) / f"{src_img_path.name}.mask.png"
+                    if not compat_mask_path.is_file():
+                        shutil.copy2(dst_mask_in_undist, compat_mask_path)
+
+                # Zero out background in undistorted image (pitch-black RGB 0,0,0 for texrecon & OpenMVS)
+                try:
+                    u_img = cv2.imread(str(dst_img_path), cv2.IMREAD_COLOR)
+                    u_mask = cv2.imread(str(dst_mask_in_undist), cv2.IMREAD_GRAYSCALE)
+                    if u_img is not None and u_mask is not None:
+                        u_img[u_mask < 128] = 0
+                        cv2.imwrite(str(dst_img_path), u_img)
+                except Exception as m_err:
+                    logger.warning(f"Failed to apply mask black-out to {dst_img_path.name}: {m_err}")
 
                 found_mask = True
                 break

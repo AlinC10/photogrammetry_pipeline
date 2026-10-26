@@ -224,19 +224,30 @@ def export_sfm_to_cam_scene(
 
         orig_path = Path(v["path"])
         fname = orig_path.name
+        view_id = str(v.get("viewId", ""))
 
         # Locate undistorted image in undistorted_images_dir
-        undist_img = undist_dir / fname
-        if not undist_img.is_file():
-            # Check with .png or .jpg extensions
-            cand_png = undist_dir / f"{orig_path.stem}.png"
-            cand_jpg = undist_dir / f"{orig_path.stem}.jpg"
-            if cand_png.is_file():
-                undist_img = cand_png
-            elif cand_jpg.is_file():
-                undist_img = cand_jpg
-            else:
-                undist_img = orig_path
+        # Bridge SFM names undistorted files as: {viewId}_{filename}
+        candidates = [
+            undist_dir / f"{view_id}_{fname}",
+            undist_dir / f"{view_id}_{orig_path.stem}.png",
+            undist_dir / f"{view_id}_{orig_path.stem}.jpg",
+            undist_dir / fname,
+            undist_dir / f"{orig_path.stem}.png",
+            undist_dir / f"{orig_path.stem}.jpg",
+        ]
+        undist_img = None
+        for cand in candidates:
+            if cand.is_file():
+                undist_img = cand
+                break
+
+        if undist_img is None:
+            logger.warning(
+                f"Undistorted image not found for view {view_id} ({fname}) in {undist_dir}. "
+                f"Falling back to original path: {orig_path}"
+            )
+            undist_img = orig_path
 
         # Destination image inside scene_dir
         dst_img = scene_dir / undist_img.name
@@ -360,6 +371,11 @@ class TexReconRunner:
         else:
             out_pref = self.work_dir / "model_textured"
         out_pref.parent.mkdir(parents=True, exist_ok=True)
+
+        # Ensure any leftover "tmp" directory from a prior run is removed to prevent texrecon abort
+        tmp_dir = out_pref.parent / "tmp"
+        if tmp_dir.is_dir():
+            shutil.rmtree(str(tmp_dir), ignore_errors=True)
 
         final_obj = Path(f"{out_pref}.obj")
         final_mtl = Path(f"{out_pref}.mtl")

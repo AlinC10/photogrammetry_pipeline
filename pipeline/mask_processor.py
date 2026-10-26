@@ -1,6 +1,6 @@
 """
-mask_processor.py — Mask management and formatting for OpenMVS.
-Ensures masks are named as <image_name>.mask.png in the masks directory.
+mask_processor.py — Automated background matting, silhouette masking, and turntable disc elimination.
+Combines 3D cylinder visual hull projection with photometric foreground segmentation.
 """
 
 from __future__ import annotations
@@ -9,13 +9,354 @@ import logging
 import os
 import shutil
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-import cv2
 import numpy as np
 
 logger = logging.getLogger("TurntableStudio.MaskProcessor")
 
+try:
+    import cv2
+    HAS_CV2 = True
+except ImportError:
+    cv2 = None
+    HAS_CV2 = False
+
+try:
+    from PIL import Image, ImageDraw, ImageFilter
+    HAS_PIL = True
+except ImportError:
+    Image = None
+    ImageDraw = None
+    ImageFilter = None
+    HAS_PIL = False
+
+
+# -----------------------------------------------------------------------------
+# 1. 2D Convex Hull & 3D Cylinder Projection
+# -----------------------------------------------------------------------------
+
+def convex_hull_2d(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    """
+    Computes 2D convex hull of points via Andrew's monotone chain algorithm (O(N log N)).
+    """
+    pts = sorted(set(points))
+    if len(pts) <= 1:
+        return pts
+
+    def cross(o: Tuple[float, float], a: Tuple[float, float], b: Tuple[float, float]) -> float:
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower: List[Tuple[float, float]] = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+
+    upper: List[Tuple[float, float]] = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+
+    return lower[:-1] + upper[:-1]
+
+
+def project_cylinder_to_2d(
+    R: np.ndarray,
+    C: np.ndarray,
+    K: np.ndarray,
+    radius_m: float = 0.080,
+    y_min_m: float = 0.003,
+    y_max_m: float = 0.350,
+    n_angles: int = 64,
+) -> List[Tuple[float, float]]:
+    """
+    Projects the 3D bounding cylinder of the turntable scanning volume into the 2D camera view.
+    Points at y <= y_min_m (e.g. 0.003m) are strictly excluded, eliminating the turntable disc (y=0.0).
+    Returns the ordered 2D convex hull polygon boundary points.
+    """
+    thetas = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
+    cos_t = np.cos(thetas)
+    sin_t = np.sin(thetas)
+
+    # Sample bottom, middle, and top circular rings of the cylinder
+    bot = np.stack([radius_m * cos_t, np.full_like(thetas, y_min_m), radius_m * sin_t], axis=1)
+    mid = np.stack([radius_m * cos_t, np.full_like(thetas, (y_min_m + y_max_m) / 2.0), radius_m * sin_t], axis=1)
+    top = np.stack([radius_m * cos_t, np.full_like(thetas, y_max_m), radius_m * sin_t], axis=1)
+
+    pts_3d = np.vstack([bot, mid, top])
+
+    # World-to-camera projection: P_cam = R @ (P_world - C)
+    C_vec = C.flatten()
+    P_cam = (pts_3d - C_vec) @ R.T
+
+    # Filter points in front of the camera
+    valid = P_cam[:, 2] > 0.05
+    if not np.any(valid):
+        return []
+
+    pts_valid = P_cam[valid]
+    u = K[0, 0] * (pts_valid[:, 0] / pts_valid[:, 2]) + K[0, 2]
+    v = K[1, 1] * (pts_valid[:, 1] / pts_valid[:, 2]) + K[1, 2]
+
+    pts_2d = [(float(px), float(py)) for px, py in zip(u, v)]
+    return convex_hull_2d(pts_2d)
+
+
+# -----------------------------------------------------------------------------
+# 2. Hybrid Mask Generator
+# -----------------------------------------------------------------------------
+
+def generate_hybrid_mask(
+    image: Union[np.ndarray, "Image.Image", str, Path],
+    R: Optional[np.ndarray] = None,
+    C: Optional[np.ndarray] = None,
+    K: Optional[np.ndarray] = None,
+    cylinder_radius_m: float = 0.080,
+    cylinder_y_min_m: float = 0.003,
+    cylinder_y_max_m: float = 0.350,
+    chroma_threshold: float = 20.0,
+    brightness_white_threshold: float = 135.0,
+    safety_dilation_px: int = 1,
+    fill_holes: bool = True,
+) -> np.ndarray:
+    """
+    Generates a high-precision binary silhouette mask (0 = background, 255 = foreground).
+    Guarantees that ONLY the scanned physical object is visible:
+    1. 3D Bounding Cylinder projection (cuts away booth walls, aluminum rails, and turntable disc at y <= 0.003m).
+    2. Photometric segmentation (separates colorful plastic / dark rubber from bright white booth & white disc).
+    3. Connected component filtering (isolates largest component / tool, drops isolated tag fragments).
+    4. Morphological safety boundary.
+    """
+    # 1. Load image as RGB NumPy array
+    if isinstance(image, (str, Path)):
+        if HAS_PIL:
+            with Image.open(str(image)) as p_img:
+                rgb_arr = np.array(p_img.convert("RGB"), dtype=np.float32)
+        elif HAS_CV2:
+            bgr = cv2.imread(str(image))
+            if bgr is None:
+                raise FileNotFoundError(f"Failed to load image: {image}")
+            rgb_arr = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
+        else:
+            raise RuntimeError("PIL or cv2 required for image loading.")
+    elif HAS_PIL and isinstance(image, Image.Image):
+        rgb_arr = np.array(image.convert("RGB"), dtype=np.float32)
+    elif isinstance(image, np.ndarray):
+        rgb_arr = image.astype(np.float32)
+        if rgb_arr.ndim == 2:
+            rgb_arr = np.repeat(rgb_arr[:, :, None], 3, axis=2)
+    else:
+        raise ValueError(f"Unsupported image type: {type(image)}")
+
+    h, w = rgb_arr.shape[:2]
+
+    # 2. Geometric 3D Cylinder Visual Hull ROI
+    roi_mask = np.ones((h, w), dtype=bool)
+    if R is not None and C is not None and K is not None:
+        hull_pts = project_cylinder_to_2d(
+            R=R, C=C, K=K,
+            radius_m=cylinder_radius_m,
+            y_min_m=cylinder_y_min_m,
+            y_max_m=cylinder_y_max_m,
+        )
+        if len(hull_pts) >= 3:
+            if HAS_PIL:
+                roi_pil = Image.new("L", (w, h), 0)
+                draw = ImageDraw.Draw(roi_pil)
+                draw.polygon(hull_pts, fill=255)
+                roi_mask = np.array(roi_pil) > 128
+            elif HAS_CV2:
+                pts_cv = np.array(hull_pts, dtype=np.int32).reshape((-1, 1, 2))
+                roi_cv = np.zeros((h, w), dtype=np.uint8)
+                cv2.fillPoly(roi_cv, [pts_cv], 255)
+                roi_mask = roi_cv > 128
+    else:
+        # Fallback ROI: center 70% width, top 75% height (cuts off turntable disc & side frame)
+        roi_mask = np.zeros((h, w), dtype=bool)
+        x_min, x_max = int(w * 0.15), int(w * 0.85)
+        y_min, y_max = int(h * 0.05), int(h * 0.72)
+        roi_mask[y_min:y_max, x_min:x_max] = True
+
+    # 3. Photometric Color & Brightness Segmentation
+    r, g, b = rgb_arr[:, :, 0], rgb_arr[:, :, 1], rgb_arr[:, :, 2]
+    max_c = np.maximum(np.maximum(r, g), b)
+    min_c = np.minimum(np.minimum(r, g), b)
+    chroma = max_c - min_c
+    brightness = (r + g + b) / 3.0
+
+    # Flat white photo-booth wall & white turntable disc:
+    is_white_bg = (brightness > brightness_white_threshold) & (chroma < chroma_threshold)
+
+    # Foreground object: inside cylinder ROI, not white background
+    is_fg = (~is_white_bg) & roi_mask
+
+    # 4. Morphological Cleaning & Connected Component Filtering
+    scale_w = min(800, w)
+    scale_h = int(h * (scale_w / w))
+
+    if HAS_PIL:
+        fg_pil = Image.fromarray((is_fg * 255).astype(np.uint8)).resize((scale_w, scale_h), Image.Resampling.NEAREST)
+        if fill_holes:
+            closed_pil = fg_pil.filter(ImageFilter.MaxFilter(7)).filter(ImageFilter.MinFilter(5))
+        else:
+            closed_pil = fg_pil
+
+        sub_arr = np.array(closed_pil) > 128
+    elif HAS_CV2:
+        sub_fg = cv2.resize((is_fg * 255).astype(np.uint8), (scale_w, scale_h), interpolation=cv2.INTER_NEAREST)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+        closed_cv = cv2.morphologyEx(sub_fg, cv2.MORPH_CLOSE, kernel) if fill_holes else sub_fg
+        sub_arr = closed_cv > 128
+    else:
+        sub_arr = is_fg
+
+    # Connected Component Filtering (keep main physical object, eliminate isolated tags/reflections)
+    sh, sw = sub_arr.shape
+    visited = np.zeros_like(sub_arr, dtype=bool)
+    components: List[List[Tuple[int, int]]] = []
+
+    for y in range(0, sh, 2):
+        for x in range(0, sw, 2):
+            if sub_arr[y, x] and not visited[y, x]:
+                comp: List[Tuple[int, int]] = []
+                queue = [(y, x)]
+                visited[y, x] = True
+                while queue:
+                    cy, cx = queue.pop()
+                    comp.append((cy, cx))
+                    for dy, dx in [(-2, 0), (2, 0), (0, -2), (0, 2)]:
+                        ny, nx = cy + dy, cx + dx
+                        if 0 <= ny < sh and 0 <= nx < sw and sub_arr[ny, nx] and not visited[ny, nx]:
+                            visited[ny, nx] = True
+                            queue.append((ny, nx))
+                if len(comp) > 20:
+                    components.append(comp)
+
+    clean_sub = np.zeros_like(sub_arr, dtype=np.uint8)
+    if components:
+        # Keep components that are >= 20% of the largest component (isolates the tool)
+        largest_size = max(len(c) for c in components)
+        min_keep_size = max(50, int(largest_size * 0.20))
+        for comp in components:
+            if len(comp) >= min_keep_size:
+                for cy, cx in comp:
+                    clean_sub[max(0, cy - 1):min(sh, cy + 2), max(0, cx - 1):min(sw, cx + 2)] = 255
+    else:
+        clean_sub = (sub_arr.astype(np.uint8)) * 255
+
+    # 5. Safety Dilation / Erosion & Upsample to Native Resolution
+    if HAS_PIL:
+        clean_pil = Image.fromarray(clean_sub)
+        if safety_dilation_px > 0:
+            clean_pil = clean_pil.filter(ImageFilter.MaxFilter(int(safety_dilation_px * 2 + 1)))
+        final_mask_pil = clean_pil.resize((w, h), Image.Resampling.BILINEAR)
+        final_mask = (np.array(final_mask_pil) > 128).astype(np.uint8) * 255
+    elif HAS_CV2:
+        if safety_dilation_px > 0:
+            d_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (safety_dilation_px * 2 + 1, safety_dilation_px * 2 + 1))
+            clean_sub = cv2.dilate(clean_sub, d_kernel)
+        final_mask = cv2.resize(clean_sub, (w, h), interpolation=cv2.INTER_LINEAR)
+        final_mask = (final_mask > 128).astype(np.uint8) * 255
+    else:
+        final_mask = (is_fg.astype(np.uint8)) * 255
+
+    return final_mask
+
+
+# -----------------------------------------------------------------------------
+# 3. Batch Generation & Application
+# -----------------------------------------------------------------------------
+
+def apply_mask_to_image(image_arr: np.ndarray, mask_arr: np.ndarray) -> np.ndarray:
+    """
+    Sets background pixels (mask < 128) to pure black RGB(0, 0, 0).
+    Guarantees that TextureMesh and texrecon never sample white walls or AprilTags.
+    """
+    out_arr = image_arr.copy()
+    if mask_arr.ndim == 2:
+        m = mask_arr >= 128
+        if out_arr.ndim == 3:
+            out_arr[~m] = 0
+        else:
+            out_arr[~m] = 0
+    else:
+        m = mask_arr[..., 0] >= 128
+        out_arr[~m] = 0
+    return out_arr
+
+
+def batch_generate_masks(
+    views: List[Dict[str, Any]],
+    poses_dict: Dict[str, Dict[str, Any]],
+    intrinsics_dict: Dict[str, Dict[str, Any]],
+    output_masks_dir: Union[str, Path],
+    cylinder_radius_m: float = 0.080,
+    cylinder_y_min_m: float = 0.003,
+    cylinder_y_max_m: float = 0.350,
+    chroma_threshold: float = 20.0,
+    brightness_white_threshold: float = 135.0,
+    safety_dilation_px: int = 1,
+) -> Dict[str, str]:
+    """
+    Generates automated binary masks for all views in the dataset.
+    Saves `<image_name>.mask.png` in output_masks_dir.
+    Returns mapping: {image_filename: mask_file_path}.
+    """
+    out_dir = Path(output_masks_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    mask_map: Dict[str, str] = {}
+    total = len(views)
+    logger.info(f"Starting automated background matting for {total} images...")
+
+    for idx, v in enumerate(views):
+        src_path = Path(v["path"])
+        if not src_path.is_file():
+            continue
+
+        pose_id = str(v.get("poseId", v.get("viewId", "")))
+        intr_id = str(v.get("intrinsicId", "0"))
+
+        pose_info = poses_dict.get(pose_id)
+        intr_info = intrinsics_dict.get(intr_id)
+
+        R = pose_info.get("R") if pose_info else None
+        C = pose_info.get("C") if pose_info else None
+        K = intr_info.get("K") if intr_info else None
+
+        mask = generate_hybrid_mask(
+            image=src_path,
+            R=R, C=C, K=K,
+            cylinder_radius_m=cylinder_radius_m,
+            cylinder_y_min_m=cylinder_y_min_m,
+            cylinder_y_max_m=cylinder_y_max_m,
+            chroma_threshold=chroma_threshold,
+            brightness_white_threshold=brightness_white_threshold,
+            safety_dilation_px=safety_dilation_px,
+        )
+
+        dst_mask_name = f"{src_path.name}.mask.png"
+        dst_mask_path = out_dir / dst_mask_name
+
+        if HAS_PIL:
+            Image.fromarray(mask).save(str(dst_mask_path), format="PNG")
+        elif HAS_CV2:
+            cv2.imwrite(str(dst_mask_path), mask)
+
+        mask_map[src_path.name] = str(dst_mask_path)
+
+        if (idx + 1) % 10 == 0 or (idx + 1) == total:
+            logger.info(f"  Processed {idx + 1}/{total} masks ({(idx + 1)/total*100:.0f}%)")
+
+    logger.info(f"Completed automated masking: {len(mask_map)} masks saved in {out_dir}")
+    return mask_map
+
+
+# -----------------------------------------------------------------------------
+# 4. Discovery & Legacy OpenMVS Utilities
+# -----------------------------------------------------------------------------
 
 def discover_masks(
     masks_dir: str,
@@ -40,7 +381,6 @@ def discover_masks(
     mask_map = {}
     for img in image_files:
         stem = img.stem
-        # Look for various naming schemes
         candidates = [
             m_dir / f"{stem}.mask.png",
             m_dir / f"{stem}.png",
@@ -74,15 +414,20 @@ def prepare_openmvs_masks(
         dst_name = f"{img_name}.mask.png"
         dst_path = target_dir / dst_name
 
-        mask = cv2.imread(mask_src, cv2.IMREAD_GRAYSCALE)
-        if mask is None:
-            logger.warning(f"Failed to read mask image: {mask_src}")
-            continue
-
-        # Ensure pure binary mask (0 = background, 255 = object)
-        _, binary_mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
-        cv2.imwrite(str(dst_path), binary_mask)
-        prepared_count += 1
+        if HAS_CV2:
+            mask = cv2.imread(mask_src, cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                logger.warning(f"Failed to read mask image: {mask_src}")
+                continue
+            _, binary_mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+            cv2.imwrite(str(dst_path), binary_mask)
+            prepared_count += 1
+        elif HAS_PIL:
+            with Image.open(mask_src) as p_img:
+                gray = p_img.convert("L")
+                arr = (np.array(gray) > 128).astype(np.uint8) * 255
+                Image.fromarray(arr).save(str(dst_path), format="PNG")
+                prepared_count += 1
 
     logger.info(f"Prepared {prepared_count} OpenMVS masks in {target_dir}")
     return str(target_dir)

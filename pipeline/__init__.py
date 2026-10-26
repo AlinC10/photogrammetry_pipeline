@@ -2,9 +2,10 @@
 Turntable Studio - Studio-grade 3D scanning pipeline with OpenMVS.
 """
 
-from .config import PipelineConfig, OpenMVSConfig, AliceVisionConfig, TexReconConfig, TurntableConfig, MeshCleaningConfig
+from .config import PipelineConfig, OpenMVSConfig, AliceVisionConfig, TexReconConfig, TurntableConfig, MeshCleaningConfig, MaskingConfig
 from .camera_init import scan_input_directory, generate_camera_init_sfm, run_turntable_poses
 from .bridge_sfm import convert_sfm_to_colmap
+from .mask_processor import batch_generate_masks, generate_hybrid_mask, apply_mask_to_image, discover_masks, prepare_openmvs_masks
 from .openmvs_runner import OpenMVSRunner
 from .alicevision_runner import AliceVisionRunner, find_alicevision_binary
 from .texrecon_runner import TexReconRunner, find_texrecon_binary, export_sfm_to_cam_scene
@@ -21,10 +22,16 @@ __all__ = [
     "TexReconConfig",
     "TurntableConfig",
     "MeshCleaningConfig",
+    "MaskingConfig",
     "scan_input_directory",
     "generate_camera_init_sfm",
     "run_turntable_poses",
     "convert_sfm_to_colmap",
+    "batch_generate_masks",
+    "generate_hybrid_mask",
+    "apply_mask_to_image",
+    "discover_masks",
+    "prepare_openmvs_masks",
     "OpenMVSRunner",
     "AliceVisionRunner",
     "find_alicevision_binary",

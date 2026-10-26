@@ -235,6 +235,9 @@ def package_textured_model(
                             first_new = list(tex_map_replacements.values())[0]
                             parts = clean_l.split(maxsplit=1)
                             clean_l = f"{parts[0]} {first_new}"
+                    # Ensure neutral ambient reflection for photogrammetry baked textures (prevents washed-out blacks in Blender)
+                    if clean_l.strip().startswith("Ka "):
+                        clean_l = "Ka 0.000000 0.000000 0.000000"
                     mtl_lines.append(clean_l + "\n")
         except Exception as e:
             logger.warning(f"Error reading source MTL: {e}")
@@ -245,7 +248,7 @@ def package_textured_model(
         mtl_lines = [
             f"# Material file for {dst_obj_path.name}\n",
             "newmtl material_0\n",
-            "Ka 1.000000 1.000000 1.000000\n",
+            "Ka 0.000000 0.000000 0.000000\n",
             "Kd 1.000000 1.000000 1.000000\n",
             "Ks 0.000000 0.000000 0.000000\n",
             "d 1.000000\n",
@@ -436,7 +439,7 @@ def export_multi_lod_bundle(
                 target_format="jpg",
                 downscale_max_dim=2048,
                 jpg_quality=85,
-                scale=exp_scale,
+                scale=1.0,  # high_obj is already scaled by exp_scale, so avoid double-scaling
             )
 
         # Helper: GLB postprocessor for unlit, double-sided photogrammetry materials

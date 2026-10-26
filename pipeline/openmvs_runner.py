@@ -206,6 +206,7 @@ class OpenMVSRunner:
         input_mvs: str = "scene_mesh.mvs",
         output_mvs: str = "scene_textured.mvs",
         mesh_file: Optional[str] = None,
+        masks_dir: Optional[str] = None,
     ) -> Tuple[str, str]:
         """
         Generates global UV atlas and textures mesh from original camera views.
@@ -245,6 +246,11 @@ class OpenMVSRunner:
         ]
         if mesh_file and Path(mesh_file).is_file():
             cmd.extend(["-m", str(Path(mesh_file).resolve())])
+        if masks_dir and Path(masks_dir).is_dir():
+            cmd.extend([
+                "--mask-path", str(Path(masks_dir).resolve()),
+                "--ignore-mask-label", "0",
+            ])
 
         self._execute_cmd(cmd, "TextureMesh")
 

@@ -99,9 +99,10 @@ class TestExporter(unittest.TestCase):
         high_obj_content = (high_dir / "model_high.obj").read_text()
         self.assertIn("mtllib model_high.mtl", high_obj_content)
 
-        # Verify model_high.mtl references the PNG texture
+        # Verify model_high.mtl references the PNG texture and has neutral Ka 0
         high_mtl_content = (high_dir / "model_high.mtl").read_text()
         self.assertIn(".png", high_mtl_content)
+        self.assertIn("Ka 0.000000 0.000000 0.000000", high_mtl_content)
 
         # Check Low-Poly deliverables
         low_dir = output_dir / "obj" / "low"
@@ -117,9 +118,10 @@ class TestExporter(unittest.TestCase):
         low_obj_content = (low_dir / "model_low.obj").read_text()
         self.assertIn("mtllib model_low.mtl", low_obj_content)
 
-        # Verify model_low.mtl references the JPG texture
+        # Verify model_low.mtl references the JPG texture and has neutral Ka 0
         low_mtl_content = (low_dir / "model_low.mtl").read_text()
         self.assertIn(".jpg", low_mtl_content)
+        self.assertIn("Ka 0.000000 0.000000 0.000000", low_mtl_content)
 
         # Check GLB deliverables
         glb_dir = output_dir / "glb"

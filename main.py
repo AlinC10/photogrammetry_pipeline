@@ -15,6 +15,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import numpy as np
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -26,6 +28,11 @@ logger = logging.getLogger("TurntableStudio")
 from pipeline.alicevision_runner import AliceVisionRunner, find_alicevision_binary
 from pipeline.texrecon_runner import TexReconRunner, find_texrecon_binary
 from pipeline.bridge_sfm import convert_sfm_to_colmap
+from pipeline.mask_processor import (
+    batch_generate_masks,
+    discover_masks,
+    prepare_openmvs_masks,
+)
 from pipeline.camera_init import (
     generate_camera_init_sfm,
     run_turntable_poses,
@@ -35,6 +42,7 @@ from pipeline.config import (
     AliceVisionConfig,
     TexReconConfig,
     MeshCleaningConfig,
+    MaskingConfig,
     OpenMVSConfig,
     PipelineConfig,
     TurntableConfig,
@@ -210,20 +218,73 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                     json.dump(mock_data, f)
 
         # ----------------------------------------------------------------------
+        # STEP 2.5: Automated Hybrid Background Matting & Turntable Elimination
+        # ----------------------------------------------------------------------
+        masks_out_dir = str(out_path / "masks")
+        masks_src: Optional[str] = config.masks_dir or str(Path(input_dir) / "masks")
+        if not Path(masks_src).is_dir():
+            masks_src = None
+
+        if config.use_masks and config.masking.enabled and config.masking.auto_generate:
+            with telemetry.step("2.5. Automated Masking & Turntable Elimination"):
+                if not mock_openmvs:
+                    with open(cameras_known_sfm, "r", encoding="utf-8") as f:
+                        sfm_data_mask = json.load(f)
+
+                    m_views = sfm_data_mask.get("views", [])
+                    m_intrinsics = {}
+                    for intr in sfm_data_mask.get("intrinsics", []):
+                        w_val = float(intr.get("width", 4056))
+                        h_val = float(intr.get("height", 3040))
+                        sensor_w = float(intr.get("sensorWidth", 6.287) or 6.287)
+                        focal_mm = float(intr.get("focalLength", 3.9) or 3.9)
+                        fx = focal_mm * (w_val / sensor_w)
+                        fy = fx * float(intr.get("pixelRatio", 1.0) or 1.0)
+                        pp = intr.get("principalPoint", [0.0, 0.0])
+                        cx = (w_val / 2.0) + float(pp[0]) if abs(float(pp[0])) < (w_val / 4.0) else float(pp[0])
+                        cy = (h_val / 2.0) + float(pp[1]) if abs(float(pp[1])) < (h_val / 4.0) else float(pp[1])
+                        m_intrinsics[str(intr["intrinsicId"])] = {
+                            "K": np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+                        }
+
+                    m_poses = {}
+                    for p in sfm_data_mask.get("poses", []):
+                        m_poses[str(p["poseId"])] = {
+                            "R": np.array(p["pose"]["transform"]["rotation"], dtype=np.float64).reshape((3, 3), order="F"),
+                            "C": np.array(p["pose"]["transform"]["center"], dtype=np.float64),
+                        }
+
+                    auto_masks = batch_generate_masks(
+                        views=m_views,
+                        poses_dict=m_poses,
+                        intrinsics_dict=m_intrinsics,
+                        output_masks_dir=masks_out_dir,
+                        cylinder_radius_m=config.masking.cylinder_radius_m,
+                        cylinder_y_min_m=config.masking.cylinder_y_min_m,
+                        cylinder_y_max_m=config.masking.cylinder_y_max_m,
+                        chroma_threshold=config.masking.chroma_threshold,
+                        brightness_white_threshold=config.masking.brightness_white_threshold,
+                        safety_dilation_px=config.masking.safety_dilation_px,
+                    )
+                    masks_src = masks_out_dir
+                    logger.info(f"Generated {len(auto_masks)} foreground masks in {masks_out_dir}.")
+                else:
+                    Path(masks_out_dir).mkdir(parents=True, exist_ok=True)
+                    masks_src = masks_out_dir
+
+        # ----------------------------------------------------------------------
         # STEP 3: Convert SFM to COLMAP & Undistort Images/Masks
         # ----------------------------------------------------------------------
         colmap_dir = str(out_path / "colmap")
         undistorted_dir = str(out_path / "undistorted")
-        masks_out_dir = str(out_path / "masks")
 
         with telemetry.step("3. Bridge SFM & Image Undistortion"):
-            masks_src = config.masks_dir or str(Path(input_dir) / "masks")
             bridge_res = convert_sfm_to_colmap(
                 sfm_json_path=cameras_known_sfm,
                 output_colmap_dir=colmap_dir,
                 undistorted_images_dir=undistorted_dir,
-                masks_src_dir=masks_src if Path(masks_src).is_dir() else None,
-                masks_dst_dir=masks_out_dir if Path(masks_src).is_dir() else None,
+                masks_src_dir=masks_src if masks_src and Path(masks_src).is_dir() else None,
+                masks_dst_dir=masks_out_dir if masks_src and Path(masks_src).is_dir() else None,
             )
 
         # ----------------------------------------------------------------------
@@ -351,10 +412,12 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                         f"mvs-texturing failed ({tr_err}). Falling back to OpenMVS texturing."
                     )
                     with telemetry.step("4.4 OpenMVS TextureMesh (Fallback)"):
+                        effective_mask_dir = masks_out_dir if masks_src and Path(masks_out_dir).is_dir() else None
                         _, textured_obj_path = runner.run_texture_mesh(
                             input_mvs=mvs_project,
                             mesh_file=cleaned_obj_path,
                             output_mvs="scene_texture.mvs",
+                            masks_dir=effective_mask_dir,
                         )
                         if cleaned_low_path and cleaned_low_path.is_file():
                             try:
@@ -362,6 +425,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                                     input_mvs=mvs_project,
                                     mesh_file=str(cleaned_low_path),
                                     output_mvs="scene_texture_low.mvs",
+                                    masks_dir=effective_mask_dir,
                                 )
                             except Exception as omvs_low_err:
                                 logger.warning(f"OpenMVS fallback low-poly texturing failed ({omvs_low_err}).")
@@ -398,10 +462,12 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                         f"AliceVision texturing failed ({av_err}). Falling back to OpenMVS texturing."
                     )
                     with telemetry.step("4.4 OpenMVS TextureMesh (Fallback)"):
+                        effective_mask_dir = masks_out_dir if masks_src and Path(masks_out_dir).is_dir() else None
                         _, textured_obj_path = runner.run_texture_mesh(
                             input_mvs=mvs_project,
                             mesh_file=cleaned_obj_path,
                             output_mvs="scene_texture.mvs",
+                            masks_dir=effective_mask_dir,
                         )
                         if cleaned_low_path and cleaned_low_path.is_file():
                             try:
@@ -409,15 +475,18 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                                     input_mvs=mvs_project,
                                     mesh_file=str(cleaned_low_path),
                                     output_mvs="scene_texture_low.mvs",
+                                    masks_dir=effective_mask_dir,
                                 )
                             except Exception as omvs_low_err:
                                 logger.warning(f"OpenMVS fallback low-poly texturing failed ({omvs_low_err}).")
             else:
                 with telemetry.step("4.4 OpenMVS TextureMesh (Watertight)"):
+                    effective_mask_dir = masks_out_dir if masks_src and Path(masks_out_dir).is_dir() else None
                     _, textured_obj_path = runner.run_texture_mesh(
                         input_mvs=mvs_project,
                         mesh_file=cleaned_obj_path,
                         output_mvs="scene_texture.mvs",
+                        masks_dir=effective_mask_dir,
                     )
                     if cleaned_low_path and cleaned_low_path.is_file():
                         try:
@@ -426,6 +495,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                                 input_mvs=mvs_project,
                                 mesh_file=str(cleaned_low_path),
                                 output_mvs="scene_texture_low.mvs",
+                                masks_dir=effective_mask_dir,
                             )
                         except Exception as omvs_low_err:
                             logger.warning(f"OpenMVS low-poly texturing failed ({omvs_low_err}).")
