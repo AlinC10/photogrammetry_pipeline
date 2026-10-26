@@ -258,6 +258,48 @@ def generate_camera_init_sfm(
     return str(out_p)
 
 
+def build_turntable_poses_cmd(
+    script_path: Path,
+    camera_init_sfm: str,
+    output_known_sfm: str,
+    config: TurntableConfig,
+    report_path: Optional[str] = None,
+    calib_out_path: Optional[str] = None,
+    python_exe: Optional[str] = None,
+) -> List[str]:
+    """
+    Command line for turntable_poses.py. Only options the script already exposes are passed
+    (RULE 1): the script itself is never changed.
+    """
+    cmd = [
+        python_exe or sys.executable,
+        str(script_path),
+        "--input", str(Path(camera_init_sfm).resolve()),
+        "--output", str(Path(output_known_sfm).resolve()),
+        "--stepDeg", str(config.step_deg),
+        "--tagScale", str(config.tag_scale),
+        "--nameRegex", config.name_regex,
+        # The script's own default is 80 mm/level while the scanner raises the carriage 100 mm
+        # (z_axis.distance_mm); with --estimateLift False a wrong value shifts every upper level.
+        "--liftMm", str(config.lift_mm),
+        "--estimateLift", "True" if config.estimate_lift else "False",
+        "--tagRefine", "True" if config.tag_refine else "False",
+    ]
+
+    if config.intrinsics_in:
+        cmd.extend(["--intrinsicsIn", str(Path(config.intrinsics_in).resolve())])
+
+    if config.tag_layout:
+        cmd.extend(["--layout", str(Path(config.tag_layout).resolve())])
+
+    if calib_out_path:
+        cmd.extend(["--calibOut", str(Path(calib_out_path).resolve())])
+
+    if report_path:
+        cmd.extend(["--report", str(Path(report_path).resolve())])
+    return cmd
+
+
 def run_turntable_poses(
     camera_init_sfm: str,
     output_known_sfm: str,
@@ -282,26 +324,15 @@ def run_turntable_poses(
     out_sfm = Path(output_known_sfm).resolve()
     out_sfm.parent.mkdir(parents=True, exist_ok=True)
 
-    py_exe = custom_python_exe or sys.executable
-
-    cmd = [
-        py_exe,
-        str(script_path),
-        "--input", str(Path(camera_init_sfm).resolve()),
-        "--output", str(out_sfm),
-        "--stepDeg", str(config.step_deg),
-        "--tagScale", str(config.tag_scale),
-        "--nameRegex", config.name_regex,
-    ]
-
-    if config.tag_layout:
-        cmd.extend(["--layout", str(Path(config.tag_layout).resolve())])
-
-    if calib_out_path:
-        cmd.extend(["--calibOut", str(Path(calib_out_path).resolve())])
-
-    if report_path:
-        cmd.extend(["--report", str(Path(report_path).resolve())])
+    cmd = build_turntable_poses_cmd(
+        script_path=script_path,
+        camera_init_sfm=camera_init_sfm,
+        output_known_sfm=str(out_sfm),
+        config=config,
+        report_path=report_path,
+        calib_out_path=calib_out_path,
+        python_exe=custom_python_exe,
+    )
 
     logger.info(f"Executing TurntablePoses: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)

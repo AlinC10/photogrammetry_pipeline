@@ -209,18 +209,26 @@ class TurntableConfig:
     name_regex: str = r"(?P<level>\d)[_]?(?P<index>\d{1,4})$"
     sensor_width_mm: float = DEFAULT_SENSOR_WIDTH_MM
     default_focal_mm: float = DEFAULT_FOCAL_LENGTH_MM
+    lift_mm: float = 100.0            # Z carriage travel per level (scanner z_axis.distance_mm); turntable_poses defaults to 80
+    estimate_lift: bool = False       # True = turntable_poses estimates the real lift instead of trusting lift_mm
+    tag_refine: bool = True           # Per-tag height/tilt (paper unevenness): RMS 4.09 -> 2.48 px on the Parkside set
+    intrinsics_in: Optional[str] = None  # Optional chessboard calibration JSON from calibrate_intrinsics.py
 
 
 @dataclass
 class MeshCleaningConfig:
     """Watertight base slicing and CAD pedestal sealing."""
-    slice_y_m: float = 0.003          # Cut plane at Y = 3 mm above turntable
-    skirt_bottom_y_m: float = 0.000   # Extrude down to Y = 0 mm (turntable plane)
+    slice_y_m: float = 0.001          # Cut plane at Y = 1.0 mm above turntable (strictly removes disc)
+    skirt_bottom_y_m: float = 0.001   # Capped directly at Y = 1.0 mm (no vertical extruded skirt)
+    extrude_skirt: bool = False       # Disable vertical skirt extrusion to prevent disc texture projection
+    base_color_rgb: tuple[int, int, int] = (25, 25, 25) # Technical dark matte for unobserved base
     max_radius_m: float = 0.12        # Radial bounding cylinder (120 mm)
     keep_largest_only: bool = True
     remove_duplicate_faces: bool = True
     target_low_poly_faces: int = 50000
+    target_high_poly_faces: int = 250000 # Optimal high-poly count: preserves all embossed text/edges, eliminates micro-noise
     smooth_iterations: int = 12       # Taubin volume-preserving smoothing (eliminates 2-4mm ripples)
+    high_poly_smooth_iterations: int = 5 # Taubin steps for high-poly (smooths 200um noise without loss of detail)
 
 
 @dataclass
@@ -228,12 +236,13 @@ class TexReconConfig:
     """Paths and settings for mvs-texturing (texrecon) from TU Darmstadt."""
     bin_dir: Optional[str] = None
     texrecon_bin: Optional[str] = None
-    data_term: str = "gmi"              # "gmi" (gradient magnitude + intensity) or "color"
+    data_term: str = "gmi"              # "gmi" (gradient magnitude integral) or "area" — the only two texrecon accepts
     smoothness_term: str = "potts"      # Potts model MRF regularizer
     outlier_removal: str = "gauss_damping" # "gauss_damping", "none", "gauss_clamping"
     tone_mapping: str = "none"          # "none"
     skip_global_seam_leveling: bool = True  # True disables global Poisson solver that bleeds background into patches (RULE 8)
     skip_local_seam_leveling: bool = False  # False = local image-space seam blending enabled
+    keep_unseen_faces: bool = True      # Keep faces no view sees (undersides, base) instead of leaving holes in the OBJ
     num_threads: Optional[int] = None   # None = auto-detect all available CPU cores
     write_timings: bool = True
     write_intermediate_results: bool = False
@@ -244,14 +253,29 @@ class MaskingConfig:
     """Settings for automated background matting, silhouette masking, and turntable disc elimination."""
     enabled: bool = True
     auto_generate: bool = True               # Automatically generate masks from 3D cylinder + chroma
-    cylinder_radius_m: float = 0.080         # Radial bounding cylinder (80 mm, tightly encloses tool, cuts outer disc)
-    cylinder_y_min_m: float = 0.003          # Base cut 3 mm above turntable surface (strictly eliminates disc at Y=0)
-    cylinder_y_max_m: float = 0.350          # Maximum object height 350 mm
+    cylinder_radius_m: float = 0.080         # Radial bounding cylinder (80 mm); 35 mm cut the Parkside tool (max radius 38.7 mm)
+    cylinder_y_min_m: float = 0.001          # Base cut 1.0 mm above turntable (matches slice_y_m = 1.0 mm)
+    cylinder_y_max_m: float = 0.350          # Maximum object height 350 mm (the Parkside tool alone is 230 mm)
     chroma_threshold: float = 20.0           # Threshold for color vs neutral background
     brightness_white_threshold: float = 135.0 # Threshold for white photo-booth wall
     safety_dilation_px: int = 1              # Edge safety margin
+    tag_blackout: bool = True                # Explicit geometric blackout of all 12 AprilTags
+    tag_expansion_factor: float = 1.25       # Expand tag quad by 25% to guarantee full black border suppression
     apply_to_texturing_images: bool = True   # Set background to black RGB(0,0,0) for TextureMesh / texrecon
-    use_for_densify: bool = False            # False: Densify runs cleanly on full scene; turntable is sliced at Y=3mm by mesh_cleaner
+    use_for_densify: bool = False            # False: Densify runs cleanly on full scene; turntable is sliced at Y=1mm by mesh_cleaner
+
+
+@dataclass
+class TexturingImagesConfig:
+    """Images texrecon textures from, rebuilt after mesh cleaning (texture_prep.py)."""
+    enabled: bool = True                     # False = texrecon uses the undistorted/ images of the bridge step
+    margin_px: int = 2                       # Mesh silhouette dilation (px) tolerating small pose errors
+    trim_band_px: int = 25                   # White background pulled inside the silhouette by pose error is trimmed within this band
+    brightness_white_threshold: float = 135.0 # Same booth-white test as the photometric mask, only applied in the band
+    chroma_threshold: float = 20.0
+    colour_normalize: bool = True            # Per-camera gains from the turntable paper (AWB of camera 1 differs)
+    max_gain_deviation: float = 0.25         # Gains are clamped to [0.75, 1.25]
+    workers: int = 4
 
 
 @dataclass
@@ -281,6 +305,7 @@ class PipelineConfig:
     masks_dir: Optional[str] = None
     texturing_engine: str = "texrecon" # "texrecon" (mvs-texturing), "alicevision", or "openmvs"
     masking: MaskingConfig = field(default_factory=MaskingConfig)
+    texturing_images: TexturingImagesConfig = field(default_factory=TexturingImagesConfig)
     texrecon: TexReconConfig = field(default_factory=TexReconConfig)
     openmvs: OpenMVSConfig = field(default_factory=OpenMVSConfig)
     alicevision: AliceVisionConfig = field(default_factory=AliceVisionConfig)

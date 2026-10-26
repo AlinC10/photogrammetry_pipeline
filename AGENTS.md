@@ -64,7 +64,7 @@ To prevent dark patches, Poisson bleeding, and micro-confetti texture atlases:
 - `--empty-color 0`: Fills unobserved faces (e.g. flat cut bottom) and empty atlas areas with clean black (`RGB 0,0,0`), not neon orange.
 
 ### RULE 9: Testing & Documentation Integrity
-- All 11 unit tests in `tests/` must pass before any commit.
+- All unit tests in `tests/` (43 at the time of writing) must pass before any commit.
 - Preserve existing docstrings, comments, and structure.
 
 ---
@@ -74,6 +74,8 @@ To prevent dark patches, Poisson bleeding, and micro-confetti texture atlases:
 ```text
 turntable_studio/
 ├── main.py                     # Master CLI and pipeline execution orchestrator
+├── debug_texturing.py          # Texture diagnostics on an output/ folder (overlays, texrecon labels, validity, colours, GLB)
+├── debug_blender_compare.py    # Headless Blender: textured OBJ vs GLB materials and renders
 ├── Dockerfile                  # Multi-stage CUDA 12 + OpenMVS production container
 ├── docker-compose.yml          # Container configuration with GPU passthrough
 ├── requirements.txt            # Python dependencies (NumPy, SciPy, Trimesh, PyMeshLab, etc.)
@@ -87,13 +89,19 @@ turntable_studio/
 │   ├── bridge_sfm.py           # SFM-to-COLMAP bridge, OpenCV undistortion, proxy 3D points
 │   ├── openmvs_runner.py       # Cross-platform CLI runner for OpenMVS binaries
 │   ├── mesh_cleaner.py         # Planar slicing, skirt extrusion, Ear-Clipping base capping
+│   ├── mesh_masks.py           # Vectorised rasterizer: mesh silhouette / face-id buffers from locked poses
+│   ├── texture_prep.py         # texturing_images/: PNG, background exactly 0, mesh masks, per-camera colour gains
+│   ├── texrecon_runner.py      # .cam scene export (rebuilt every run) and texrecon execution
 │   ├── exporter.py             # Multi-LOD decimation, texture conversion, GLB embedding
 │   ├── mask_processor.py       # Alpha mask utilities
 │   └── calibrate_intrinsics.py # Chessboard/Charuco camera matrix calibration
 └── tests/
     ├── test_bridge_sfm.py      # Camera matrix, quaternion, and proxy track tests
     ├── test_mesh_cleaner.py    # 2D Ear-clipping and watertight base tests
-    ├── test_exporter.py        # Multi-LOD OBJ, MTL, JPG/PNG, and GLB bundle tests
+    ├── test_exporter.py        # Multi-LOD OBJ, MTL, JPG/PNG, and GLB bundle tests (incl. multi-material GLB)
+    ├── test_texrecon_runner.py # .cam export, scene/ rebuilt per run, unseen-face patch
+    ├── test_texture_prep.py    # Mesh rasterizer, PNG background exactly 0, colour gains
+    ├── test_camera_init.py     # turntable_poses command line (--liftMm, --tagRefine)
     └── test_telemetry.py       # RAM/VRAM profiler and timer tests
 ```
 

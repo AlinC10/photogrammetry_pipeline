@@ -24,9 +24,12 @@ from PIL import Image
 
 from pipeline.config import TexReconConfig
 from pipeline.texrecon_runner import (
+    TexReconError,
     TexReconRunner,
     export_sfm_to_cam_scene,
+    fill_unseen_face_texels,
     find_texrecon_binary,
+    remove_texrecon_outputs,
 )
 
 
@@ -278,6 +281,91 @@ class TestTexReconRunner(unittest.TestCase):
         copied_images = list(scene_dir.glob("*.jpg")) + list(scene_dir.glob("*.png"))
         self.assertEqual(len(copied_images), 1)
         self.assertEqual(copied_images[0].name, "100_frame.jpg")
+
+    def _rig_sfm(self, img_dir: Path) -> Path:
+        """Two rig cameras whose photos share the file name f_1000.jpg (rig/0 and rig/1)."""
+        views, poses = [], []
+        for cam, (vid, cx) in enumerate((("1000", 0.30), ("1020", -0.30))):
+            views.append({"viewId": vid, "poseId": vid, "intrinsicId": "0",
+                          "path": f"/workspace/input_images/rig/{cam}/f_1000.jpg", "width": "100", "height": "100"})
+            poses.append({"poseId": vid, "pose": {"transform": {
+                "rotation": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], "center": [cx, 0.0, -0.5]}}})
+            Image.new("RGB", (100, 100), color=(10 + cam, 20, 30)).save(str(img_dir / f"{vid}_f_1000.png"))
+        sfm = {"version": ["1", "0", "0"], "views": views, "poses": poses,
+               "intrinsics": [{"intrinsicId": "0", "width": "100", "height": "100", "sensorWidth": "6.0",
+                               "focalLength": "6.0", "principalPoint": ["0.0", "0.0"]}]}
+        sfm_file = self.work_p / "rig.sfm"
+        sfm_file.write_text(json.dumps(sfm))
+        return sfm_file
+
+    def test_scene_folder_is_rebuilt_without_stale_views(self):
+        """Leftover .cam files from an older run were loaded by texrecon as extra (wrong) views."""
+        img_dir = self.work_p / "texturing_images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        sfm_file = self._rig_sfm(img_dir)
+        scene_dir = self.work_p / "scene"
+        scene_dir.mkdir(parents=True, exist_ok=True)
+        (scene_dir / "f_1000.cam").write_text("0 0 0 1 0 0 0 1 0 0 0 1\n1 0 0 1 0.5 0.5\n")
+        (scene_dir / "f_1000.jpg").write_bytes(b"")
+
+        cam_files = export_sfm_to_cam_scene(str(sfm_file), str(img_dir), str(scene_dir))
+
+        names = sorted(p.name for p in scene_dir.iterdir())
+        self.assertEqual(names, ["1000_f_1000.cam", "1000_f_1000.png", "1020_f_1000.cam", "1020_f_1000.png", "scene.nvm"])
+        self.assertEqual(len(cam_files), 2)
+        # Same file name in both cameras: each .cam keeps its own pose (T = -R C)
+        t0 = [float(x) for x in (scene_dir / "1000_f_1000.cam").read_text().split()[:3]]
+        t1 = [float(x) for x in (scene_dir / "1020_f_1000.cam").read_text().split()[:3]]
+        self.assertAlmostEqual(t0[0], -0.30, places=6)
+        self.assertAlmostEqual(t1[0], 0.30, places=6)
+        # ...and its own image
+        self.assertEqual(Image.open(scene_dir / "1020_f_1000.png").getpixel((0, 0))[0], 11)
+
+    def test_missing_texturing_image_raises_instead_of_using_raw_photo(self):
+        img_dir = self.work_p / "texturing_images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        sfm_file = self._rig_sfm(img_dir)
+        (img_dir / "1020_f_1000.png").unlink()
+        with self.assertRaises(TexReconError):
+            export_sfm_to_cam_scene(str(sfm_file), str(img_dir), str(self.work_p / "scene"))
+
+    def test_remove_outputs_is_anchored_on_prefix(self):
+        out = self.work_p / "texrecon"
+        out.mkdir(parents=True, exist_ok=True)
+        for name in ("model_textured.obj", "model_textured.mtl", "model_textured_material0024_map_Kd.png",
+                     "model_textured_labeling.vec", "model_textured_low.obj", "model_textured_low_material0000_map_Kd.png"):
+            (out / name).write_bytes(b"x")
+        removed = remove_texrecon_outputs(out / "model_textured")
+        self.assertEqual(removed, 4)
+        self.assertEqual(sorted(p.name for p in out.iterdir()),
+                         ["model_textured_low.obj", "model_textured_low_material0000_map_Kd.png"])
+
+    def test_fill_unseen_face_texels(self):
+        """--keep_unseen_faces maps all unseen faces to one black 3x3 patch: it is repainted with the neighbours' colour."""
+        out = self.work_p / "unseen"
+        out.mkdir(parents=True, exist_ok=True)
+        size = 256
+        padding = size >> 7
+        atlas = np.zeros((size, size, 3), np.uint8)
+        atlas[:128, :] = (40, 160, 60)                       # textured faces, RGB
+        Image.fromarray(atlas).save(str(out / "m_material0000_map_Kd.png"))
+        (out / "m.mtl").write_text("newmtl material0000\nKd 1 1 1\nmap_Kd m_material0000_map_Kd.png\n")
+        ox, oy = 200 + padding, 200 + padding                 # unseen patch rect origin + padding
+        rel = [(2.0, 1.0), (1.0, 1.0), (1.0, 2.0)]
+        vts = [((ox + x) / size, 1.0 - (oy + y) / size) for x, y in rel]
+        vts += [(0.2, 0.9), (0.5, 0.9), (0.2, 0.7)]          # a textured face in the green half
+        lines = ["mtllib m.mtl\n"]
+        lines += [f"v {i} {i % 2} 0\n" for i in range(6)]
+        lines += [f"vt {u:.6f} {v:.6f}\n" for u, v in vts]
+        lines += ["usemtl material0000\n", "f 1/4 2/5 3/6\n", "f 2/1 3/2 4/3\n", "f 4/1 5/2 6/3\n", "f 5/1 6/2 1/3\n"]
+        (out / "m.obj").write_text("".join(lines))
+
+        colour = fill_unseen_face_texels(str(out / "m.obj"))
+        self.assertEqual(colour, (40, 160, 60))
+        res = np.array(Image.open(out / "m_material0000_map_Kd.png"))
+        self.assertEqual(tuple(res[oy + 1, ox + 1]), (40, 160, 60))
+        self.assertEqual(tuple(res[oy - padding, ox - padding]), (40, 160, 60))
+        self.assertEqual(tuple(res[140, 20]), (0, 0, 0))     # rest of the atlas untouched
 
 
 if __name__ == "__main__":

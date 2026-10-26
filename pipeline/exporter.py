@@ -11,7 +11,7 @@ import os
 import shutil
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import trimesh
@@ -81,6 +81,100 @@ def decimate_mesh(
     shutil.copy2(in_p, out_p)
 
 
+def convert_obj_to_glb(
+    obj_folder_or_path: Union[str, Path],
+    glb_path: Union[str, Path],
+    compress_textures: bool = True,
+    jpeg_quality: int = 85,
+    draco: bool = False,
+    draco_level: int = 7,
+    draco_bits: int = 14,
+) -> None:
+    """
+    Packs an OBJ + MTL + texture images into a single GLB (binary glTF).
+
+    Stage 1 (trimesh): loads the OBJ scene preserving all geometry and material bindings,
+                       and optionally re-encodes texture images as optimized JPEG buffers.
+    Stage 2 (glTF export): packs into a single binary GLB file with double-sided,
+                           unlit photogrammetry material settings.
+
+    :param obj_folder_or_path: Path to the folder containing the OBJ or the OBJ file directly.
+    :param glb_path: Path where the output GLB file will be saved.
+    :param compress_textures: Whether to compress textures to JPEG.
+    :param jpeg_quality: Quality for JPEG texture compression (default 85).
+    :param draco: Whether to apply Draco compression (reserved for future extensions).
+    """
+    p = Path(obj_folder_or_path).resolve()
+    if p.is_dir():
+        for cand_name in ["model_high.obj", "model_low.obj", "texturedMesh.obj", "model_textured.obj"]:
+            if (p / cand_name).is_file():
+                obj_path = p / cand_name
+                break
+        else:
+            objs = sorted(list(p.glob("*.obj")))
+            if objs:
+                obj_path = objs[0]
+            else:
+                logger.error(f"[GLB] ERROR: No OBJ file found in folder: {p}")
+                return
+    else:
+        obj_path = p
+
+    if not obj_path.is_file():
+        logger.error(f"[GLB] ERROR: OBJ not found: {obj_path}")
+        return
+
+    try:
+        logger.info(f"[GLB] Converting OBJ -> GLB (compress_textures={compress_textures})...")
+        logger.info(f"      Source: {obj_path}")
+
+        # Load scene preserving all geometries and materials
+        scene = trimesh.load(str(obj_path), process=False, force="scene")
+
+        if hasattr(scene, "geometry"):
+            if compress_textures:
+                import io
+                from PIL import Image
+                for geom in scene.geometry.values():
+                    if hasattr(geom, "visual") and hasattr(geom.visual, "material"):
+                        mat = geom.visual.material
+                        for attr_name in ['image', 'baseColorTexture']:
+                            if hasattr(mat, attr_name) and getattr(mat, attr_name) is not None:
+                                img = getattr(mat, attr_name)
+                                if isinstance(img, Image.Image):
+                                    if img.mode != 'RGB':
+                                        img = img.convert('RGB')
+                                    buffer = io.BytesIO()
+                                    img.save(buffer, format="JPEG", quality=jpeg_quality)
+                                    buffer.seek(0)
+                                    setattr(mat, attr_name, Image.open(buffer))
+
+        out_glb_p = Path(glb_path).resolve()
+        out_glb_p.parent.mkdir(parents=True, exist_ok=True)
+
+        # GLB postprocessor for unlit, double-sided photogrammetry materials
+        def gltf_unlit_postproc(tree):
+            tree.setdefault('extensionsUsed', []).append('KHR_materials_unlit')
+            for mat in tree.get('materials', []):
+                mat['doubleSided'] = True
+                mat.setdefault('extensions', {})['KHR_materials_unlit'] = {}
+
+        try:
+            glb_data = trimesh.exchange.gltf.export_glb(scene, tree_postprocessor=gltf_unlit_postproc)
+        except Exception as ge:
+            logger.warning(f"[GLB] Unlit postprocessor export failed ({ge}), exporting standard GLB...")
+            glb_data = scene.export(file_type="glb")
+
+        with open(str(out_glb_p), "wb") as gf:
+            gf.write(glb_data)
+
+        logger.info(f"[GLB] Successfully exported {out_glb_p.name} ({len(glb_data) / 1024 / 1024:.2f} MB)")
+
+    except Exception as e:
+        logger.error(f"[GLB] Error converting OBJ to GLB: {e}", exc_info=True)
+        raise
+
+
 def convert_texture_png_to_jpg(png_path: str, jpg_path: str, quality: int = 85) -> None:
     """Converts a PNG texture atlas to an optimized JPEG texture for web delivery."""
     try:
@@ -134,13 +228,15 @@ def find_source_mtl_and_textures(tex_p: Path) -> Tuple[Optional[Path], List[Path
         except Exception as e:
             logger.warning(f"Error reading MTL {mtl_file}: {e}")
 
-    # Fallback to search any images in directory matching stem or material
+    # Fallback: images named after this exact OBJ (texrecon: <stem>_material0000_map_Kd.png,
+    # OpenMVS: <stem>_material_0_map_Kd.jpg). A bare substring test would also pick up
+    # model_textured_low_* atlases for model_textured.obj.
     if not tex_images:
-        for f in tex_dir.iterdir():
-            if f.is_file() and f.suffix.lower() in img_exts:
-                if tex_p.stem in f.stem or "material" in f.name.lower() or "texture" in f.name.lower():
-                    if f not in tex_images:
-                        tex_images.append(f)
+        prefixes = (f"{tex_p.stem}_material", f"{tex_p.stem}_texture", f"{tex_p.stem}_tex_")
+        for f in sorted(tex_dir.iterdir()):
+            if f.is_file() and f.suffix.lower() in img_exts and f.stem.startswith(prefixes):
+                if f not in tex_images:
+                    tex_images.append(f)
 
     return mtl_file, tex_images
 
@@ -352,7 +448,11 @@ def export_multi_lod_bundle(
     mf_dir = out_base / "3mf"
     glb_dir = out_base / "glb"
 
+    # Start from empty deliverable folders: a previous run with more texture atlases would
+    # otherwise leave its extra model_high_tex_N.png files here and inside output.zip.
     for d in [obj_high_dir, obj_low_dir, stl_dir, mf_dir, glb_dir]:
+        if d.is_dir():
+            shutil.rmtree(str(d))
         d.mkdir(parents=True, exist_ok=True)
 
     # 1. High-Poly Assets
@@ -442,32 +542,14 @@ def export_multi_lod_bundle(
                 scale=1.0,  # high_obj is already scaled by exp_scale, so avoid double-scaling
             )
 
-        # Helper: GLB postprocessor for unlit, double-sided photogrammetry materials
-        def gltf_unlit_postproc(tree):
-            tree.setdefault('extensionsUsed', []).append('KHR_materials_unlit')
-            for mat in tree.get('materials', []):
-                mat['doubleSided'] = True
-                mat.setdefault('extensions', {})['KHR_materials_unlit'] = {}
-
         # 4. Generate High-Poly GLB from model_high.obj (contains embedded PNG texture)
         try:
-            textured_high_scene = trimesh.load(str(high_obj), process=False)
-            high_pngs = list(obj_high_dir.glob("*.png"))
-            if high_pngs:
-                from trimesh.visual import TextureVisuals
-                tex_img = Image.open(str(high_pngs[0]))
-                if isinstance(textured_high_scene, trimesh.Scene):
-                    for geom in textured_high_scene.geometry.values():
-                        if hasattr(geom, "visual") and hasattr(geom.visual, "uv") and geom.visual.uv is not None and len(geom.visual.uv) > 0:
-                            geom.visual = TextureVisuals(uv=geom.visual.uv, image=tex_img)
-                elif hasattr(textured_high_scene, "visual") and hasattr(textured_high_scene.visual, "uv") and len(textured_high_scene.visual.uv) > 0:
-                    textured_high_scene.visual = TextureVisuals(uv=textured_high_scene.visual.uv, image=tex_img)
-
-            glb_data = trimesh.exchange.gltf.export_glb(textured_high_scene, tree_postprocessor=gltf_unlit_postproc)
-            with open(str(high_glb), "wb") as gf:
-                gf.write(glb_data)
+            convert_obj_to_glb(
+                obj_folder_or_path=high_obj,
+                glb_path=high_glb,
+                compress_textures=False,  # High-poly retains lossless PNG texture
+            )
             telemetry.record_mesh(str(high_glb))
-            logger.info(f"Exported textured High-Poly GLB (Unlit/PNG): {high_glb.name}")
         except Exception as ge:
             logger.warning(f"High GLB export warning: {ge}. Using standard GLB export.")
             cleaned_trimesh.export(str(high_glb), file_type="glb")
@@ -475,23 +557,13 @@ def export_multi_lod_bundle(
 
         # 5. Generate Low-Poly GLB from model_low.obj (contains embedded downscaled JPG texture)
         try:
-            textured_low_scene = trimesh.load(str(low_obj), process=False)
-            low_jpgs = list(obj_low_dir.glob("*.jpg")) + list(obj_low_dir.glob("*.jpeg"))
-            if low_jpgs:
-                from trimesh.visual import TextureVisuals
-                tex_img = Image.open(str(low_jpgs[0]))
-                if isinstance(textured_low_scene, trimesh.Scene):
-                    for geom in textured_low_scene.geometry.values():
-                        if hasattr(geom, "visual") and hasattr(geom.visual, "uv") and geom.visual.uv is not None and len(geom.visual.uv) > 0:
-                            geom.visual = TextureVisuals(uv=geom.visual.uv, image=tex_img)
-                elif hasattr(textured_low_scene, "visual") and hasattr(textured_low_scene.visual, "uv") and len(textured_low_scene.visual.uv) > 0:
-                    textured_low_scene.visual = TextureVisuals(uv=textured_low_scene.visual.uv, image=tex_img)
-
-            glb_data = trimesh.exchange.gltf.export_glb(textured_low_scene, tree_postprocessor=gltf_unlit_postproc)
-            with open(str(low_glb), "wb") as gf:
-                gf.write(glb_data)
+            convert_obj_to_glb(
+                obj_folder_or_path=low_obj,
+                glb_path=low_glb,
+                compress_textures=True,  # Low-poly compresses textures to web-optimized JPEG
+                jpeg_quality=85,
+            )
             telemetry.record_mesh(str(low_glb))
-            logger.info(f"Exported textured Low-Poly GLB (Unlit/JPG): {low_glb.name}")
         except Exception as ge:
             logger.warning(f"Low GLB export warning: {ge}. Using standard GLB export.")
             cleaned_trimesh.export(str(low_glb), file_type="glb")

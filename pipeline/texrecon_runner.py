@@ -35,6 +35,10 @@ class TexReconError(RuntimeError):
     pass
 
 
+# The only data terms texrecon accepts (tex/settings.h: choice_strings<DataTerm>)
+TEXRECON_DATA_TERMS = ("gmi", "area")
+
+
 def find_texrecon_binary(custom_dir: Optional[str] = None) -> Optional[str]:
     """
     Locates the texrecon executable across:
@@ -117,6 +121,17 @@ def find_texrecon_binary(custom_dir: Optional[str] = None) -> Optional[str]:
     return None
 
 
+def _link_or_copy(src: Path, dst: Path) -> None:
+    """Relative symlink (survives moving the whole output folder), copy as fallback."""
+    try:
+        if hasattr(os, "symlink") and sys.platform != "win32":
+            os.symlink(os.path.relpath(str(src), str(dst.parent)), str(dst))
+            return
+    except OSError:
+        pass
+    shutil.copy2(str(src), str(dst))
+
+
 def export_sfm_to_cam_scene(
     sfm_data_path: str,
     undistorted_images_dir: str,
@@ -132,12 +147,21 @@ def export_sfm_to_cam_scene(
       - .cam format:
           Line 1: tx ty tz R00 R01 R02 R10 R11 R12 R20 R21 R22
           Line 2: f d0 d1 paspect ppx ppy
-          where f = fx / max(w, h), paspect = fy / fx, ppx = cx / w, ppy = cy / h.
+          where f = fx / max(w, h), paspect = fy / fx, ppx = (cx + 0.5) / w, ppy = (cy + 0.5) / h.
+          MVE puts pixel centres at +0.5 (TextureView::get_pixel_coords subtracts 0.5), while
+          OpenCV/AliceVision centres are integers, hence the half-pixel shift.
           For undistorted images, distortion coefficients d0=0, d1=0.
+
+    The scene folder is rebuilt from scratch on every call: texrecon loads EVERY .cam file it
+    finds, so leftovers from a previous run in the same output folder become extra (wrong) views.
+    Each view is written as `<viewId>_<stem>` so the two rig cameras (same file names in
+    rig/0 and rig/1) can never overwrite each other's .cam file.
     """
     sfm_p = Path(sfm_data_path).resolve()
     undist_dir = Path(undistorted_images_dir).resolve()
     scene_dir = Path(output_scene_dir).resolve()
+    if scene_dir.exists():
+        shutil.rmtree(str(scene_dir))
     scene_dir.mkdir(parents=True, exist_ok=True)
 
     with open(sfm_p, "r", encoding="utf-8") as f:
@@ -209,6 +233,13 @@ def export_sfm_to_cam_scene(
     written_cam_files: List[Path] = []
     nvm_camera_records: List[str] = []
 
+    # A bare file name is only trusted if no other view has the same one (rig/0 and rig/1 do).
+    name_counts: Dict[str, int] = {}
+    for v in sfm.get("views", []):
+        n = Path(v["path"]).name
+        name_counts[n] = name_counts.get(n, 0) + 1
+
+    missing: List[str] = []
     for v in sfm.get("views", []):
         pose_id = str(v["poseId"])
         if pose_id not in poses_by_id:
@@ -226,40 +257,30 @@ def export_sfm_to_cam_scene(
         fname = orig_path.name
         view_id = str(v.get("viewId", ""))
 
-        # Locate undistorted image in undistorted_images_dir
-        # Bridge SFM names undistorted files as: {viewId}_{filename}
+        # Locate the texturing image (undistorted with K_new) for this view.
+        # Bridge SFM / texture_prep name them: {viewId}_{stem}.png or {viewId}_{filename}
         candidates = [
-            undist_dir / f"{view_id}_{fname}",
             undist_dir / f"{view_id}_{orig_path.stem}.png",
+            undist_dir / f"{view_id}_{fname}",
             undist_dir / f"{view_id}_{orig_path.stem}.jpg",
-            undist_dir / fname,
-            undist_dir / f"{orig_path.stem}.png",
-            undist_dir / f"{orig_path.stem}.jpg",
         ]
-        undist_img = None
-        for cand in candidates:
-            if cand.is_file():
-                undist_img = cand
-                break
+        if name_counts.get(fname, 0) == 1:
+            candidates += [
+                undist_dir / fname,
+                undist_dir / f"{orig_path.stem}.png",
+                undist_dir / f"{orig_path.stem}.jpg",
+            ]
+        undist_img = next((c for c in candidates if c.is_file()), None)
 
         if undist_img is None:
-            logger.warning(
-                f"Undistorted image not found for view {view_id} ({fname}) in {undist_dir}. "
-                f"Falling back to original path: {orig_path}"
-            )
-            undist_img = orig_path
+            # Never fall back to the original photo: it is distorted and unmasked, and the
+            # .cam written below describes the undistorted camera K_new.
+            missing.append(f"{view_id} ({fname})")
+            continue
 
-        # Destination image inside scene_dir
-        dst_img = scene_dir / undist_img.name
-        if not dst_img.is_file():
-            try:
-                # Attempt relative symlink
-                if hasattr(os, "symlink") and sys.platform != "win32":
-                    os.symlink(str(undist_img), str(dst_img))
-                else:
-                    shutil.copy2(str(undist_img), str(dst_img))
-            except Exception:
-                shutil.copy2(str(undist_img), str(dst_img))
+        # Destination image inside scene_dir, unique per view
+        dst_img = scene_dir / f"{view_id}_{orig_path.stem}{undist_img.suffix.lower()}"
+        _link_or_copy(undist_img, dst_img)
 
         # Camera parameters
         w = c_info["w"]
@@ -267,8 +288,8 @@ def export_sfm_to_cam_scene(
         max_dim = max(w, h)
         f_norm = c_info["fx"] / max_dim
         paspect = c_info["fy"] / c_info["fx"]
-        ppx = c_info["cx"] / w
-        ppy = c_info["cy"] / h
+        ppx = (c_info["cx"] + 0.5) / w
+        ppy = (c_info["cy"] + 0.5) / h
 
         # Rotation row-major 9 elements
         r_flat = R.flatten()
@@ -296,6 +317,12 @@ def export_sfm_to_cam_scene(
             f"{dst_img.name} {f_px:.4f} {qw:.8f} {qx:.8f} {qy:.8f} {qz:.8f} {C[0]:.8f} {C[1]:.8f} {C[2]:.8f} 0 0"
         )
 
+    if missing:
+        raise TexReconError(
+            f"Texturing images not found in {undist_dir} for {len(missing)} view(s): "
+            f"{', '.join(missing[:5])}{' ...' if len(missing) > 5 else ''}"
+        )
+
     # 4. Also write scene.nvm in scene_dir as alternative/universal bundle file
     nvm_path = scene_dir / "scene.nvm"
     with open(nvm_path, "w", encoding="utf-8") as nf:
@@ -309,6 +336,147 @@ def export_sfm_to_cam_scene(
         f"Exported {len(written_cam_files)} .cam parameters and scene.nvm to {scene_dir}"
     )
     return written_cam_files
+
+
+def remove_texrecon_outputs(out_prefix: Path) -> int:
+    """
+    Deletes every file texrecon writes for `out_prefix` (OBJ, MTL, atlases, intermediate results).
+    Patterns are anchored on the exact prefix, so "model_textured" never touches "model_textured_low_*".
+    """
+    out_prefix = Path(out_prefix)
+    name = out_prefix.name
+    patterns = [
+        f"{name}.obj", f"{name}.mtl", f"{name}.conf",
+        f"{name}_material[0-9]*_map_Kd.*",
+        f"{name}_labeling.vec", f"{name}_data_costs.spt", f"{name}_timings.csv",
+        f"{name}_view_selection*",
+    ]
+    removed = 0
+    for pat in patterns:
+        for f in out_prefix.parent.glob(pat):
+            if f.is_file() or f.is_symlink():
+                f.unlink()
+                removed += 1
+    return removed
+
+
+def _read_obj_faces(obj_path: Path):
+    """Minimal OBJ reader for texrecon output: (vt [N,2], face v [F,3], face vt [F,3], face material, names, mtllib)."""
+    vt: List[Tuple[float, float]] = []
+    fv: List[Tuple[int, int, int]] = []
+    ft: List[Tuple[int, int, int]] = []
+    fm: List[int] = []
+    names: List[str] = []
+    index: Dict[str, int] = {}
+    cur = -1
+    mtllib = None
+    with open(obj_path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if line.startswith("vt "):
+                p = line.split()
+                vt.append((float(p[1]), float(p[2])))
+            elif line.startswith("f "):
+                p = [c.split("/") for c in line.split()[1:4]]
+                if len(p) == 3 and all(len(c) > 1 and c[1] for c in p):
+                    fv.append((int(p[0][0]), int(p[1][0]), int(p[2][0])))
+                    ft.append((int(p[0][1]), int(p[1][1]), int(p[2][1])))
+                    fm.append(cur)
+            elif line.startswith("usemtl "):
+                n = line.split(maxsplit=1)[1].strip()
+                if n not in index:
+                    index[n] = len(names)
+                    names.append(n)
+                cur = index[n]
+            elif line.startswith("mtllib "):
+                mtllib = line.split(maxsplit=1)[1].strip()
+    return (np.array(vt, dtype=np.float64).reshape(-1, 2), np.array(fv, dtype=np.int64).reshape(-1, 3) - 1,
+            np.array(ft, dtype=np.int64).reshape(-1, 3) - 1, np.array(fm, dtype=np.int64), names, mtllib)
+
+
+def fill_unseen_face_texels(
+    obj_path: str,
+    min_faces: int = 3,
+    fallback_rgb: Tuple[int, int, int] = (25, 25, 25),
+    max_samples: int = 20000,
+) -> Optional[Tuple[int, int, int]]:
+    """
+    With --keep_unseen_faces texrecon maps every face no view could see onto one 3x3 black patch
+    (generate_texture_patches.cpp) inside one atlas, surrounded by `atlas_size >> 7` px of padding.
+    All those faces therefore share the same three texture coordinates. This repaints that patch
+    with the median colour of the textured faces touching the unseen ones, so undersides and the
+    flat base read as the surrounding plastic instead of black holes.
+    Returns the RGB colour used, or None if the OBJ has no unseen-face patch.
+    """
+    obj_p = Path(obj_path)
+    vt, fv, ft, fm, names, mtllib = _read_obj_faces(obj_p)
+    if len(ft) == 0:
+        return None
+    _, inverse, counts = np.unique(np.sort(ft, axis=1), axis=0, return_inverse=True, return_counts=True)
+    inverse = inverse.reshape(-1)
+    best = int(np.argmax(counts))
+    if counts[best] < min_faces:
+        return None
+    unseen = inverse == best
+
+    maps: Dict[str, str] = {}
+    if mtllib and (obj_p.parent / mtllib).is_file():
+        cur = None
+        for line in (obj_p.parent / mtllib).read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if line.startswith("newmtl "):
+                cur = line.split(maxsplit=1)[1].strip()
+            elif line.startswith("map_Kd") and cur:
+                maps[cur] = line.split(maxsplit=1)[1].strip()
+
+    def atlas_path(mat_idx: int) -> Optional[Path]:
+        if mat_idx < 0 or mat_idx >= len(names) or names[mat_idx] not in maps:
+            return None
+        p = obj_p.parent / maps[names[mat_idx]]
+        return p if p.is_file() else None
+
+    # Median colour of textured faces sharing a vertex with an unseen face
+    seen_v = np.zeros(int(fv.max()) + 1, dtype=bool)
+    seen_v[fv[unseen].ravel()] = True
+    neigh = np.nonzero(~unseen & seen_v[fv].any(axis=1))[0]
+    if len(neigh) == 0:
+        neigh = np.nonzero(~unseen)[0]
+    if len(neigh) > max_samples:
+        neigh = np.random.default_rng(0).choice(neigh, max_samples, replace=False)
+    samples = []
+    for mat_idx in np.unique(fm[neigh]):
+        ap = atlas_path(int(mat_idx))
+        if ap is None:
+            continue
+        img = cv2.imread(str(ap), cv2.IMREAD_COLOR)
+        if img is None:
+            continue
+        sel = neigh[fm[neigh] == mat_idx]
+        uv = vt[ft[sel]].mean(axis=1)
+        x = np.clip((uv[:, 0] * img.shape[1]).astype(int), 0, img.shape[1] - 1)
+        y = np.clip(((1.0 - uv[:, 1]) * img.shape[0]).astype(int), 0, img.shape[0] - 1)
+        samples.append(img[y, x])
+    if samples:
+        bgr = np.median(np.concatenate(samples), axis=0).round().astype(int)
+        colour = (int(bgr[2]), int(bgr[1]), int(bgr[0]))
+    else:
+        colour = tuple(int(c) for c in fallback_rgb)
+
+    mat_idx = int(fm[unseen][0])
+    ap = atlas_path(mat_idx)
+    if ap is None:
+        return None
+    img = cv2.imread(str(ap), cv2.IMREAD_COLOR)
+    size = img.shape[1]
+    padding = size >> 7
+    tri = vt[ft[unseen][0]]
+    # patch-relative texcoords are (2,1), (1,1), (1,2): the 3x3 patch starts one texel before the minimum
+    x0 = int(round(tri[:, 0].min() * size)) - 1 - padding
+    y0 = int(round((1.0 - tri[:, 1].max()) * img.shape[0])) - 1 - padding
+    x1, y1 = x0 + 3 + 2 * padding, y0 + 3 + 2 * padding
+    img[max(0, y0):min(img.shape[0], y1), max(0, x0):min(size, x1)] = (colour[2], colour[1], colour[0])
+    cv2.imwrite(str(ap), img)
+    logger.info(f"Recoloured {int(unseen.sum()):,d} unseen faces in {ap.name} (patch at x={x0}, y={y0}).")
+    return colour
 
 
 class TexReconRunner:
@@ -347,6 +515,10 @@ class TexReconRunner:
         in_mesh_p = Path(input_mesh_path).resolve()
         if not in_mesh_p.is_file():
             raise FileNotFoundError(f"Input mesh not found: {in_mesh_p}")
+        if self.config.data_term not in TEXRECON_DATA_TERMS:
+            raise ValueError(
+                f"texrecon --data_term must be one of {TEXRECON_DATA_TERMS}, got '{self.config.data_term}'"
+            )
 
         # 1. Prepare scene folder with .cam files and images
         scene_dir = self.work_dir / "scene"
@@ -377,6 +549,12 @@ class TexReconRunner:
         if tmp_dir.is_dir():
             shutil.rmtree(str(tmp_dir), ignore_errors=True)
 
+        # Remove outputs of a previous run with the same prefix: a run that produces fewer atlases
+        # would otherwise leave old *_materialNNNN_map_Kd.png files next to the new ones.
+        removed = remove_texrecon_outputs(out_pref)
+        if removed:
+            logger.info(f"Removed {removed} stale texrecon output file(s) for prefix {out_pref.name}")
+
         final_obj = Path(f"{out_pref}.obj")
         final_mtl = Path(f"{out_pref}.mtl")
 
@@ -403,6 +581,8 @@ class TexReconRunner:
             cmd.append("--skip_global_seam_leveling")
         if self.config.skip_local_seam_leveling:
             cmd.append("--skip_local_seam_leveling")
+        if self.config.keep_unseen_faces:
+            cmd.append("--keep_unseen_faces")
         if self.config.num_threads:
             cmd.append(f"--num_threads={self.config.num_threads}")
         if self.config.write_timings:
@@ -434,12 +614,16 @@ class TexReconRunner:
             raise TexReconError(f"texrecon process failed with return code {res.returncode}")
 
         if not final_obj.is_file():
-            # Check if texrecon outputted with slightly different suffix
-            cands = list(out_pref.parent.glob(f"{out_pref.name}*.obj"))
-            if cands:
-                final_obj = cands[0]
-            else:
-                raise FileNotFoundError(f"Expected texrecon output OBJ not found: {final_obj}")
+            # No glob fallback: "<prefix>*.obj" would also match e.g. model_textured_low.obj
+            raise FileNotFoundError(f"Expected texrecon output OBJ not found: {final_obj}")
+
+        if self.config.keep_unseen_faces:
+            try:
+                colour = fill_unseen_face_texels(final_obj)
+                if colour is not None:
+                    logger.info(f"Unseen faces kept and coloured with neighbour median RGB {colour}")
+            except Exception as fill_err:
+                logger.warning(f"Could not recolour unseen faces ({fill_err}); they stay black.")
 
         logger.info(f"Successfully generated textured OBJ with texrecon: {final_obj.name}")
         return str(final_obj), str(final_mtl)

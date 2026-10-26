@@ -174,15 +174,25 @@ You can run Turntable Studio directly on Windows without Docker:
 | :--- | :--- | :--- | :--- |
 | `--focal_length_mm`, `--focal_mm` | `float` | `3.9` | Camera lens focal length in mm (calibrated for IMX477 M12 lens) |
 | `--step_deg` | `float` | `18.0` | Turntable rotation step in degrees (`18.0` for 20 steps/turn) |
+| `--lift_mm` | `float` | `100.0` | Carriage lift per level passed to `turntable_poses --liftMm` (the script's own default is 80 mm) |
+| `--estimate_lift` | `flag` | `False` | Let `turntable_poses` estimate the real lift per level |
+| `--no_tag_refine` | `flag` | `False` | Disable `turntable_poses --tagRefine` (per-tag paper unevenness; RMS 4.09 → 2.48 px on the Parkside set) |
+| `--intrinsics_in` | `str` | `None` | Chessboard intrinsics JSON from `calibrate_intrinsics.py` (`turntable_poses --intrinsicsIn`) |
 
 ### C. Texturing Engine Selection & Settings
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `--texturing_engine` | `choice` | `texrecon` | Texturing engine: `texrecon` (mvs-texturing, default), `alicevision`, or `openmvs` |
 | `--texrecon_bin` | `str` | `None` | Path to `texrecon` executable or directory (e.g. `C:\texrecon\bin`) |
-| `--data_term` | `choice` | `gmi` | `texrecon` data term: `gmi` (gradient magnitude + intensity, default) or `color` |
+| `--data_term` | `choice` | `gmi` | `texrecon` data term: `gmi` (gradient magnitude integral, default) or `area` — the only two texrecon accepts |
 | `--smoothness_term` | `str` | `potts` | `texrecon` smoothness term MRF regularizer (default: `potts`) |
 | `--outlier_removal` | `choice` | `gauss_damping` | `texrecon` photometric outlier removal: `gauss_damping`, `none`, or `gauss_clamping` |
+| `--texrecon_global_seam_leveling` | `int` | `0` | `texrecon` global seam leveling (`1` = enable; worth re-testing now that the background is masked cleanly) |
+| `--no_keep_unseen_faces` | `flag` | `False` | Let texrecon drop faces no camera sees (default keeps them, coloured like their neighbours, so the OBJ/GLB has no holes) |
+| `--write_intermediate_results` | `flag` | `False` | texrecon writes `<prefix>_labeling.vec` (which view textured each face), read by `debug_texturing.py labels` |
+| `--no_mesh_texture_masks` | `flag` | `False` | Texture from the bridge JPEGs + photometric masks instead of `texturing_images/` (PNG, mesh-silhouette masks) |
+| `--texture_mask_margin_px` | `int` | `2` | Dilation of the mesh silhouette used as texturing mask |
+| `--no_colour_normalize` | `flag` | `False` | Disable per-camera colour gains measured on the turntable paper |
 | `--alicevision_bin` | `str` | `None` | Path to AliceVision binary directory (e.g. `C:\Meshroom\aliceVision\bin`) |
 | `--unwrap_method` | `choice` | `Basic` | AliceVision UV unwrapping method: `Basic` (fast & robust on high-poly), `LSCM`, or `ABF` |
 | `--visibility_remapping_method` | `choice` | `MeshItself` | AliceVision visibility test: `MeshItself` (direct mesh raycasting) or `PullPush` |

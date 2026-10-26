@@ -41,6 +41,7 @@ from pipeline.camera_init import (
 from pipeline.config import (
     AliceVisionConfig,
     TexReconConfig,
+    TexturingImagesConfig,
     MeshCleaningConfig,
     MaskingConfig,
     OpenMVSConfig,
@@ -51,6 +52,8 @@ from pipeline.exporter import decimate_mesh, export_multi_lod_bundle
 from pipeline.mesh_cleaner import clean_and_repair_mesh
 from pipeline.openmvs_runner import OpenMVSRunner
 from pipeline.telemetry import SystemTelemetry
+from pipeline.texrecon_runner import TEXRECON_DATA_TERMS
+from pipeline.texture_prep import prepare_texturing_images
 
 
 def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -120,6 +123,10 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         elif detected_av:
             logger.info(f"Using AliceVision Texturing: {detected_av}")
 
+    data_term = job.get("data_term", "gmi")
+    if data_term not in TEXRECON_DATA_TERMS:
+        raise ValueError(f"data_term must be one of {TEXRECON_DATA_TERMS} (texrecon rejects anything else), got '{data_term}'")
+
     # Build Configuration
     config = PipelineConfig(
         input_dir=input_dir,
@@ -128,10 +135,19 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         texturing_engine=texturing_engine,
         texrecon=TexReconConfig(
             bin_dir=texrecon_bin,
-            data_term=job.get("data_term", "gmi"),
+            data_term=data_term,
             smoothness_term=job.get("smoothness_term", "potts"),
             outlier_removal=job.get("outlier_removal", "gauss_damping"),
             num_threads=job.get("num_threads"),
+            skip_global_seam_leveling=not bool(job.get("texrecon_global_seam_leveling", 0)),
+            keep_unseen_faces=bool(job.get("keep_unseen_faces", True)),
+            write_intermediate_results=bool(job.get("write_intermediate_results", False)),
+        ),
+        texturing_images=TexturingImagesConfig(
+            enabled=bool(job.get("mesh_texture_masks", True)),
+            margin_px=int(job.get("texture_mask_margin_px", 2)),
+            trim_band_px=int(job.get("texture_mask_trim_band_px", 25)),
+            colour_normalize=bool(job.get("colour_normalize", True)),
         ),
         alicevision=AliceVisionConfig(
             bin_dir=alicevision_bin,
@@ -159,6 +175,10 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             step_deg=job.get("step_deg", 18.0),
             tag_scale=job.get("tag_scale", 1.0),
             default_focal_mm=job.get("focal_length_mm", 3.9),
+            lift_mm=float(job.get("lift_mm", 100.0)),
+            estimate_lift=bool(job.get("estimate_lift", False)),
+            tag_refine=bool(job.get("tag_refine", True)),
+            intrinsics_in=job.get("intrinsics_in"),
         ),
         cleaning=MeshCleaningConfig(
             slice_y_m=job.get("slice_y_m", 0.003),
@@ -190,7 +210,11 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         # ----------------------------------------------------------------------
         cameras_known_sfm = str(out_path / "cameras_known.sfm")
         with telemetry.step("2. Turntable Poses (Rigid Lock)"):
-            if not mock_openmvs:
+            if not mock_openmvs and job.get("resume", False) and Path(cameras_known_sfm).is_file():
+                # The resumed mesh was reconstructed with these exact poses: recomputing them with
+                # other options (e.g. tag_refine) would misalign texture and geometry.
+                logger.info(f"[RESUME] Reusing locked poses from {cameras_known_sfm}.")
+            elif not mock_openmvs:
                 run_turntable_poses(
                     camera_init_sfm=camera_init_sfm,
                     output_known_sfm=cameras_known_sfm,
@@ -265,6 +289,8 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                         chroma_threshold=config.masking.chroma_threshold,
                         brightness_white_threshold=config.masking.brightness_white_threshold,
                         safety_dilation_px=config.masking.safety_dilation_px,
+                        tag_blackout=config.masking.tag_blackout,
+                        tag_expansion_factor=config.masking.tag_expansion_factor,
                     )
                     masks_src = masks_out_dir
                     logger.info(f"Generated {len(auto_masks)} foreground masks in {masks_out_dir}.")
@@ -388,6 +414,35 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                     mvs_project = "scene.mvs"
 
             # ----------------------------------------------------------------------
+            # STEP 5.5: Texturing images from the cleaned mesh (texrecon only)
+            #   lossless PNG, background exactly 0, mesh-silhouette masks, per-camera colour gains
+            # ----------------------------------------------------------------------
+            texturing_images_dir = undistorted_dir
+            if config.texturing_engine == "texrecon" and config.texturing_images.enabled:
+                ti = config.texturing_images
+                try:
+                    with telemetry.step("5.5 Texturing Images (Mesh Masks, PNG, Colour Gains)"):
+                        prep = prepare_texturing_images(
+                            sfm_json_path=cameras_known_sfm,
+                            mesh_path=cleaned_obj_path,
+                            output_dir=str(out_path / "texturing_images"),
+                            margin_px=ti.margin_px,
+                            trim_band_px=ti.trim_band_px,
+                            brightness_threshold=ti.brightness_white_threshold,
+                            chroma_threshold=ti.chroma_threshold,
+                            colour_normalize=ti.colour_normalize,
+                            max_gain_deviation=ti.max_gain_deviation,
+                            tag_layout_path=config.turntable.tag_layout,
+                            workers=ti.workers,
+                        )
+                        texturing_images_dir = prep["images_dir"]
+                except Exception as prep_err:
+                    logger.warning(
+                        f"Texturing image preparation failed ({prep_err}). "
+                        f"texrecon will use the bridge images in {undistorted_dir}."
+                    )
+
+            # ----------------------------------------------------------------------
             # STEP 4.4: Texture Mesh on Watertight Sealed Geometry
             # ----------------------------------------------------------------------
             if config.texturing_engine == "texrecon":
@@ -400,7 +455,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                         textured_obj_path, _ = tr_runner.run_texturing(
                             sfm_data_path=cameras_known_sfm,
                             input_mesh_path=cleaned_obj_path,
-                            images_folder=undistorted_dir,
+                            images_folder=texturing_images_dir,
                             out_prefix=str(out_path / "texrecon" / "model_textured"),
                             mock_mode=job.get("mock_openmvs", False),
                         )
@@ -410,7 +465,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                                 textured_low_obj_path, _ = tr_runner.run_texturing(
                                     sfm_data_path=cameras_known_sfm,
                                     input_mesh_path=str(cleaned_low_path),
-                                    images_folder=undistorted_dir,
+                                    images_folder=texturing_images_dir,
                                     out_prefix=str(out_path / "texrecon" / "model_textured_low"),
                                     mock_mode=job.get("mock_openmvs", False),
                                 )
@@ -620,9 +675,19 @@ def parse_args():
     parser.add_argument("--scale_to_mm", action="store_true", help="Shortcut to export OBJ in millimeters (sets export_scale=1000.0)")
     parser.add_argument("--texturing_engine", choices=["texrecon", "alicevision", "openmvs"], default="texrecon", help="Texturing engine: 'texrecon' (mvs-texturing, default), 'alicevision', or 'openmvs'")
     parser.add_argument("--texrecon_bin", default=None, help="Custom path to texrecon executable or directory (e.g. C:\\texrecon\\bin or /usr/local/bin/texrecon)")
-    parser.add_argument("--data_term", choices=["gmi", "color"], default="gmi", help="texrecon data term: 'gmi' (default) or 'color'")
+    parser.add_argument("--data_term", choices=list(TEXRECON_DATA_TERMS), default="gmi", help="texrecon data term: 'gmi' (default, gradient magnitude) or 'area' (less sensitive to reflections and mask borders)")
     parser.add_argument("--smoothness_term", default="potts", help="texrecon smoothness term (default: 'potts')")
     parser.add_argument("--outlier_removal", choices=["gauss_damping", "none", "gauss_clamping"], default="gauss_damping", help="texrecon outlier removal (default: 'gauss_damping')")
+    parser.add_argument("--texrecon_global_seam_leveling", type=int, default=0, help="texrecon global seam leveling (0=skip, default; 1=enable, test once masks/PNG inputs are clean)")
+    parser.add_argument("--no_keep_unseen_faces", action="store_true", help="Let texrecon drop faces no camera sees (leaves holes in the textured OBJ/GLB)")
+    parser.add_argument("--write_intermediate_results", action="store_true", help="texrecon writes <prefix>_labeling.vec / _data_costs.spt (which view textured each face)")
+    parser.add_argument("--no_mesh_texture_masks", action="store_true", help="Texture from the bridge JPEGs + photometric masks instead of PNGs masked by the cleaned mesh")
+    parser.add_argument("--texture_mask_margin_px", type=int, default=2, help="Dilation (px) of the mesh silhouette used as texturing mask (default: 2)")
+    parser.add_argument("--no_colour_normalize", action="store_true", help="Disable per-camera colour gains measured on the turntable paper")
+    parser.add_argument("--lift_mm", type=float, default=100.0, help="Carriage lift per level in mm passed to turntable_poses --liftMm (default: 100, scanner z_axis.distance_mm)")
+    parser.add_argument("--estimate_lift", action="store_true", help="Let turntable_poses estimate the real lift per level")
+    parser.add_argument("--no_tag_refine", action="store_true", help="Disable turntable_poses --tagRefine (per-tag paper unevenness)")
+    parser.add_argument("--intrinsics_in", default=None, help="Chessboard intrinsics JSON from calibrate_intrinsics.py, passed to turntable_poses --intrinsicsIn")
     parser.add_argument("--unwrap_method", choices=["Basic", "LSCM", "ABF"], default="Basic", help="AliceVision UV unwrapping method: 'Basic' (fast & robust on high-poly), 'LSCM', or 'ABF'")
     parser.add_argument("--visibility_remapping_method", choices=["MeshItself", "PullPush", "Pull", "Push"], default="MeshItself", help="AliceVision visibility remapping: 'MeshItself' (direct mesh raycasting) or 'PullPush'")
     parser.add_argument("--alicevision_bin", default=None, help="Custom path to AliceVision bin directory or aliceVision_texturing executable (e.g. C:\\Meshroom\\aliceVision\\bin)")
@@ -642,6 +707,16 @@ def main():
         "data_term": args.data_term,
         "smoothness_term": args.smoothness_term,
         "outlier_removal": args.outlier_removal,
+        "texrecon_global_seam_leveling": args.texrecon_global_seam_leveling,
+        "keep_unseen_faces": not args.no_keep_unseen_faces,
+        "write_intermediate_results": args.write_intermediate_results,
+        "mesh_texture_masks": not args.no_mesh_texture_masks,
+        "texture_mask_margin_px": args.texture_mask_margin_px,
+        "colour_normalize": not args.no_colour_normalize,
+        "lift_mm": args.lift_mm,
+        "estimate_lift": args.estimate_lift,
+        "tag_refine": not args.no_tag_refine,
+        "intrinsics_in": args.intrinsics_in,
         "unwrap_method": args.unwrap_method,
         "visibility_remapping_method": args.visibility_remapping_method,
         "alicevision_bin": args.alicevision_bin,

@@ -104,6 +104,71 @@ def project_cylinder_to_2d(
     return convex_hull_2d(pts_2d)
 
 
+def load_tag_layout(layout_path: Optional[Union[str, Path]] = None) -> List[Dict[str, Any]]:
+    """
+    Loads AprilTag disc layout specification (e.g. platan_260mm_layout.json).
+    Returns list of tag dictionaries with 'id', 'center', and 'corners'.
+    """
+    import json
+    if layout_path is None:
+        layout_path = Path(__file__).resolve().parent / "platan_260mm_layout.json"
+    l_path = Path(layout_path).resolve()
+    if not l_path.is_file():
+        logger.warning(f"Tag layout file not found: {l_path}")
+        return []
+    try:
+        with open(l_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("tags", [])
+    except Exception as e:
+        logger.warning(f"Failed to load tag layout from {l_path}: {e}")
+        return []
+
+
+def project_tags_to_2d(
+    tags: List[Dict[str, Any]],
+    R: np.ndarray,
+    C: np.ndarray,
+    K: np.ndarray,
+    expansion_factor: float = 1.25,
+) -> List[List[Tuple[float, float]]]:
+    """
+    Projects 3D AprilTag coordinates into 2D camera coordinates.
+    Each tag polygon is expanded by `expansion_factor` around its 3D center
+    to guarantee suppression of the tag's black border and quiet zone.
+    Returns list of 2D quad polygons [(u0, v0), (u1, v1), (u2, v2), (u3, v3)].
+    """
+    tag_polys: List[List[Tuple[float, float]]] = []
+    C_vec = C.flatten()
+
+    for tag in tags:
+        corners = np.array(tag.get("corners", []), dtype=np.float64)
+        if len(corners) < 3:
+            continue
+        center = np.array(tag.get("center", [0.0, 0.0, 0.0]), dtype=np.float64)
+
+        # 3D radial expansion around center to cover black border
+        if expansion_factor != 1.0:
+            corners_exp = center + (corners - center) * expansion_factor
+        else:
+            corners_exp = corners
+
+        # World-to-camera projection: P_cam = (P_world - C) @ R.T
+        P_cam = (corners_exp - C_vec) @ R.T
+
+        # Require points to be in front of camera
+        if not np.all(P_cam[:, 2] > 0.05):
+            continue
+
+        u = K[0, 0] * (P_cam[:, 0] / P_cam[:, 2]) + K[0, 2]
+        v = K[1, 1] * (P_cam[:, 1] / P_cam[:, 2]) + K[1, 2]
+
+        poly = [(float(px), float(py)) for px, py in zip(u, v)]
+        tag_polys.append(poly)
+
+    return tag_polys
+
+
 # -----------------------------------------------------------------------------
 # 2. Hybrid Mask Generator
 # -----------------------------------------------------------------------------
@@ -113,21 +178,24 @@ def generate_hybrid_mask(
     R: Optional[np.ndarray] = None,
     C: Optional[np.ndarray] = None,
     K: Optional[np.ndarray] = None,
-    cylinder_radius_m: float = 0.080,
-    cylinder_y_min_m: float = 0.003,
-    cylinder_y_max_m: float = 0.350,
+    cylinder_radius_m: float = 0.035,
+    cylinder_y_min_m: float = 0.001,
+    cylinder_y_max_m: float = 0.245,
     chroma_threshold: float = 20.0,
     brightness_white_threshold: float = 135.0,
     safety_dilation_px: int = 1,
     fill_holes: bool = True,
+    tag_polygons: Optional[List[List[Tuple[float, float]]]] = None,
+    tag_blackout: bool = True,
 ) -> np.ndarray:
     """
     Generates a high-precision binary silhouette mask (0 = background, 255 = foreground).
     Guarantees that ONLY the scanned physical object is visible:
-    1. 3D Bounding Cylinder projection (cuts away booth walls, aluminum rails, and turntable disc at y <= 0.003m).
-    2. Photometric segmentation (separates colorful plastic / dark rubber from bright white booth & white disc).
-    3. Connected component filtering (isolates largest component / tool, drops isolated tag fragments).
-    4. Morphological safety boundary.
+    1. 3D Bounding Cylinder projection (cuts away booth walls, aluminum rails, and turntable disc at y <= 0.001m).
+    2. Explicit geometric AprilTag blackout (forces all 12 AprilTag regions to 0/background).
+    3. Photometric segmentation (separates colorful plastic / dark rubber from bright white booth & white disc).
+    4. Connected component filtering (isolates largest component / tool, drops isolated tag fragments).
+    5. Morphological safety boundary.
     """
     # 1. Load image as RGB NumPy array
     if isinstance(image, (str, Path)):
@@ -179,7 +247,25 @@ def generate_hybrid_mask(
         y_min, y_max = int(h * 0.05), int(h * 0.72)
         roi_mask[y_min:y_max, x_min:x_max] = True
 
-    # 3. Photometric Color & Brightness Segmentation
+    # 3. Geometric AprilTag Blackout Mask
+    tag_mask = np.zeros((h, w), dtype=bool)
+    if tag_blackout and tag_polygons:
+        if HAS_PIL:
+            t_pil = Image.new("L", (w, h), 0)
+            tdraw = ImageDraw.Draw(t_pil)
+            for tpoly in tag_polygons:
+                if len(tpoly) >= 3:
+                    tdraw.polygon(tpoly, fill=255)
+            tag_mask = np.array(t_pil) > 128
+        elif HAS_CV2:
+            t_cv = np.zeros((h, w), dtype=np.uint8)
+            for tpoly in tag_polygons:
+                if len(tpoly) >= 3:
+                    pts_t = np.array(tpoly, dtype=np.int32).reshape((-1, 1, 2))
+                    cv2.fillPoly(t_cv, [pts_t], 255)
+            tag_mask = t_cv > 128
+
+    # 4. Photometric Color & Brightness Segmentation
     r, g, b = rgb_arr[:, :, 0], rgb_arr[:, :, 1], rgb_arr[:, :, 2]
     max_c = np.maximum(np.maximum(r, g), b)
     min_c = np.minimum(np.minimum(r, g), b)
@@ -189,10 +275,10 @@ def generate_hybrid_mask(
     # Flat white photo-booth wall & white turntable disc:
     is_white_bg = (brightness > brightness_white_threshold) & (chroma < chroma_threshold)
 
-    # Foreground object: inside cylinder ROI, not white background
-    is_fg = (~is_white_bg) & roi_mask
+    # Foreground object: inside cylinder ROI, not white background, and strictly NOT on any AprilTag
+    is_fg = (~is_white_bg) & roi_mask & (~tag_mask)
 
-    # 4. Morphological Cleaning & Connected Component Filtering
+    # 5. Morphological Cleaning & Connected Component Filtering
     scale_w = min(800, w)
     scale_h = int(h * (scale_w / w))
 
@@ -246,7 +332,7 @@ def generate_hybrid_mask(
     else:
         clean_sub = (sub_arr.astype(np.uint8)) * 255
 
-    # 5. Safety Dilation / Erosion & Upsample to Native Resolution
+    # 6. Safety Dilation / Erosion & Upsample to Native Resolution
     if HAS_PIL:
         clean_pil = Image.fromarray(clean_sub)
         if safety_dilation_px > 0:
@@ -261,6 +347,10 @@ def generate_hybrid_mask(
         final_mask = (final_mask > 128).astype(np.uint8) * 255
     else:
         final_mask = (is_fg.astype(np.uint8)) * 255
+
+    # 7. Strictly enforce AprilTag blackout on final mask (overrides dilation/upsampling)
+    if np.any(tag_mask):
+        final_mask[tag_mask] = 0
 
     return final_mask
 
@@ -292,12 +382,15 @@ def batch_generate_masks(
     poses_dict: Dict[str, Dict[str, Any]],
     intrinsics_dict: Dict[str, Dict[str, Any]],
     output_masks_dir: Union[str, Path],
-    cylinder_radius_m: float = 0.080,
-    cylinder_y_min_m: float = 0.003,
-    cylinder_y_max_m: float = 0.350,
+    cylinder_radius_m: float = 0.035,
+    cylinder_y_min_m: float = 0.001,
+    cylinder_y_max_m: float = 0.245,
     chroma_threshold: float = 20.0,
     brightness_white_threshold: float = 135.0,
     safety_dilation_px: int = 1,
+    tag_blackout: bool = True,
+    tag_expansion_factor: float = 1.25,
+    tag_layout_path: Optional[Union[str, Path]] = None,
 ) -> Dict[str, str]:
     """
     Generates automated binary masks for all views in the dataset.
@@ -306,6 +399,10 @@ def batch_generate_masks(
     """
     out_dir = Path(output_masks_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    tags = load_tag_layout(tag_layout_path) if tag_blackout else []
+    if tag_blackout and tags:
+        logger.info(f"Loaded {len(tags)} AprilTags for disc blackout suppression (expansion={tag_expansion_factor:.2f}).")
 
     mask_map: Dict[str, str] = {}
     total = len(views)
@@ -326,6 +423,13 @@ def batch_generate_masks(
         C = pose_info.get("C") if pose_info else None
         K = intr_info.get("K") if intr_info else None
 
+        tag_polygons = None
+        if tag_blackout and tags and R is not None and C is not None and K is not None:
+            tag_polygons = project_tags_to_2d(
+                tags=tags, R=R, C=C, K=K,
+                expansion_factor=tag_expansion_factor,
+            )
+
         mask = generate_hybrid_mask(
             image=src_path,
             R=R, C=C, K=K,
@@ -335,6 +439,8 @@ def batch_generate_masks(
             chroma_threshold=chroma_threshold,
             brightness_white_threshold=brightness_white_threshold,
             safety_dilation_px=safety_dilation_px,
+            tag_polygons=tag_polygons,
+            tag_blackout=tag_blackout,
         )
 
         view_id = str(v.get("viewId", idx))

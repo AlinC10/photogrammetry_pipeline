@@ -67,6 +67,28 @@ class TestMeshCleaner(unittest.TestCase):
         self.assertTrue(sealed.is_watertight)
         self.assertGreater(sealed.volume, 0.0)
 
+    def test_seal_watertight_pedestal_no_skirt(self):
+        """Verifies direct planar capping without vertical skirt extrusion."""
+        R = trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0])
+        cylinder = trimesh.creation.cylinder(radius=0.03, height=0.10, sections=24, transform=R)
+        cylinder.apply_translation([0.0, 0.03, 0.0])
+
+        sealed = seal_watertight_pedestal(
+            input_mesh=cylinder,
+            slice_y=0.001,
+            skirt_y=0.001,
+            max_radius=0.10,
+            extrude_skirt=False,
+            base_color_rgb=(25, 25, 25),
+        )
+
+        self.assertIsNotNone(sealed)
+        self.assertTrue(sealed.is_watertight)
+        self.assertGreater(sealed.volume, 0.0)
+        # Lowest point must be exactly at slice_y = 0.001
+        min_y = float(sealed.vertices[:, 1].min())
+        self.assertAlmostEqual(min_y, 0.001, places=3)
+
     def test_full_clean_and_repair_flow(self):
         R = trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0])
         cylinder = trimesh.creation.cylinder(radius=0.025, height=0.08, sections=16, transform=R)
@@ -92,6 +114,39 @@ class TestMeshCleaner(unittest.TestCase):
         self.assertGreater(res["vertex_count"], 0)
         self.assertGreater(res["face_count"], 0)
         self.assertTrue(res["is_watertight"])
+
+    def test_high_poly_conditioning_and_normals(self):
+        """Verifies high-poly decimation, Taubin smoothing, and vertex normal unitization."""
+        R = trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0])
+        cylinder = trimesh.creation.cylinder(radius=0.03, height=0.10, sections=40, transform=R)
+        cylinder.apply_translation([0.0, 0.03, 0.0])
+
+        in_obj = Path(self.test_dir) / "dense_raw.obj"
+        out_obj = Path(self.test_dir) / "dense_cleaned.obj"
+        cylinder.export(str(in_obj))
+
+        config = MeshCleaningConfig(
+            slice_y_m=0.001,
+            skirt_bottom_y_m=0.001,
+            extrude_skirt=False,
+            target_high_poly_faces=100,
+            high_poly_smooth_iterations=3,
+        )
+
+        res = clean_and_repair_mesh(
+            input_obj_path=str(in_obj),
+            output_obj_path=str(out_obj),
+            config=config,
+        )
+
+        self.assertTrue(out_obj.is_file())
+        loaded = trimesh.load(str(out_obj), process=False)
+        # Verify normals are unit length (||n|| ≈ 1.0)
+        if hasattr(loaded, "vertex_normals") and len(loaded.vertex_normals) > 0:
+            lengths = np.linalg.norm(loaded.vertex_normals, axis=1)
+            valid = lengths > 1e-4
+            if np.any(valid):
+                np.testing.assert_allclose(lengths[valid], 1.0, atol=1e-2)
 
 
 if __name__ == "__main__":

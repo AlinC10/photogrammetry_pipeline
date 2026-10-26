@@ -64,16 +64,24 @@ def triangulate_2d_polygon(coords_2d: np.ndarray) -> np.ndarray:
 
 def seal_watertight_pedestal(
     input_mesh: trimesh.Trimesh,
-    slice_y: float = 0.003,
-    skirt_y: float = 0.000,
+    slice_y: float = 0.001,
+    skirt_y: float = 0.001,
     max_radius: float = 0.12,
+    extrude_skirt: Optional[bool] = None,
+    base_color_rgb: Tuple[int, int, int] = (25, 25, 25),
 ) -> trimesh.Trimesh:
     """
     Slices mesh at slice_y (dropping noisy turntable points), finds boundary loops,
-    extrudes a prismatic skirt down to skirt_y, and triangulates the bottom cap
+    optionally extrudes a prismatic skirt down to skirt_y, and triangulates the bottom cap
     with strict -Y normal winding.
     """
-    logger.info(f"Slicing mesh at Y = {slice_y * 1000:.1f} mm, skirt down to Y = {skirt_y * 1000:.1f} mm...")
+    if extrude_skirt is None:
+        extrude_skirt = (skirt_y < (slice_y - 1e-4))
+
+    logger.info(
+        f"Slicing mesh at Y = {slice_y * 1000:.1f} mm "
+        f"({'extruding skirt down to Y = ' + str(skirt_y * 1000) + ' mm' if extrude_skirt else 'direct base cap without skirt'})..."
+    )
 
     # 1. Planar slice keeping everything ABOVE slice_y
     # Plane normal points UP (+Y), origin at [0, slice_y, 0]
@@ -154,68 +162,84 @@ def seal_watertight_pedestal(
     n_loop = len(loop_v_idx)
     logger.info(f"Identified primary boundary loop with {n_loop} vertices.")
 
-    # 3. Create skirt vertices and faces
+    # 3. Create skirt vertices and faces or direct base cap
     new_vertices = list(sliced.vertices.copy())
     new_faces = list(sliced.faces.copy())
 
-    # Skirt bottom vertices at y = skirt_y
-    skirt_bottom_indices = []
-    base_coords_2d = []
+    if extrude_skirt and abs(slice_y - skirt_y) > 1e-4:
+        # Skirt bottom vertices at y = skirt_y
+        skirt_bottom_indices = []
+        base_coords_2d = []
 
-    for idx in loop_v_idx:
-        vx, vy, vz = sliced.vertices[idx]
-        skirt_v = np.array([vx, skirt_y, vz], dtype=np.float64)
-        new_idx = len(new_vertices)
-        new_vertices.append(skirt_v)
-        skirt_bottom_indices.append(new_idx)
-        base_coords_2d.append([vx, vz])
+        for idx in loop_v_idx:
+            vx, vy, vz = sliced.vertices[idx]
+            skirt_v = np.array([vx, skirt_y, vz], dtype=np.float64)
+            new_idx = len(new_vertices)
+            new_vertices.append(skirt_v)
+            skirt_bottom_indices.append(new_idx)
+            base_coords_2d.append([vx, vz])
 
-    skirt_bottom_indices = np.array(skirt_bottom_indices)
-    base_coords_2d = np.array(base_coords_2d)
+        skirt_bottom_indices = np.array(skirt_bottom_indices)
+        base_coords_2d = np.array(base_coords_2d)
 
-    # Build vertical quad walls between slice_y and skirt_y
-    for i in range(n_loop):
-        top_curr = loop_v_idx[i]
-        top_next = loop_v_idx[(i + 1) % n_loop]
-        bot_curr = skirt_bottom_indices[i]
-        bot_next = skirt_bottom_indices[(i + 1) % n_loop]
+        # Build vertical quad walls between slice_y and skirt_y
+        for i in range(n_loop):
+            top_curr = loop_v_idx[i]
+            top_next = loop_v_idx[(i + 1) % n_loop]
+            bot_curr = skirt_bottom_indices[i]
+            bot_next = skirt_bottom_indices[(i + 1) % n_loop]
 
-        # Two triangles per quad
-        f1 = [top_curr, top_next, bot_next]
-        f2 = [top_curr, bot_next, bot_curr]
+            # Two triangles per quad
+            f1 = [top_curr, top_next, bot_next]
+            f2 = [top_curr, bot_next, bot_curr]
 
-        # Check normal direction of quad faces (should point radially outwards)
-        v0, v1, v2 = new_vertices[f1[0]], new_vertices[f1[1]], new_vertices[f1[2]]
-        face_norm = np.cross(v1 - v0, v2 - v0)
-        centroid = (v0 + v1 + v2) / 3.0
-        # Radially outwards vector: [centroid[0], 0, centroid[2]]
-        radial_vec = np.array([centroid[0], 0.0, centroid[2]])
-        if np.dot(face_norm, radial_vec) < 0:
-            # Swap winding
-            f1 = [top_curr, bot_next, top_next]
-            f2 = [top_curr, bot_curr, bot_next]
+            # Check normal direction of quad faces (should point radially outwards)
+            v0, v1, v2 = new_vertices[f1[0]], new_vertices[f1[1]], new_vertices[f1[2]]
+            face_norm = np.cross(v1 - v0, v2 - v0)
+            centroid = (v0 + v1 + v2) / 3.0
+            radial_vec = np.array([centroid[0], 0.0, centroid[2]])
+            if np.dot(face_norm, radial_vec) < 0:
+                f1 = [top_curr, bot_next, top_next]
+                f2 = [top_curr, bot_curr, bot_next]
 
-        new_faces.append(f1)
-        new_faces.append(f2)
+            new_faces.append(f1)
+            new_faces.append(f2)
 
-    # 4. Triangulate bottom base cap at y = skirt_y
-    tri_2d_faces = triangulate_2d_polygon(base_coords_2d)
-    for tri in tri_2d_faces:
-        idx0 = skirt_bottom_indices[tri[0]]
-        idx1 = skirt_bottom_indices[tri[1]]
-        idx2 = skirt_bottom_indices[tri[2]]
+        # Triangulate bottom base cap at y = skirt_y
+        tri_2d_faces = triangulate_2d_polygon(base_coords_2d)
+        for tri in tri_2d_faces:
+            idx0 = skirt_bottom_indices[tri[0]]
+            idx1 = skirt_bottom_indices[tri[1]]
+            idx2 = skirt_bottom_indices[tri[2]]
 
-        # Normal must point DOWN (-Y)
-        v0 = new_vertices[idx0]
-        v1 = new_vertices[idx1]
-        v2 = new_vertices[idx2]
+            # Normal must point DOWN (-Y)
+            v0 = new_vertices[idx0]
+            v1 = new_vertices[idx1]
+            v2 = new_vertices[idx2]
 
-        norm = np.cross(v1 - v0, v2 - v0)
-        if norm[1] > 0:
-            # Winding points UP (+Y), swap to point DOWN (-Y)
-            new_faces.append([idx0, idx2, idx1])
-        else:
-            new_faces.append([idx0, idx1, idx2])
+            norm = np.cross(v1 - v0, v2 - v0)
+            if norm[1] > 0:
+                new_faces.append([idx0, idx2, idx1])
+            else:
+                new_faces.append([idx0, idx1, idx2])
+    else:
+        # Direct flat cap at slice plane (no extruded skirt)
+        base_coords_2d = np.array([[sliced.vertices[idx][0], sliced.vertices[idx][2]] for idx in loop_v_idx])
+        tri_2d_faces = triangulate_2d_polygon(base_coords_2d)
+        for tri in tri_2d_faces:
+            idx0 = loop_v_idx[tri[0]]
+            idx1 = loop_v_idx[tri[1]]
+            idx2 = loop_v_idx[tri[2]]
+
+            v0 = new_vertices[idx0]
+            v1 = new_vertices[idx1]
+            v2 = new_vertices[idx2]
+
+            norm = np.cross(v1 - v0, v2 - v0)
+            if norm[1] > 0:
+                new_faces.append([idx0, idx2, idx1])
+            else:
+                new_faces.append([idx0, idx1, idx2])
 
     assembled_mesh = trimesh.Trimesh(
         vertices=np.array(new_vertices),
@@ -260,6 +284,8 @@ def clean_and_repair_mesh(
         slice_y=config.slice_y_m,
         skirt_y=config.skirt_bottom_y_m,
         max_radius=config.max_radius_m,
+        extrude_skirt=getattr(config, "extrude_skirt", False),
+        base_color_rgb=getattr(config, "base_color_rgb", (25, 25, 25)),
     )
 
     # Export intermediate to temp for PyMeshLab
@@ -284,17 +310,48 @@ def clean_and_repair_mesh(
         ms.meshing_repair_non_manifold_vertices()
         ms.meshing_close_holes(maxholesize=30)
 
-        # Volume-preserving Taubin smoothing (eliminates 2-4mm ripples without shrinkage)
-        if getattr(config, "smooth_iterations", 0) > 0:
-            logger.info(f"Applying volume-preserving Taubin smoothing ({config.smooth_iterations} steps)...")
+        # High-Poly Conditioning: Decimate to optimal face count if needed
+        # (Preserves embossed lettering/logos while eliminating micro-triangle depth noise)
+        curr = ms.current_mesh()
+        curr_faces = curr.face_number()
+        target_high = getattr(config, "target_high_poly_faces", 250000)
+        if target_high and curr_faces > target_high:
+            logger.info(
+                f"Conditioning High-Poly mesh: decimating from {curr_faces:,d} to {target_high:,d} faces "
+                f"(preserving boundaries, normal relief, and planar quadrics)..."
+            )
+            try:
+                ms.meshing_decimation_quadric_edge_collapse(
+                    targetfacenum=target_high,
+                    preserveboundary=True,
+                    preservenormal=True,
+                    planarquadric=True,
+                    optimalplacement=True,
+                )
+            except Exception as de:
+                logger.warning(f"Quadric edge collapse decimation warning: {de}")
+
+        # Volume-preserving Taubin smoothing (eliminates 200um noise ripples without shrinkage)
+        smooth_steps = getattr(config, "high_poly_smooth_iterations", 5)
+        if smooth_steps > 0:
+            logger.info(f"Applying volume-preserving Taubin smoothing ({smooth_steps} steps)...")
             try:
                 ms.apply_coord_taubin_smoothing(
                     lambda_=0.5,
                     mu=-0.53,
-                    stepsmoothnum=config.smooth_iterations,
+                    stepsmoothnum=smooth_steps,
                 )
             except Exception as se:
                 logger.warning(f"Taubin smoothing warning: {se}")
+
+        # Compute angle-weighted per-vertex normals and STRICTLY NORMALIZE
+        # (CRITICAL: prevents unnormalized 2pi length normals causing Blender specular frosting!)
+        logger.info("Computing angle-weighted vertex normals and normalizing strictly (||n|| = 1.0000)...")
+        try:
+            ms.compute_normal_per_vertex(weightingmode=1)
+            ms.apply_normal_normalization_per_vertex()
+        except Exception as ne:
+            logger.warning(f"Normal computation/normalization warning: {ne}")
 
         # Save repaired mesh
         ms.save_current_mesh(str(out_p))
@@ -312,6 +369,12 @@ def clean_and_repair_mesh(
 
     except Exception as e:
         logger.warning(f"PyMeshLab processing warning: {e}. Falling back to trimesh export.")
+        try:
+            sealed.fix_normals()
+            if hasattr(sealed, "vertex_normals") and len(sealed.vertex_normals) > 0:
+                sealed.vertex_normals = trimesh.geometry.unitize(sealed.vertex_normals)
+        except Exception:
+            pass
         sealed.export(str(out_p))
         v_count = len(sealed.vertices)
         f_count = len(sealed.faces)
