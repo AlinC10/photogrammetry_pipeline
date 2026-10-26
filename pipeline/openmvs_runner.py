@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from .config import OpenMVSConfig
 
@@ -122,7 +122,7 @@ class OpenMVSRunner:
             "--min-resolution", str(self.config.min_resolution),
             "--max-resolution", str(self.config.max_resolution),
             "--number-views", str(self.config.number_views),
-            "--number-views-fuse", "2",
+            "--number-views-fuse", str(getattr(self.config, "number_views_fuse", 3)),
             "-v", "2",
         ]
         if masks_dir and Path(masks_dir).is_dir():
@@ -175,31 +175,44 @@ class OpenMVSRunner:
 
     def run_refine_mesh(
         self,
-        input_mvs: str = "scene_mesh.mvs",
+        input_mvs: str = "scene_dense.mvs",
+        mesh_file: Optional[str] = None,
         output_mvs: str = "scene_mesh_refined.mvs",
     ) -> str:
-        """Optionally refines mesh geometry using photo-consistency gradient."""
+        """
+        Refines the reconstructed surface with photo-consistency (OpenMVS RefineMesh): removes the
+        small dents PatchMatch leaves on dark / glossy plastic without blurring sharp edges.
+        Returns the refined mesh path (.ply), or mesh_file unchanged if RefineMesh is unavailable.
+        """
         bin_path = self.config.refine_mesh
         if not bin_path:
             logger.info("RefineMesh binary not found, skipping.")
-            return str(self.work_dir / input_mvs)
+            return str(mesh_file) if mesh_file else str(self.work_dir / input_mvs)
 
         in_file = self.work_dir / input_mvs
         if not in_file.is_file():
             in_file = self.work_dir / "scene_dense.mvs"
 
         out_file = self.work_dir / output_mvs
+        out_ply = self.work_dir / f"{out_file.stem}.ply"
 
         cmd = [
             bin_path,
             str(in_file),
             "-o", str(out_file),
-            "--resolution-level", "1",
+            "--resolution-level", str(getattr(self.config, "refine_resolution_level", 1)),
             "--max-face-area", "64",
             "-v", "2",
         ]
+        # ReconstructMesh (v2.3) leaves the surface in scene_mesh.ply next to a mesh-less .mvs
+        if mesh_file and Path(mesh_file).is_file():
+            cmd.extend(["--mesh-file", str(Path(mesh_file).resolve())])
         self._execute_cmd(cmd, "RefineMesh")
-        return str(out_file) if out_file.is_file() else str(in_file)
+        if out_ply.is_file():
+            return str(out_ply)
+        if out_file.is_file():
+            return str(out_file)
+        raise FileNotFoundError(f"RefineMesh output missing: {out_ply}")
 
     def run_texture_mesh(
         self,
