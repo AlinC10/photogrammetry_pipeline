@@ -4,7 +4,7 @@
 # Skipped: glibc / libstdc++ / libgcc (already in the base image) and the NVIDIA driver libraries
 # (libcuda, libnvidia-*), which the NVIDIA container runtime mounts from the host at run time.
 #
-#   docker_runtime_deps.sh /opt/runtime-libs /opt/openmvs_bin/bin/OpenMVS/* /opt/mvs-texturing/.../texrecon
+#   docker_runtime_deps.sh /opt/runtime-libs /opt/openMVS_build/bin/<app> /opt/mvs-texturing/.../texrecon
 set -eu
 DEST="$1"; shift
 mkdir -p "$DEST"

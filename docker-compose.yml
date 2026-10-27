@@ -6,6 +6,8 @@ services:
       args:
         # stats.json records it: GIT_COMMIT=$(git rev-parse --short HEAD) docker compose build
         GIT_COMMIT: ${GIT_COMMIT:-unknown}
+        # Parallel compile jobs (~2 GB RAM each): BUILD_JOBS=2 docker compose build if 4 still runs out of memory
+        BUILD_JOBS: ${BUILD_JOBS:-4}
     image: turntable-studio:latest
     container_name: turntable_studio_worker
     deploy:

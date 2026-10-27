@@ -225,6 +225,24 @@ class TestRunPod(unittest.TestCase):
         self.assertEqual(run.outcome, "timeout")
         self.assertFalse(run.terminated)
 
+    def test_pod_that_never_starts_is_replaced(self):
+        # Host stuck pulling the image: the pod stays RUNNING but never writes started.json
+        api = FakeRunPod()
+        started = iter([False, True])          # second pod starts at its first check
+        statuses = iter([None, {"state": "ok"}])
+        with mock.patch.object(rp, "BOOT_TIMEOUT_S", -1):
+            runs = rp.run_job_pods(api, self.body, 16, lambda: next(statuses, None), read_started=lambda: next(started))
+        self.assertEqual([r.outcome for r in runs], ["boot_timeout", "finished"])
+        self.assertEqual(api.bodies[1]["minRAMPerGPU"], 16)   # same request, new pod
+        self.assertEqual(api.deleted, ["pod1", "pod2"])
+
+    def test_started_pod_is_not_boot_timed_out(self):
+        api = FakeRunPod()
+        statuses = iter([None, None, {"state": "ok"}])
+        run = rp.run_pod(api, self.body(), lambda: next(statuses), poll_s=0, read_started=lambda: True,
+                         boot_timeout_s=-1)
+        self.assertEqual(run.outcome, "finished")
+
     def test_create_retries_then_gives_up(self):
         api = FakeRunPod(fail_creates=99)
         self.assertIsNone(rp.run_pod(api, self.body(), lambda: None, poll_s=0))
@@ -310,6 +328,7 @@ class TestPodJobEndToEnd(unittest.TestCase):
             self.assertIn("logs/run_log.txt", names)
             self.assertIn("stats.json", names)
             self.assertIn((BUCKET, r2.output_key("j9", "run_log.txt")), s3.objects)
+            self.assertIn((BUCKET, r2.output_key("j9", "started.json")), s3.objects)   # boot signal for the client
 
 
 class TestPlanJob(unittest.TestCase):
@@ -325,6 +344,57 @@ class TestPlanJob(unittest.TestCase):
             plan = plan_job(tmp)
         self.assertEqual((plan["n_images"], plan["width"], plan["height"]), (6, 405, 304))
         self.assertGreaterEqual(plan["min_ram_gb"], plan["ram_estimate_gb"])
+
+
+class TestCloudScanTool(unittest.TestCase):
+    def setUp(self):
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+        import cloud_scan
+        self.tool = cloud_scan
+
+    def test_set_values(self):
+        opts = self.tool.parse_set(["tag_scale=1.002", "estimate_lift=false", "data_term=area", "--resolution_level=0"])
+        self.assertEqual(opts, {"tag_scale": 1.002, "estimate_lift": False, "data_term": "area", "resolution_level": 0})
+        with self.assertRaises(SystemExit):
+            self.tool.parse_set(["output_dir=/x"])
+        with self.assertRaises(SystemExit):
+            self.tool.parse_set(["tag_scale"])
+        with self.assertRaises(SystemExit):
+            self.tool.parse_set(["tag_scal=1.0"])             # typo: refused, not silently ignored in the pod
+        self.assertEqual(self.tool.parse_set(["no_tag_refine", "--no_colour_normalize=true"]),
+                         {"tag_refine": False, "colour_normalize": False})
+
+    def test_known_options_match_main(self):
+        import re
+        src = (Path(__file__).resolve().parent.parent / "main.py").read_text(encoding="utf-8")
+        block = src[src.index("    job = {"):]
+        main_keys = set(re.findall(r'^\s+"([a-z_]+)":', block[:block.index("\n    }")], re.M))
+        self.assertLessEqual(self.tool.PIPELINE_OPTIONS, main_keys)
+        self.assertLessEqual(main_keys, self.tool.PIPELINE_OPTIONS | self.tool.RESERVED_OPTIONS)
+
+    def test_ctrl_c_cancels_the_job(self):
+        seen = {}
+
+        def fake_job(cancel_event=None, **kwargs):
+            seen["cancelled"] = cancel_event.wait(timeout=5)
+            return {"job_id": "x", "timings_s": {}, "result": "failed"}
+
+        joins = iter([KeyboardInterrupt()])
+
+        real_join = self.tool.threading.Thread.join
+
+        def join(thread, timeout=None):
+            err = next(joins, None)
+            if err:
+                raise err
+            return real_join(thread, timeout)
+
+        with mock.patch.object(self.tool, "run_cloud_job", fake_job), \
+                mock.patch.object(self.tool.threading.Thread, "join", join):
+            report = self.tool.run_interruptible(input_dir="x")
+        self.assertTrue(seen["cancelled"])
+        self.assertEqual(report["result"], "failed")
 
 
 if __name__ == "__main__":

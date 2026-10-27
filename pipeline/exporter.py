@@ -23,6 +23,24 @@ from .telemetry import SystemTelemetry
 logger = logging.getLogger("TurntableStudio.Exporter")
 
 
+# The pipeline works Y-up (turntable plane Y = 0, as glTF / OBJ). STL and 3MF are Z-up by convention (3MF spec,
+# slicers, Blender's STL import does not convert axes), so the print copies are rotated +90 deg about X:
+# (x, y, z) -> (x, -z, y). A proper rotation (det +1): face winding and outward normals stay valid.
+Y_UP_TO_Z_UP = np.array([
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, -1.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+])
+
+
+def to_print_frame(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    """Copy of a Y-up mesh standing upright for STL / 3MF (Z-up), base on Z = 0."""
+    out = mesh.copy()
+    out.apply_transform(Y_UP_TO_Z_UP)
+    return out
+
+
 def decimate_mesh(
     input_mesh_path: str,
     output_mesh_path: str,
@@ -43,8 +61,12 @@ def decimate_mesh(
         curr_faces = ms.current_mesh().face_number()
         logger.info(f"Decimating mesh from {curr_faces:,d} to {target_faces:,d} faces...")
 
-        # 1. Try texture-preserving quadric decimation to preserve UV texture coordinates (vt)
+        # 1. Texture-preserving quadric decimation keeps the UV coordinates (vt), but only exists for meshes that
+        #    have them: the untextured cleaned mesh goes straight to the standard decimation.
+        textured = ms.current_mesh().has_wedge_tex_coord()
         try:
+            if not textured:
+                raise ValueError("mesh has no texture coordinates")
             ms.meshing_decimation_quadric_edge_collapse_with_texture(
                 targetfacenum=target_faces,
                 preserveboundary=True,
@@ -52,7 +74,8 @@ def decimate_mesh(
             )
             logger.info(f"Texture-preserving decimation succeeded: {ms.current_mesh().face_number():,d} faces.")
         except Exception as tex_e:
-            logger.warning(f"Texture-preserving decimation failed ({tex_e}), trying standard decimation.")
+            if textured:
+                logger.warning(f"Texture-preserving decimation failed ({tex_e}), trying standard decimation.")
             ms.meshing_decimation_quadric_edge_collapse(
                 targetfacenum=target_faces,
                 preserveboundary=True,
@@ -530,7 +553,8 @@ def export_multi_lod_bundle(
     else:
         high_print_mesh = cleaned_trimesh
 
-    # Export watertight STL and 3MF at real-world scale
+    # Export watertight STL and 3MF at real-world scale, standing upright (Z-up)
+    high_print_mesh = to_print_frame(high_print_mesh)
     high_print_mesh.export(str(high_stl), file_type="stl")
     telemetry.record_mesh(str(high_stl))
 
@@ -655,6 +679,7 @@ def export_multi_lod_bundle(
         low_trimesh = trimesh.util.concatenate(geoms) if geoms else cleaned_trimesh.copy()
     else:
         low_trimesh = loaded_low.copy()
+    low_trimesh = to_print_frame(low_trimesh)   # STL / 3MF are Z-up
 
     low_trimesh.export(str(low_stl), file_type="stl")
     telemetry.record_mesh(str(low_stl))

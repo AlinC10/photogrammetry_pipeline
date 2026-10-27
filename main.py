@@ -183,6 +183,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             bin_dir=job.get("openmvs_bin_dir"),
             resolution_level=job.get("resolution_level", 1),
             smooth_mesh=job.get("smooth_mesh", 2),
+            min_point_distance=float(job.get("min_point_distance", 0.5)),
             min_resolution=job.get("min_resolution", 640),
             texture_resolution=job.get("texture_resolution", 4096),
             empty_color=job.get("empty_color", 0),
@@ -207,6 +208,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             skirt_bottom_y_m=job.get("skirt_bottom_y_m", 0.000),
             max_radius_m=job.get("max_radius_m", 0.12),
             target_low_poly_faces=job.get("target_low_poly_faces", 50000),
+            target_high_poly_faces=int(job.get("target_high_poly_faces", 1000000)),
         ),
         export_scale=job.get("export_scale", 100.0),
         scale_stl_to_mm=job.get("scale_stl_to_mm", True),
@@ -712,6 +714,8 @@ def parse_args():
     parser.add_argument("--empty_color", type=int, default=0, help="OpenMVS empty/unobserved face color in decimal RGB (0=black, 16744231=orange)")
     parser.add_argument("--global_seam_leveling", type=int, default=0, help="OpenMVS global Poisson seam leveling (0=disabled to avoid dark bleeding, 1=enabled)")
     parser.add_argument("--local_seam_leveling", type=int, default=1, help="OpenMVS local seam edge blending (1=enabled, 0=disabled)")
+    parser.add_argument("--min_point_distance", type=float, default=0.5, help="ReconstructMesh --min-point-distance in pixels (default 0.5; OpenMVS default 2.5: fewer points, faster Delaunay + graph-cut)")
+    parser.add_argument("--target_high_poly_faces", type=int, default=1000000, help="High-poly face cap (default 1,000,000 = ~500k vertices; denser cleaned meshes are decimated to it, 0 = never)")
     parser.add_argument("--target_low_poly_faces", type=int, default=50000, help="Target face count for low-poly mesh (default: 50,000)")
     parser.add_argument("--export_scale", type=float, default=100.0, help="Scale factor applied to exported assets (default: 100.0 for real-world scale: 2.2mm -> 22cm)")
     parser.add_argument("--scale_to_mm", action="store_true", help="Shortcut to export OBJ in millimeters (sets export_scale=1000.0)")
@@ -777,6 +781,8 @@ def main():
         "global_seam_leveling": args.global_seam_leveling,
         "local_seam_leveling": args.local_seam_leveling,
         "target_low_poly_faces": args.target_low_poly_faces,
+        "target_high_poly_faces": args.target_high_poly_faces,
+        "min_point_distance": args.min_point_distance,
         "export_scale": export_scale,
         "scale_stl_to_mm": True,
         "mock_openmvs": args.mock_openmvs,

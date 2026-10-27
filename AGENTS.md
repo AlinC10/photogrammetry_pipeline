@@ -64,7 +64,7 @@ To prevent dark patches, Poisson bleeding, and micro-confetti texture atlases:
 - `--empty-color 0`: Fills unobserved faces (e.g. flat cut bottom) and empty atlas areas with clean black (`RGB 0,0,0`), not neon orange.
 
 ### RULE 9: Testing & Documentation Integrity
-- All unit tests in `tests/` (78 at the time of writing) must pass before any commit.
+- All unit tests in `tests/` (84 at the time of writing) must pass before any commit.
 - Preserve existing docstrings, comments, and structure.
 
 ---
@@ -83,7 +83,7 @@ turntable_studio/
 │   ├── cloudflare_r2.py        # R2 client, jobs/<id>/input|output layout, temporary prefix-scoped credentials
 │   ├── runpod.py               # RunPod REST pods: GPU list + min RAM/vCPU, guaranteed termination, bounded retries
 │   └── job.py                  # Whole cloud flow for one scan (upload -> pod -> download -> cleanup)
-├── tools/                      # Local only (not in the image): cloud_test_run.py, fit_ram_model.py, collect_stats.py,
+├── tools/                      # Local only (not in the image): cloud_scan.py, fit_ram_model.py, collect_stats.py,
 │                               #   debug_texturing.py (texture diagnostics), debug_blender_compare.py (headless Blender)
 ├── Dockerfile                  # Multi-stage CUDA 12 + OpenMVS production container
 ├── docker-compose.yml          # Container configuration with GPU passthrough
@@ -139,7 +139,7 @@ The following features are slated for upcoming agent implementations:
 
 ### Priority 4: Cloud Deployment (RunPod pods + Cloudflare R2) — implemented, first real run pending
 - One pod per scan (`cloud/job.py`, `runpod_job.py`); see `cloud/README.md`.
-- Pending: first measured run (`tools/cloud_test_run.py`), image pushed to a registry, GPU id list checked.
+- Pending: first measured run (`tools/cloud_scan.py`), image pushed to a registry, GPU id list checked.
 
 ---
 

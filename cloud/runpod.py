@@ -4,6 +4,9 @@ runpod.py — One pod per scan job through the RunPod REST API (https://rest.run
 * The pod is created from a list of acceptable GPU types (gpuTypeIds + gpuTypePriority "custom": RunPod takes
   the first one with capacity, in our order) with a minimum host RAM and vCPU count per GPU.
 * Completion is read from R2 (jobs/<id>/output/status.json, written last by the pod), not guessed from uptime.
+* A pod whose container never starts (e.g. the host's Docker fails to pull the image: "failed to register layer")
+  still reports RUNNING. The pod writes jobs/<id>/output/started.json first thing; without it after
+  BOOT_TIMEOUT_S the pod is terminated and the job retried on a new pod (usually another host).
 * Every pod created is terminated (DELETE /pods/{id}) in a `finally`, after success, failure, cancel or timeout.
   When a termination fails no other pod is started, so a lost termination never doubles the bill.
 * The pod never receives the RunPod API key: stopping it is the client's job.
@@ -44,7 +47,9 @@ MAX_POD_ATTEMPTS = int(os.environ.get("RUNPOD_MAX_POD_ATTEMPTS", "2"))
 # Create requests rejected for lack of capacity cost nothing: retried this many times
 MAX_CREATE_ATTEMPTS = int(os.environ.get("RUNPOD_MAX_CREATE_ATTEMPTS", "5"))
 CREATE_RETRY_S = 30.0
-POLL_S = 15.0                     # pause between two status checks
+# A pod whose pipeline has not written started.json after this long is replaced (stuck image pull on its host)
+BOOT_TIMEOUT_S = float(os.environ.get("RUNPOD_BOOT_TIMEOUT_S", str(10 * 60)))
+POLL_S = 5.0                      # pause between two status checks (the pod bills until the one after status.json)
 STATUS_MAX_ERRORS = 5             # consecutive failed status queries after which the pod is given up (and terminated)
 TERMINATE_ATTEMPTS = 5
 TERMINATE_RETRY_S = 5.0
@@ -167,7 +172,7 @@ class PodRun:
     """What happened to one pod."""
     pod_id: str
     started_at: float
-    outcome: str = "failed"          # finished | exited | cancelled | timeout | status_error
+    outcome: str = "failed"          # finished | exited | cancelled | timeout | boot_timeout | status_error
     status: Optional[Dict[str, Any]] = None   # jobs/<id>/output/status.json
     terminated: bool = False
     pod_info: Dict[str, Any] = field(default_factory=dict)   # gpu, memoryInGb, vcpuCount, costPerHr
@@ -216,10 +221,14 @@ def run_pod(
     max_runtime_s: float = POD_MAX_RUNTIME_S,
     poll_s: float = POLL_S,
     on_progress: Optional[Callable[[str], None]] = None,
+    read_started: Optional[Callable[[], bool]] = None,
+    boot_timeout_s: Optional[float] = None,
 ) -> Optional[PodRun]:
     """
-    Creates one pod, waits until its status.json appears in R2 (or the pod exits, is cancelled, runs too long or
-    cannot be queried) and ALWAYS terminates it afterwards. Returns None when no pod could be created.
+    Creates one pod, waits until its status.json appears in R2 (or the pod exits, is cancelled, runs too long,
+    never starts its pipeline within boot_timeout_s or cannot be queried) and ALWAYS terminates it afterwards.
+    read_started() says whether the pod's pipeline has started (started.json in R2); None disables the check.
+    Returns None when no pod could be created.
     """
     def wait(seconds: float) -> bool:
         if cancel_event is not None:
@@ -228,6 +237,7 @@ def run_pod(
         return False
 
     say = on_progress or logger.info
+    boot_timeout_s = BOOT_TIMEOUT_S if boot_timeout_s is None else boot_timeout_s
     created = create_pod_with_retries(client, body, wait)
     if not created:
         return None
@@ -235,6 +245,7 @@ def run_pod(
     say(f"Created pod {run.pod_id}: {run.pod_info}")
     try:
         errors = 0
+        started = read_started is None
         while True:
             if wait(poll_s):
                 say("Job cancelled: terminating the pod.")
@@ -253,6 +264,18 @@ def run_pod(
                 run.status = status
                 run.outcome = "finished"
                 break
+            if not started:
+                try:
+                    started = bool(read_started())
+                except Exception as e:
+                    say(f"Could not read started.json: {e}")
+                if started:
+                    say(f"Pipeline started in the pod after {run.elapsed_s:.0f} s (image pull + boot).")
+                elif run.elapsed_s > boot_timeout_s:
+                    say(f"Pipeline not started after {boot_timeout_s / 60:g} minutes (image pull stuck on this host?): "
+                        "terminating the pod. Its log is on console.runpod.io until then.")
+                    run.outcome = "boot_timeout"
+                    break
             try:
                 pod = client.get_pod(run.pod_id)
                 errors = 0
@@ -286,11 +309,12 @@ def run_job_pods(
     max_runtime_s: float = POD_MAX_RUNTIME_S,
     on_progress: Optional[Callable[[str], None]] = None,
     before_retry: Optional[Callable[[], None]] = None,
+    read_started: Optional[Callable[[], bool]] = None,
 ) -> List[PodRun]:
     """
     Runs the job on at most MAX_POD_ATTEMPTS pods. A new pod is started only when the previous one
-    reported "ram_insufficient" (asks for the RAM the pod measured it needs) or died without a status
-    (likely OOM: asks for RAM_RETRY_FACTOR more). make_body(min_ram_gb) builds the create request (fresh
+    reported "ram_insufficient" (asks for the RAM the pod measured it needs), died without a status
+    (likely OOM: asks for RAM_RETRY_FACTOR more) or never started its pipeline (same request, new pod). make_body(min_ram_gb) builds the create request (fresh
     credentials for every pod); before_retry() removes the previous pod's status.json.
     """
     say = on_progress or logger.info
@@ -300,7 +324,8 @@ def run_job_pods(
         if attempt > 1 and before_retry is not None:
             before_retry()
         say(f"--- Pod attempt {attempt} of {MAX_POD_ATTEMPTS} (min RAM {ram} GB per GPU) ---")
-        run = run_pod(client, make_body(ram), read_status, cancel_event, max_runtime_s, on_progress=say)
+        run = run_pod(client, make_body(ram), read_status, cancel_event, max_runtime_s, on_progress=say,
+                      read_started=read_started)
         if run is None:
             say("No pod could be created with these filters.")
             break
@@ -314,5 +339,7 @@ def run_job_pods(
         if run.outcome == "exited":
             ram = int(math.ceil(ram * RAM_RETRY_FACTOR))
             continue
+        if run.outcome == "boot_timeout":
+            continue          # same request: RunPod places the new pod, usually on another host
         break  # ok or pipeline_error: retrying would not help
     return runs

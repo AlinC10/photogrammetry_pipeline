@@ -166,7 +166,7 @@ class OpenMVSConfig:
     max_threads: int = 0              # --max-threads for every OpenMVS app (0 = OpenMVS default: all cores)
     keep_depth_maps: bool = False     # False: depth*.dmap (~74 MB each at level 1) are deleted after fusion
     smooth_mesh: int = 2              # OpenMVS ReconstructMesh --smooth (default 2)
-    min_point_distance: float = 0.5   # mm distance filter
+    min_point_distance: float = 0.5   # ReconstructMesh --min-point-distance, in pixels (OpenMVS default 2.5)
     texture_resolution: int = 4096    # high-res texture atlas
     low_poly_texture_res: int = 2048  # low-poly texture atlas
     empty_color: int = 0              # 0 = black (prevents neon orange on unobserved/bottom faces)
@@ -228,7 +228,7 @@ class MeshCleaningConfig:
     keep_largest_only: bool = True
     remove_duplicate_faces: bool = True
     target_low_poly_faces: int = 50000
-    target_high_poly_faces: int = 250000 # Optimal high-poly count: preserves all embossed text/edges, eliminates micro-noise
+    target_high_poly_faces: int = 1000000 # High-poly cap (~500k vertices); denser meshes are decimated to it
     smooth_iterations: int = 12       # Taubin volume-preserving smoothing (eliminates 2-4mm ripples)
     high_poly_smooth_iterations: int = 5 # Taubin steps for high-poly (smooths 200um noise without loss of detail)
 

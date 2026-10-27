@@ -62,6 +62,10 @@ def main() -> int:
         logger.info(f"Job {job_id} already has a status.json: nothing to do.")
         return 0
 
+    # First sign of life for the client: without it the pod is replaced after RUNPOD_BOOT_TIMEOUT_S
+    r2.put_json({"job_id": job_id, "started_at": started}, r2.output_key(job_id, "started.json"), bucket,
+                client=out_client)
+
     done = threading.Event()
 
     def watchdog():

@@ -27,9 +27,9 @@ Pi / laptop                              R2 (one bucket)                        
 |---|---|
 | `cloudflare_r2.py` | S3 client for R2, job key layout (`jobs/<id>/input|output/`), uploads (never raise), downloads, prefix deletion, preflight, **temporary prefix-scoped credentials** |
 | `runpod.py` | RunPod REST client (`POST/GET/DELETE /v1/pods`), pod request, pod lifecycle with guaranteed termination and bounded retries |
-| `job.py` | The whole flow above for one scan (`run_cloud_job`), used by the Pi and by `tools/cloud_test_run.py` |
+| `job.py` | The whole flow above for one scan (`run_cloud_job`), used by the Pi and by `tools/cloud_scan.py` |
 | `../runpod_job.py` | Inside the pod: download, run, upload, `status.json` |
-| `../tools/cloud_test_run.py` | Runs the flow from the laptop with `input_images/` (not in the Docker image) |
+| `../tools/cloud_scan.py` | Runs the flow from the laptop with `input_images/` (not in the Docker image) |
 
 ## Keys: who holds what
 
@@ -72,14 +72,14 @@ or died without writing a status (likely OOM, asks for 1.5× RAM). `pipeline_err
 
 ```bash
 cp .env.example .env       # fill in the keys and TURNTABLE_IMAGE
-python tools/cloud_test_run.py --dry_run    # preflight + estimate + the pod request (secrets redacted); no pod
-python tools/cloud_test_run.py              # full flow; prints timings, the pod used and the cost estimate
-python tools/cloud_test_run.py --keep_remote                 # leave jobs/<id>/ in R2
-python tools/cloud_test_run.py --job_id <id> --skip_upload   # retry with the photos already in R2
+python tools/cloud_scan.py --dry_run    # preflight + estimate + the pod request (secrets redacted); no pod
+python tools/cloud_scan.py              # full flow; prints timings, the pod used and the cost estimate
+python tools/cloud_scan.py --keep_remote                 # leave jobs/<id>/ in R2
+python tools/cloud_scan.py --job_id <id> --skip_upload   # retry with the photos already in R2
 ```
 
 Before the first real run:
-1. Build and push the image (`docker build -t ghcr.io/<user>/turntable-studio:v1 . && docker push ...`).
+1. Build and push the image (`docker build -t <user>/turntable-studio:v1 . && docker push ...`). Then `python tools/cloud_scan.py --mock` tests image, keys, R2 and pod termination with simulated OpenMVS.
    For a private registry, add its credentials in RunPod (Settings → Container Registry Auth) and put the id in
    `RUNPOD_REGISTRY_AUTH_ID`.
 2. Check the GPU ids in `--dry_run` against RunPod's list (some ids contain double spaces there).

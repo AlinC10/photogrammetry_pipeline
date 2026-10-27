@@ -20,6 +20,7 @@ from pathlib import Path
 # Ensure turntable_studio root is on PYTHONPATH
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import numpy as np
 import trimesh
 from PIL import Image
 
@@ -36,6 +37,17 @@ class TestExporter(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_print_frame_stands_upright(self):
+        """STL / 3MF are Z-up: a tall Y-up object (base on Y = 0) must stand on Z = 0, not lie on its side."""
+        from pipeline.exporter import to_print_frame
+        tall = trimesh.creation.box(extents=[0.04, 0.20, 0.06])
+        tall.apply_translation([0.0, 0.10, 0.0])           # base on the turntable plane Y = 0
+        up = to_print_frame(tall)
+        self.assertTrue(np.allclose(up.extents, [0.04, 0.06, 0.20]))
+        self.assertAlmostEqual(up.bounds[0][2], 0.0)
+        self.assertGreater(up.volume, 0)                   # proper rotation: normals still point outwards
+        self.assertTrue(np.allclose(tall.bounds[0], [-0.02, 0.0, -0.03]))   # the source mesh is not modified
 
     def test_export_multi_lod_bundle_textured(self):
         tpath = Path(self.test_dir)

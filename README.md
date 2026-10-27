@@ -153,12 +153,13 @@ Once:
 
 Then, from the repository root:
 ```bash
-python tools/cloud_test_run.py --dry_run     # R2 check + RAM/disk estimate + the pod request, no pod, no cost
-python tools/cloud_test_run.py               # upload input_images/ -> pod -> results/<job_id>/ -> clean R2
-python tools/cloud_test_run.py --keep_remote # leave the job in R2 (debugging)
-python tools/cloud_test_run.py --job_id <id> --skip_upload   # retry with the photos already in R2
+python tools/cloud_scan.py --dry_run     # R2 check + RAM/disk estimate + the pod request, no pod, no cost
+python tools/cloud_scan.py               # upload input_images/ -> pod -> results/<job_id>/ -> clean R2
+python tools/cloud_scan.py D:\scans\multimeter --name multimeter --set tag_scale=1.002   # any folder, any pipeline option
+python tools/cloud_scan.py --keep_remote # leave the job in R2 (debugging)
+python tools/cloud_scan.py --job_id <id> --skip_upload   # retry with the photos already in R2
 ```
-It prints the time of every phase, the GPU / RAM / vCPU received and the cost estimate. Details, key permissions,
+It asks before starting the (billed) pod (`-y` skips the question); Ctrl+C terminates the pod. It prints the time of every phase, the GPU / RAM / vCPU received and the cost estimate. Details, key permissions,
 `status.json` and the Pi upload queue: [`cloud/README.md`](cloud/README.md).
 
 ---
@@ -268,7 +269,7 @@ requirements-runtime.txt (image) / requirements.txt (+ local tools)
 .env.example             keys for the cloud flow (.env is ignored by git and Docker)
 pipeline/                the steps of section 1, resources.py (RAM/CPU), run_metrics.py (stats), telemetry.py
 cloud/                   cloudflare_r2.py, runpod.py, job.py, README.md
-tools/                   local only: cloud_test_run.py, collect_stats.py, fit_ram_model.py,
+tools/                   local only: cloud_scan.py, collect_stats.py, fit_ram_model.py,
                          debug_texturing.py (texture diagnostics), debug_blender_compare.py (headless Blender)
 tests/                   unit tests (no GPU, no network)
 plans/                   open plans (AUDIT_RECONSTRUCTIE_GENERALA.md = next fixes); plans/implemented/ = done

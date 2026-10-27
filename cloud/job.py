@@ -176,20 +176,26 @@ def run_cloud_job(
         return report
 
     status_key = r2.output_key(job_id, "status.json")
+    started_key = r2.output_key(job_id, "started.json")
 
     def read_status():
         return r2.get_json(status_key, bucket, client=client)
 
+    def read_started() -> bool:
+        return r2.get_json(started_key, bucket, client=client) is not None
+
     def clear_status():
-        try:
-            client.delete_object(Bucket=bucket, Key=status_key)
-        except (ClientError, BotoCoreError) as e:
-            say(f"Could not remove the previous status.json: {e}")
+        for key in (status_key, started_key):
+            try:
+                client.delete_object(Bucket=bucket, Key=key)
+            except (ClientError, BotoCoreError) as e:
+                say(f"Could not remove the previous {key.rsplit('/', 1)[-1]}: {e}")
 
     clear_status()  # a status.json left by an earlier attempt of this job must not end the new pod at once
     t0 = time.time()
     runs = rp.run_job_pods(rp.RunPodClient(), make_body, plan["min_ram_gb"], read_status,
-                           cancel_event=cancel_event, on_progress=say, before_retry=clear_status)
+                           cancel_event=cancel_event, on_progress=say, before_retry=clear_status,
+                           read_started=read_started)
     t["pods"] = round(time.time() - t0, 2)
     report["pods"] = [{
         "pod_id": r.pod_id, "outcome": r.outcome, "terminated": r.terminated, "elapsed_s": round(r.elapsed_s, 1),

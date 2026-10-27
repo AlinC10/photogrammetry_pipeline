@@ -12,6 +12,13 @@ FROM nvidia/cuda:12.2.2-devel-ubuntu22.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
+# Parallel compile jobs. Each OpenMVS/CGAL compiler process takes 1.5-2.5 GB, so $(nproc) jobs run out of
+# memory on a 12-thread machine with ~12 GB in Docker Desktop/WSL ("Killed signal terminated program cc1plus").
+ARG BUILD_JOBS=4
+# GPU code compiled into OpenMVS (its default is only 75). 75 = RTX 20xx (the local 2060 SUPER),
+# 86 = RTX 30xx / A4000 / A4500 / A5000 / A40, 89 = RTX 40xx / L4 / L40S. Newer cards (RTX 5090 = 120) run
+# the compute_89 PTX through the driver's JIT; native sm_120 needs a CUDA >= 12.8 base image.
+ARG CUDA_ARCHS="75;86;89"
 
 # Install system build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -57,7 +64,7 @@ RUN git clone --depth 1 https://github.com/leethomason/tinyxml2.git tinyxml2 && 
           -DCMAKE_INSTALL_PREFIX=/usr/local \
           -DBUILD_SHARED_LIBS=OFF \
           ../tinyxml2 && \
-    make -j$(nproc) && \
+    make -j${BUILD_JOBS} && \
     make install
 
 # 3. TinyEXIF (metadata parser required by OpenMVS)
@@ -69,10 +76,11 @@ RUN git clone https://github.com/cdcseacave/TinyEXIF.git TinyEXIF && \
           -DCMAKE_PREFIX_PATH="/usr/local" \
           -DBUILD_SHARED_LIBS=OFF \
           ../TinyEXIF && \
-    make -j$(nproc) && \
+    make -j${BUILD_JOBS} && \
     make install
 
-# 4. OpenMVS with CUDA support (pinned strictly to stable release v2.3.0)
+# 4. OpenMVS with CUDA support (pinned strictly to stable release v2.3.0). Only the apps the pipeline runs are
+#    built (no Viewer, Tests, InterfacePolycam ...); they stay in openMVS_build/bin, no make install.
 RUN ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/libcuda.so || true && \
     ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/libcuda.so.1 || true && \
     ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 || true && \
@@ -82,26 +90,32 @@ RUN ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/libcuda.s
     cmake -DCMAKE_BUILD_TYPE=Release \
           -DVCG_ROOT=/opt/vcglib \
           -DOpenMVS_USE_CUDA=ON \
+          -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
           -DCUDA_CUDA_LIBRARY=/usr/local/cuda/lib64/stubs/libcuda.so \
           -DCMAKE_LIBRARY_PATH=/usr/local/cuda/lib64/stubs \
-          -DCMAKE_INSTALL_PREFIX=/opt/openmvs_bin \
           -DCMAKE_PREFIX_PATH="/usr/local" \
           ../openMVS && \
-    make -j$(nproc) && \
-    make install
+    make -j${BUILD_JOBS} InterfaceCOLMAP DensifyPointCloud ReconstructMesh RefineMesh TextureMesh
 
 # 5. mvs-texturing (texrecon from TU Darmstadt)
+#    It and its mve library compile with -march=native: built on a Zen 4 / AVX-512 machine, texrecon died with
+#    SIGILL (return code -4) at start on a RunPod EPYC 7763 (Zen 3). x86-64-v3 (AVX2, FMA) runs on every
+#    Haswell+ / Zen 2+ host: RunPod's Xeons and EPYCs and the local Ryzen 5 3600.
+ARG CPU_ARCH=x86-64-v3
 RUN git clone https://github.com/nmoehrle/mvs-texturing.git mvs-texturing && \
+    sed -i "s/-march=native/-march=${CPU_ARCH}/" mvs-texturing/CMakeLists.txt && \
+    grep -q -- "-march=${CPU_ARCH}" mvs-texturing/CMakeLists.txt && \
     mkdir -p mvs-texturing/build && \
     cd mvs-texturing/build && \
     cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-Wno-template-body -Wno-template-id-cdtor" .. && \
-    make -j$(nproc)
+    CXXINTRINSICS="-march=${CPU_ARCH}" make -j${BUILD_JOBS} && \
+    ! grep -rq -- "-march=native" --include=flags.make .
 
 # 6. Runtime payload: only the OpenMVS apps the pipeline runs (no Viewer), texrecon, and their libraries
 COPY docker/runtime_deps.sh /opt/runtime_deps.sh
 RUN mkdir -p /opt/payload/bin && \
     for app in InterfaceCOLMAP DensifyPointCloud ReconstructMesh RefineMesh TextureMesh; do \
-        cp "$(find /opt/openmvs_bin/bin -type f -name "$app" | head -n 1)" /opt/payload/bin/; \
+        cp "$(find /opt/openMVS_build/bin -type f -name "$app" | head -n 1)" /opt/payload/bin/ || exit 1; \
     done && \
     cp /opt/mvs-texturing/build/apps/texrecon/texrecon /opt/payload/bin/ && \
     sh /opt/runtime_deps.sh /opt/payload/lib /opt/payload/bin/*
@@ -121,11 +135,13 @@ ENV PATH="${OPENMVS_BIN_DIR}:${PATH}"
 # Undistorted images and OpenMVS files: fast container disk, not the bind-mounted output folder
 ENV TURNTABLE_WORK_DIR=/tmp/turntable_work
 
-# Python runtime only (no python3-dev, no -dev libraries). libgl1/libglib2.0-0/libgomp1: PyMeshLab and OpenMP.
+# Python runtime only (no python3-dev, no -dev libraries). libgl1/libopengl0/libglib2.0-0/libgomp1: PyMeshLab and
+# OpenMP. Without libopengl0 (libOpenGL.so.0) PyMeshLab's I/O plugin does not load: "Unknown format for load: obj".
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     libgl1 \
+    libopengl0 \
     libglib2.0-0 \
     libgomp1 \
     ca-certificates \
@@ -142,6 +158,10 @@ WORKDIR /workspace/turntable_studio
 # Dependencies before the code: a code change only rebuilds the last small layers
 COPY requirements-runtime.txt .
 RUN pip3 install --no-cache-dir -r requirements-runtime.txt
+# Fail the build (not a pod run) when PyMeshLab cannot read meshes: decimation and repair depend on it
+RUN printf 'v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n' > /tmp/check.obj && \
+    python3 -c "import pymeshlab; ms = pymeshlab.MeshSet(); ms.load_new_mesh('/tmp/check.obj'); assert ms.current_mesh().face_number() == 1; print('PyMeshLab I/O ok')" && \
+    rm /tmp/check.obj
 
 # Code version recorded in stats.json (.git is not copied into the image). After the pip layer, so a new
 # commit does not reinstall the Python packages:
