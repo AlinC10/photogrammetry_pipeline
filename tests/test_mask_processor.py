@@ -149,6 +149,38 @@ class TestMaskProcessor(unittest.TestCase):
             self.assertTrue(saved_mask.is_file())
             self.assertTrue(saved_mask.name.endswith(".mask.png"))
 
+    @unittest.skipUnless(HAS_PIL, "PIL required for batch mask generation tests")
+    def test_batch_generate_masks_parallel_matches_serial(self):
+        """Masks made by several worker processes are byte-identical to the serial ones; rig cameras do not collide."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_p = Path(tmp_dir)
+            views = []
+            for cam in ("0", "1"):
+                (tmp_p / "rig" / cam).mkdir(parents=True)
+                for k in range(3):
+                    arr = np.full((100, 100, 3), 160, dtype=np.uint8)
+                    arr[20 + 5 * k:70, 30:70 + 5 * int(cam)] = [30, 150, 40]
+                    img = tmp_p / "rig" / cam / f"f_100{k}.jpg"
+                    Image.fromarray(arr).save(str(img))
+                    views.append({"viewId": f"{cam}{k}", "path": str(img), "poseId": "1", "intrinsicId": "1"})
+            poses = {"1": {"R": np.eye(3), "C": np.array([0.0, 0.1, 0.3])}}
+            intr = {"1": {"K": np.array([[500.0, 0.0, 50.0], [0.0, 500.0, 50.0], [0.0, 0.0, 1.0]])}}
+
+            serial = batch_generate_masks(views, poses, intr, tmp_p / "serial", tag_blackout=False, workers=1)
+            parallel = batch_generate_masks(views, poses, intr, tmp_p / "parallel", tag_blackout=False, workers=3)
+
+            for v in views:  # the viewId-prefixed key is unique per camera
+                self.assertIn(f"{v['viewId']}_{Path(v['path']).name}", parallel)
+            for v in views:
+                name = Path(v["path"]).stem
+                a = (tmp_p / "serial" / f"{v['viewId']}_{name}.mask.png").read_bytes()
+                b = (tmp_p / "parallel" / f"{v['viewId']}_{name}.mask.png").read_bytes()
+                self.assertEqual(a, b)
+            # No flat f_1000.mask.png alias: both cameras have an f_1000 and one would overwrite the other
+            self.assertFalse((tmp_p / "parallel" / "f_1000.mask.png").exists())
+            self.assertTrue((tmp_p / "parallel" / "0" / "f_1000.mask.png").is_file())
+            self.assertTrue((tmp_p / "parallel" / "1" / "f_1000.mask.png").is_file())
+
     def test_load_tag_layout_and_project_tags_to_2d(self):
         """Verifies loading 12 AprilTags and projecting into camera view."""
         tags = load_tag_layout()

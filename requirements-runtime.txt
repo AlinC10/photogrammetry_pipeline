@@ -1,0 +1,18 @@
+# Only what the pipeline and the RunPod entry point import (installed in the Docker image).
+# Python 3.10 (Ubuntu 22.04). Development extras: requirements.txt.
+
+numpy>=1.24.0,<2.1.0
+scipy>=1.10.0
+opencv-python-headless>=4.7.0.72
+pillow>=10.0.0
+pymeshlab>=2023.12
+trimesh>=4.0.0
+networkx>=3.0          # trimesh graph operations (connected components)
+lxml>=4.9.0            # trimesh 3MF export
+shapely>=2.0.0
+mapbox-earcut>=1.0.1
+psutil>=5.9.0
+
+# RunPod pod: Cloudflare R2 transfers (runpod_job.py, cloud/)
+boto3>=1.28.0
+requests>=2.28.0

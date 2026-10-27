@@ -1,10 +1,33 @@
-output
-tests
-.venv
-AGENTS.md
+# Imaginea are nevoie doar de main.py, runpod_job.py, docker_entrypoint.sh, pipeline/, cloud/, docker/
+# și requirements-runtime.txt.
+# input_images/ și output/ sunt montate ca volume în docker-compose.yml.
+.git
 .gitignore
-vizualizare_camere_3d.html
-README.md
-PROIECTIE_SPATIALA_CAMERE_RIG.md
-proiectie_camere_turntable.svg
-BRAINSTORMING_SI_CERCETARE_TEXTURARE_STUDIO.md
+.dockerignore
+.venv
+**/__pycache__
+**/*.pyc
+
+input_images
+output
+output_*
+
+tests
+docs
+plans
+deprecated
+to_delete
+tools
+results
+
+# Chei: nu intră niciodată în imagine (pod-ul primește doar credențiale temporare)
+.env
+.env.*
+
+*.md
+*.tex
+*.svg
+*.html
+Dockerfile
+docker-compose.yml
+requirements.txt

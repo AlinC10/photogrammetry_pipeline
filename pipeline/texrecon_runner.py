@@ -599,6 +599,9 @@ class TexReconRunner:
         ])
 
         logger.info(f"Executing texrecon: {' '.join(cmd)}")
+        env = os.environ.copy()
+        if self.config.num_threads:
+            env["OMP_NUM_THREADS"] = str(self.config.num_threads)
         t0 = time.time()
         res = subprocess.run(
             cmd,
@@ -606,9 +609,15 @@ class TexReconRunner:
             stderr=subprocess.STDOUT,
             text=True,
             cwd=str(self.work_dir),
+            env=env,
         )
         elapsed = time.time() - t0
         logger.info(f"texrecon finished in {elapsed:.2f}s with return code {res.returncode}")
+        # Full texrecon output next to its results (packed into output.zip under logs/)
+        try:
+            Path(f"{out_pref}.log").write_text(res.stdout or "", encoding="utf-8")
+        except OSError as log_err:
+            logger.warning(f"Could not write the texrecon log: {log_err}")
 
         if res.returncode != 0:
             logger.error(f"texrecon stdout/stderr:\n{res.stdout}")

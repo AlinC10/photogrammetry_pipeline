@@ -8,10 +8,10 @@ from __future__ import annotations
 import json
 import logging
 import math
-import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -156,12 +156,98 @@ def generate_proxy_3d_points(
     return points
 
 
+def _undistort_view_images(
+    v: Dict[str, Any],
+    c_info: Dict[str, Any],
+    dst_img_name: str,
+    undist_img_path: Path,
+    masks_src_dir: Optional[str],
+    masks_dst_dir: Optional[str],
+) -> bool:
+    """
+    Undistorts one view's image (and its mask, if one is found) and blacks out the background.
+    Returns True when a mask was found. Independent per view, so it runs in a thread pool.
+    """
+    src_img_path = Path(v["path"])
+    dst_img_path = undist_img_path / dst_img_name
+    K_new = c_info["K_new"]
+
+    # Undistort original image
+    undistort_single_image(
+        str(src_img_path), str(dst_img_path),
+        c_info["K_orig"], c_info["dist"], K_new, is_mask=False
+    )
+
+    # Undistort mask if available
+    mask_candidates = [
+        src_img_path.parent / f"{src_img_path.stem}.mask.png",
+        src_img_path.parent / f"{src_img_path.stem}_mask.png",
+        src_img_path.parent / f"{src_img_path.name}.mask.png",
+    ]
+    if masks_src_dir:
+        m_src = Path(masks_src_dir)
+        mask_candidates.extend([
+            m_src / f"{v['viewId']}_{src_img_path.stem}.mask.png",
+            m_src / f"{v['viewId']}_{src_img_path.name}.mask.png",
+            m_src / f"{src_img_path.stem}.mask.png",
+            m_src / f"{src_img_path.stem}_mask.png",
+            m_src / f"{src_img_path.name}.mask.png",
+            m_src / f"{src_img_path.stem}.png",
+            m_src / f"{src_img_path.name}",
+            m_src / src_img_path.parent.name / f"{src_img_path.stem}.mask.png",
+            m_src / src_img_path.parent.name / f"{src_img_path.stem}_mask.png",
+            m_src / src_img_path.parent.name / f"{src_img_path.name}.mask.png",
+            m_src / src_img_path.parent.name / f"{src_img_path.stem}.png",
+            m_src / "rig" / src_img_path.parent.name / f"{src_img_path.stem}.mask.png",
+            m_src / "rig" / src_img_path.parent.name / f"{src_img_path.stem}_mask.png",
+            m_src / "rig" / src_img_path.parent.name / f"{src_img_path.name}.mask.png",
+            m_src / "rig" / src_img_path.parent.name / f"{src_img_path.stem}.png",
+        ])
+
+    found_mask = False
+    for m_cand in mask_candidates:
+        if m_cand.is_file() and m_cand.resolve() != src_img_path.resolve():
+            # OpenMVS expects masks formatted as: <image_stem>.mask.png and/or <image_name>.mask.png
+            dst_stem_mask_name = f"{Path(dst_img_name).stem}.mask.png"  # e.g. 1000_f_1000.mask.png
+            dst_full_mask_name = f"{dst_img_name}.mask.png"             # e.g. 1000_f_1000.jpg.mask.png
+            dst_mask_in_undist = undist_img_path / dst_stem_mask_name
+
+            # Undistort mask directly alongside image for TextureMesh & texrecon
+            undistort_single_image(
+                str(m_cand), str(dst_mask_in_undist),
+                c_info["K_orig"], c_info["dist"], K_new, is_mask=True
+            )
+
+            # Save canonical mask names in undistorted and masks_dst_dir
+            shutil.copy2(dst_mask_in_undist, undist_img_path / dst_full_mask_name)
+            if masks_dst_dir:
+                m_dst = Path(masks_dst_dir)
+                shutil.copy2(dst_mask_in_undist, m_dst / dst_stem_mask_name)
+                shutil.copy2(dst_mask_in_undist, m_dst / dst_full_mask_name)
+
+            # Zero out background in undistorted image (pitch-black RGB 0,0,0 for texrecon & OpenMVS)
+            try:
+                u_img = cv2.imread(str(dst_img_path), cv2.IMREAD_COLOR)
+                u_mask = cv2.imread(str(dst_mask_in_undist), cv2.IMREAD_GRAYSCALE)
+                if u_img is not None and u_mask is not None:
+                    u_img[u_mask < 128] = 0
+                    cv2.imwrite(str(dst_img_path), u_img)
+            except Exception as m_err:
+                logger.warning(f"Failed to apply mask black-out to {dst_img_path.name}: {m_err}")
+
+            found_mask = True
+            break
+
+        return found_mask
+
+
 def convert_sfm_to_colmap(
     sfm_json_path: str,
     output_colmap_dir: str,
     undistorted_images_dir: str,
     masks_src_dir: Optional[str] = None,
     masks_dst_dir: Optional[str] = None,
+    workers: int = 1,
 ) -> Dict[str, Any]:
     """
     Reads AliceVision cameras_known.sfm, undistorts images and masks,
@@ -243,6 +329,7 @@ def convert_sfm_to_colmap(
     # 4. Undistort images and collect view geometry
     views = sfm.get("views", [])
     registered_views = []
+    image_tasks = []
 
     for v in views:
         pose_id = str(v["poseId"])
@@ -270,78 +357,9 @@ def convert_sfm_to_colmap(
         qy = float(q_scipy[1])
         qz = float(q_scipy[2])
 
-        # Undistort original image
         src_img_path = Path(v["path"])
         dst_img_name = f"{v['viewId']}_{src_img_path.name}"
-        dst_img_path = undist_img_path / dst_img_name
-
-        undistort_single_image(
-            str(src_img_path), str(dst_img_path),
-            c_info["K_orig"], c_info["dist"], K_new, is_mask=False
-        )
-
-        # Undistort mask if available
-        mask_candidates = [
-            src_img_path.parent / f"{src_img_path.stem}.mask.png",
-            src_img_path.parent / f"{src_img_path.stem}_mask.png",
-            src_img_path.parent / f"{src_img_path.name}.mask.png",
-        ]
-        if masks_src_dir:
-            m_src = Path(masks_src_dir)
-            mask_candidates.extend([
-                m_src / f"{v['viewId']}_{src_img_path.stem}.mask.png",
-                m_src / f"{v['viewId']}_{src_img_path.name}.mask.png",
-                m_src / f"{src_img_path.stem}.mask.png",
-                m_src / f"{src_img_path.stem}_mask.png",
-                m_src / f"{src_img_path.name}.mask.png",
-                m_src / f"{src_img_path.stem}.png",
-                m_src / f"{src_img_path.name}",
-                m_src / src_img_path.parent.name / f"{src_img_path.stem}.mask.png",
-                m_src / src_img_path.parent.name / f"{src_img_path.stem}_mask.png",
-                m_src / src_img_path.parent.name / f"{src_img_path.name}.mask.png",
-                m_src / src_img_path.parent.name / f"{src_img_path.stem}.png",
-                m_src / "rig" / src_img_path.parent.name / f"{src_img_path.stem}.mask.png",
-                m_src / "rig" / src_img_path.parent.name / f"{src_img_path.stem}_mask.png",
-                m_src / "rig" / src_img_path.parent.name / f"{src_img_path.name}.mask.png",
-                m_src / "rig" / src_img_path.parent.name / f"{src_img_path.stem}.png",
-            ])
-
-        found_mask = False
-        for m_cand in mask_candidates:
-            if m_cand.is_file() and m_cand.resolve() != src_img_path.resolve():
-                # OpenMVS expects masks formatted as: <image_stem>.mask.png and/or <image_name>.mask.png
-                dst_stem_mask_name = f"{Path(dst_img_name).stem}.mask.png"  # e.g. 1000_f_1000.mask.png
-                dst_full_mask_name = f"{dst_img_name}.mask.png"             # e.g. 1000_f_1000.jpg.mask.png
-                dst_mask_in_undist = undist_img_path / dst_stem_mask_name
-
-                # Undistort mask directly alongside image for TextureMesh & texrecon
-                undistort_single_image(
-                    str(m_cand), str(dst_mask_in_undist),
-                    c_info["K_orig"], c_info["dist"], K_new, is_mask=True
-                )
-
-                # Save canonical mask names in undistorted and masks_dst_dir
-                shutil.copy2(dst_mask_in_undist, undist_img_path / dst_full_mask_name)
-                if masks_dst_dir:
-                    m_dst = Path(masks_dst_dir)
-                    shutil.copy2(dst_mask_in_undist, m_dst / dst_stem_mask_name)
-                    shutil.copy2(dst_mask_in_undist, m_dst / dst_full_mask_name)
-                    compat_mask_path = m_dst / f"{src_img_path.stem}.mask.png"
-                    if not compat_mask_path.is_file():
-                        shutil.copy2(dst_mask_in_undist, compat_mask_path)
-
-                # Zero out background in undistorted image (pitch-black RGB 0,0,0 for texrecon & OpenMVS)
-                try:
-                    u_img = cv2.imread(str(dst_img_path), cv2.IMREAD_COLOR)
-                    u_mask = cv2.imread(str(dst_mask_in_undist), cv2.IMREAD_GRAYSCALE)
-                    if u_img is not None and u_mask is not None:
-                        u_img[u_mask < 128] = 0
-                        cv2.imwrite(str(dst_img_path), u_img)
-                except Exception as m_err:
-                    logger.warning(f"Failed to apply mask black-out to {dst_img_path.name}: {m_err}")
-
-                found_mask = True
-                break
+        image_tasks.append((v, c_info, dst_img_name))
 
         colmap_image_id = len(registered_views) + 1
         registered_views.append({
@@ -353,6 +371,20 @@ def convert_sfm_to_colmap(
             "K_new": K_new,
             "w": w, "h": h,
         })
+
+    # Undistortion + mask black-out, `workers` images at a time (OpenCV releases the GIL)
+    workers = max(1, min(int(workers or 1), len(image_tasks) or 1))
+    logger.info(f"Undistorting {len(image_tasks)} images with {workers} worker(s)...")
+
+    def run_task(task) -> bool:
+        tv, tc, tname = task
+        return _undistort_view_images(tv, tc, tname, undist_img_path, masks_src_dir, masks_dst_dir)
+
+    if workers == 1:
+        list(map(run_task, image_tasks))
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            list(ex.map(run_task, image_tasks))
 
     # Pass 1: Project points into all views to calculate visibility
     pt_visibility = {pt_idx + 1: [] for pt_idx in range(len(proxy_points))}

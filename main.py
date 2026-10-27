@@ -10,47 +10,67 @@ import argparse
 import json
 import logging
 import os
-import sys
-import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import numpy as np
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
+LOG_FORMAT = "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
+LOG_DATEFMT = "%H:%M:%S"
+
+# Console: INFO. The root logger lets DEBUG through so run_log.txt can keep the OpenMVS output
+# (logged at DEBUG by openmvs_runner); the console handler filters it back to INFO.
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=LOG_DATEFMT)
+logging.getLogger().setLevel(logging.DEBUG)
+for _h in logging.getLogger().handlers:
+    _h.setLevel(logging.INFO)
 logger = logging.getLogger("TurntableStudio")
 
-from pipeline.alicevision_runner import AliceVisionRunner, find_alicevision_binary
+
+class _RunLogFilter(logging.Filter):
+    """run_log.txt: everything from INFO up, plus DEBUG from our own loggers (OpenMVS output), no library noise."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno >= logging.INFO or record.name.startswith("TurntableStudio")
+
+
+def attach_run_log(out_path: Path) -> logging.Handler:
+    """UTF-8 log file written by the pipeline itself, whatever the shell (PowerShell tee wrote UTF-16)."""
+    handler = logging.FileHandler(out_path / "run_log.txt", mode="w", encoding="utf-8")
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
+    handler.addFilter(_RunLogFilter())
+    logging.getLogger().addHandler(handler)
+    return handler
+
+
+def detach_run_log(handler: logging.Handler) -> None:
+    handler.flush()
+    handler.close()
+    logging.getLogger().removeHandler(handler)
+
+
 from pipeline.texrecon_runner import TexReconRunner, find_texrecon_binary
 from pipeline.bridge_sfm import convert_sfm_to_colmap
-from pipeline.mask_processor import (
-    batch_generate_masks,
-    discover_masks,
-    prepare_openmvs_masks,
-)
+from pipeline.mask_processor import batch_generate_masks
 from pipeline.camera_init import (
     generate_camera_init_sfm,
     run_turntable_poses,
     scan_input_directory,
 )
 from pipeline.config import (
-    AliceVisionConfig,
     TexReconConfig,
     TexturingImagesConfig,
     MeshCleaningConfig,
-    MaskingConfig,
     OpenMVSConfig,
     PipelineConfig,
     TurntableConfig,
 )
-from pipeline.exporter import decimate_mesh, export_multi_lod_bundle
+from pipeline.exporter import collect_log_files, decimate_mesh, export_multi_lod_bundle, package_output_zip
 from pipeline.mesh_cleaner import clean_and_repair_mesh
 from pipeline.openmvs_runner import OpenMVSRunner
+from pipeline import run_metrics
+from pipeline.resources import InsufficientRamError, check_ram, describe_resources, resolve_workers
 from pipeline.telemetry import SystemTelemetry
 from pipeline.texrecon_runner import TEXRECON_DATA_TERMS
 from pipeline.texture_prep import prepare_texturing_images
@@ -77,10 +97,35 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
 
     out_path = Path(output_dir).resolve()
     out_path.mkdir(parents=True, exist_ok=True)
+    run_log_handler = attach_run_log(out_path)
+
+    # Large intermediate files (undistorted images, depth maps) go to a fast work directory when one is
+    # given: a Windows folder bind-mounted through Docker Desktop/WSL is several times slower.
+    work_dir = job.get("work_dir") or os.environ.get("TURNTABLE_WORK_DIR") or None
+    work_path = Path(work_dir).resolve() if work_dir else out_path
+    work_path.mkdir(parents=True, exist_ok=True)
 
     # Initialize Telemetry
     telemetry = SystemTelemetry(output_dir=str(out_path))
     telemetry.start_sampling(interval_sec=0.2)
+
+    resources = describe_resources()
+    workers = resolve_workers(job.get("workers"))
+    telemetry.set_info(resources=resources, workers=workers, work_dir=str(work_path))
+    telemetry.watch(str(out_path), str(work_path))
+    # Features for predicting RAM / time / disk of future scans (tools/collect_stats.py)
+    disk = {"work": run_metrics.disk_benchmark(str(work_path))}
+    if work_path != out_path:
+        disk["output"] = run_metrics.disk_benchmark(str(out_path))
+    telemetry.set_info(
+        version=run_metrics.code_version(),
+        hardware={"cpu": run_metrics.cpu_info(), "gpus": run_metrics.gpu_info(), "host": run_metrics.host_info()},
+        disk=disk,
+        settings={k: job.get(k) for k in (
+            "rig_mode", "resolution_level", "texturing_engine", "data_term", "estimate_lift", "lift_mm",
+            "tag_refine", "tag_scale", "intrinsics_in", "target_low_poly_faces", "export_scale", "keep_depth_maps",
+            "mesh_texture_masks", "colour_normalize", "resume", "mock_openmvs", "ram_margin")},
+    )
 
     logger.info("=" * 70)
     logger.info("          STARTING TURNTABLE STUDIO 3D SCANNING PIPELINE")
@@ -88,40 +133,24 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
     logger.info(f"Input Directory  : {input_dir}")
     logger.info(f"Output Directory : {output_dir}")
     logger.info(f"Rig Mode Enabled : {rig_mode}")
+    logger.info(f"Work Directory   : {work_path}")
+    logger.info(
+        f"Resources        : {resources['cpus']} CPUs (host {resources['host_cpus']}), "
+        f"{resources['ram_total_gb']} GB RAM (host {resources['host_ram_gb']} GB, "
+        f"cgroup limit {resources['ram_cgroup_limit_gb']}), {workers} worker(s)"
+    )
 
     texturing_engine = job.get("texturing_engine", "texrecon")
     texrecon_bin = job.get("texrecon_bin") or job.get("texrecon_bin_dir")
-    alicevision_bin = job.get("alicevision_bin") or job.get("alicevision_bin_dir")
 
-    # If texrecon is requested, verify availability or fall back gracefully
+    # If texrecon is requested, verify availability or fall back to OpenMVS TextureMesh
     if texturing_engine == "texrecon":
         detected_tr = find_texrecon_binary(custom_dir=texrecon_bin)
         if not detected_tr and not job.get("mock_openmvs"):
-            logger.warning(
-                "texrecon executable not detected on system. "
-                "Checking for AliceVision as fallback..."
-            )
-            detected_av = find_alicevision_binary("aliceVision_texturing", custom_dir=alicevision_bin)
-            if detected_av:
-                logger.info(f"Using AliceVision Texturing as fallback: {detected_av}")
-                texturing_engine = "alicevision"
-            else:
-                logger.warning("Defaulting to OpenMVS texturing engine.")
-                texturing_engine = "openmvs"
+            logger.warning("texrecon executable not detected on system. Defaulting to OpenMVS texturing engine.")
+            texturing_engine = "openmvs"
         elif detected_tr:
             logger.info(f"Using mvs-texturing (texrecon): {detected_tr}")
-
-    # If AliceVision is requested but binary is not found anywhere, warn and fall back to openmvs
-    elif texturing_engine == "alicevision":
-        detected_av = find_alicevision_binary("aliceVision_texturing", custom_dir=alicevision_bin)
-        if not detected_av and not job.get("mock_openmvs"):
-            logger.warning(
-                "aliceVision_texturing executable not detected on system. "
-                "Defaulting to OpenMVS texturing engine."
-            )
-            texturing_engine = "openmvs"
-        elif detected_av:
-            logger.info(f"Using AliceVision Texturing: {detected_av}")
 
     data_term = job.get("data_term", "gmi")
     if data_term not in TEXRECON_DATA_TERMS:
@@ -138,7 +167,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             data_term=data_term,
             smoothness_term=job.get("smoothness_term", "potts"),
             outlier_removal=job.get("outlier_removal", "gauss_damping"),
-            num_threads=job.get("num_threads"),
+            num_threads=job.get("num_threads") or resources["cpus"],
             skip_global_seam_leveling=not bool(job.get("texrecon_global_seam_leveling", 0)),
             keep_unseen_faces=bool(job.get("keep_unseen_faces", True)),
             write_intermediate_results=bool(job.get("write_intermediate_results", False)),
@@ -148,16 +177,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             margin_px=int(job.get("texture_mask_margin_px", 2)),
             trim_band_px=int(job.get("texture_mask_trim_band_px", 25)),
             colour_normalize=bool(job.get("colour_normalize", True)),
-        ),
-        alicevision=AliceVisionConfig(
-            bin_dir=alicevision_bin,
-            texture_side=job.get("texture_resolution", 4096),
-            unwrap_method=job.get("unwrap_method", "Basic"),
-            use_udim=job.get("use_udim", False),
-            fill_holes=job.get("fill_holes", True),
-            correct_ev=job.get("correct_ev", True),
-            color_mapping_type=job.get("color_mapping_type", "png"),
-            visibility_remapping_method=job.get("visibility_remapping_method", "MeshItself"),
+            workers=workers,
         ),
         openmvs=OpenMVSConfig(
             bin_dir=job.get("openmvs_bin_dir"),
@@ -170,6 +190,8 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             outlier_threshold=job.get("outlier_threshold", 0.0),
             global_seam_leveling=job.get("global_seam_leveling", 0),
             local_seam_leveling=job.get("local_seam_leveling", 1),
+            max_threads=resources["cpus"],
+            keep_depth_maps=bool(job.get("keep_depth_maps", False)),
         ),
         turntable=TurntableConfig(
             step_deg=job.get("step_deg", 18.0),
@@ -204,6 +226,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
 
             camera_init_sfm = str(out_path / "cameraInit.sfm")
             generate_camera_init_sfm(views, intrinsics, camera_init_sfm)
+        telemetry.set_info(inputs=run_metrics.input_stats(camera_init_sfm, name_regex))
 
         # ----------------------------------------------------------------------
         # STEP 2: Calibrate and Lock Poses via TurntablePoses
@@ -240,6 +263,9 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                     })
                 with open(cameras_known_sfm, "w") as f:
                     json.dump(mock_data, f)
+
+        if not mock_openmvs and (out_path / "turntable_report.txt").is_file():
+            telemetry.set_info(pose_quality=run_metrics.pose_quality(str(out_path / "turntable_report.txt")))
 
         # ----------------------------------------------------------------------
         # STEP 2.5: Automated Hybrid Background Matting & Turntable Elimination
@@ -291,6 +317,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                         safety_dilation_px=config.masking.safety_dilation_px,
                         tag_blackout=config.masking.tag_blackout,
                         tag_expansion_factor=config.masking.tag_expansion_factor,
+                        workers=workers,
                     )
                     masks_src = masks_out_dir
                     logger.info(f"Generated {len(auto_masks)} foreground masks in {masks_out_dir}.")
@@ -301,22 +328,24 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         # ----------------------------------------------------------------------
         # STEP 3: Convert SFM to COLMAP & Undistort Images/Masks
         # ----------------------------------------------------------------------
-        colmap_dir = str(out_path / "colmap")
-        undistorted_dir = str(out_path / "undistorted")
+        colmap_dir = str(work_path / "colmap")
+        undistorted_dir = str(work_path / "undistorted")
 
         with telemetry.step("3. Bridge SFM & Image Undistortion"):
-            bridge_res = convert_sfm_to_colmap(
+            convert_sfm_to_colmap(
                 sfm_json_path=cameras_known_sfm,
                 output_colmap_dir=colmap_dir,
                 undistorted_images_dir=undistorted_dir,
                 masks_src_dir=masks_src if masks_src and Path(masks_src).is_dir() else None,
                 masks_dst_dir=masks_out_dir if masks_src and Path(masks_src).is_dir() else None,
+                workers=workers,
             )
+        telemetry.set_info(object_images=run_metrics.object_image_stats(undistorted_dir))
 
         # ----------------------------------------------------------------------
         # STEP 4: OpenMVS Dense Reconstruction
         # ----------------------------------------------------------------------
-        openmvs_dir = out_path / "openmvs"
+        openmvs_dir = work_path / "openmvs"
         openmvs_dir.mkdir(parents=True, exist_ok=True)
         runner = OpenMVSRunner(config=config.openmvs, work_dir=str(openmvs_dir))
         raw_reconstructed_mesh = str(openmvs_dir / "scene_mesh.ply")
@@ -345,6 +374,10 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                     skip_densify = True
 
             if not skip_densify:
+                # Fail in seconds instead of an OOM kill after 20 minutes
+                ram_check = _check_densify_ram(cameras_known_sfm, config, job)
+                telemetry.set_info(ram_check=ram_check)
+
                 with telemetry.step("4.1 OpenMVS InterfaceCOLMAP"):
                     runner.run_interface_colmap(colmap_dir, undistorted_dir)
 
@@ -383,6 +416,11 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                 else:
                     raw_reconstructed_mesh = str(openmvs_dir / "scene_mesh.ply")
 
+            telemetry.set_info(
+                openmvs=run_metrics.openmvs_log_stats(str(openmvs_dir)),
+                raw_mesh=run_metrics.mesh_quality(raw_reconstructed_mesh, "raw"),
+            )
+
             # ----------------------------------------------------------------------
             # STEP 5: Watertight Base Slicing & Mesh Cleaning (BEFORE Texturing!)
             # ----------------------------------------------------------------------
@@ -392,6 +430,8 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                     output_obj_path=cleaned_obj_path,
                     config=config.cleaning,
                 )
+
+            telemetry.set_info(cleaned_mesh=run_metrics.mesh_quality(cleaned_obj_path, "cleaned"))
 
             # Generate dedicated low-poly geometry for branching texturing (eliminates white untextured low-poly!)
             cleaned_low_path = out_path / "cleaned_mesh_low.obj"
@@ -474,56 +514,6 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                 except Exception as tr_err:
                     logger.warning(
                         f"mvs-texturing failed ({tr_err}). Falling back to OpenMVS texturing."
-                    )
-                    with telemetry.step("4.4 OpenMVS TextureMesh (Fallback)"):
-                        effective_mask_dir = masks_out_dir if masks_src and Path(masks_out_dir).is_dir() else None
-                        _, textured_obj_path = runner.run_texture_mesh(
-                            input_mvs=mvs_project,
-                            mesh_file=cleaned_obj_path,
-                            output_mvs="scene_texture.mvs",
-                            masks_dir=effective_mask_dir,
-                        )
-                        if cleaned_low_path and cleaned_low_path.is_file():
-                            try:
-                                _, textured_low_obj_path = runner.run_texture_mesh(
-                                    input_mvs=mvs_project,
-                                    mesh_file=str(cleaned_low_path),
-                                    output_mvs="scene_texture_low.mvs",
-                                    masks_dir=effective_mask_dir,
-                                )
-                            except Exception as omvs_low_err:
-                                logger.warning(f"OpenMVS fallback low-poly texturing failed ({omvs_low_err}).")
-            elif config.texturing_engine == "alicevision":
-                try:
-                    with telemetry.step("4.4 AliceVision Texturing (Multi-Band & LSCM)"):
-                        av_runner = AliceVisionRunner(
-                            config=config.alicevision,
-                            work_dir=str(out_path / "alicevision"),
-                        )
-                        textured_obj_path, _ = av_runner.run_texturing(
-                            sfm_data_path=cameras_known_sfm,
-                            input_mesh_path=cleaned_obj_path,
-                            images_folder=undistorted_dir,
-                            output_mesh_name="texturedMesh.obj",
-                        )
-                        if cleaned_low_path and cleaned_low_path.is_file():
-                            try:
-                                logger.info("Running branching texturing on low-poly mesh (AliceVision)...")
-                                av_low_runner = AliceVisionRunner(
-                                    config=config.alicevision,
-                                    work_dir=str(out_path / "alicevision" / "low"),
-                                )
-                                textured_low_obj_path, _ = av_low_runner.run_texturing(
-                                    sfm_data_path=cameras_known_sfm,
-                                    input_mesh_path=str(cleaned_low_path),
-                                    images_folder=undistorted_dir,
-                                    output_mesh_name="texturedMesh.obj",
-                                )
-                            except Exception as av_low_err:
-                                logger.warning(f"AliceVision low-poly texturing failed ({av_low_err}).")
-                except Exception as av_err:
-                    logger.warning(
-                        f"AliceVision texturing failed ({av_err}). Falling back to OpenMVS texturing."
                     )
                     with telemetry.step("4.4 OpenMVS TextureMesh (Fallback)"):
                         effective_mask_dir = masks_out_dir if masks_src and Path(masks_out_dir).is_dir() else None
@@ -637,8 +627,20 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
 
         # Stop telemetry sampling and finalize report
         telemetry.stop_sampling()
+        run_log_handler.flush()
+        telemetry.set_info(log_counters=run_metrics.log_counters(str(out_path / "run_log.txt")),
+                           output_zip_mb=bundle.get("zip_size_mb"))
+        telemetry.set_outcome("ok")
         stats_file = telemetry.save_json()
         telemetry.print_table()
+
+        # Repack output.zip last, so it carries the final stats.json and the complete logs
+        run_log_handler.flush()
+        bundle["zip_path"] = str(package_output_zip(
+            str(out_path), config.zip_name, stats_file,
+            collect_log_files(str(out_path), extra_dirs=[str(openmvs_dir)] if work_path != out_path else None),
+        ))
+        detach_run_log(run_log_handler)
 
         return {
             "status": "SUCCESS",
@@ -650,9 +652,49 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         logger.exception(f"Pipeline failed: {e}")
         telemetry.stop_sampling()
+        telemetry.set_outcome("error", error_type=type(e).__name__, error=str(e)[:500],
+                              failed_step=telemetry.current_step)
+        run_log_handler.flush()
+        telemetry.set_info(log_counters=run_metrics.log_counters(str(out_path / "run_log.txt")))
         telemetry.save_json()
         telemetry.print_table()
+        detach_run_log(run_log_handler)
         raise
+
+
+def _check_densify_ram(cameras_known_sfm: str, config: PipelineConfig, job: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    RAM estimate for DensifyPointCloud against the container RAM (resources.check_ram).
+    Full resolution that does not fit (or barely fits) drops to level 1; anything else that does not fit
+    raises InsufficientRamError before OpenMVS starts.
+    """
+    with open(cameras_known_sfm, "r", encoding="utf-8") as f:
+        sfm = json.load(f)
+    n_images = len(sfm.get("views", []))
+    intr = (sfm.get("intrinsics") or [{}])[0]
+    width, height = int(intr.get("width", 4056)), int(intr.get("height", 3040))
+    margin = float(job.get("ram_margin", 1.0))
+    level = int(config.openmvs.resolution_level)
+    try:
+        result = check_ram(n_images, width, height, level, margin=margin)
+    except InsufficientRamError as err:
+        if level != 0:
+            raise
+        logger.warning(f"{err} Dropping DensifyPointCloud from full resolution to --resolution-level 1.")
+        config.openmvs.resolution_level = 1
+        result = check_ram(n_images, width, height, 1, margin=margin)
+        result["downgraded_from_level"] = 0
+    if result["status"] == "tight" and config.openmvs.resolution_level == 0:
+        logger.warning("RAM is tight at full resolution: dropping DensifyPointCloud to --resolution-level 1.")
+        config.openmvs.resolution_level = 1
+        result = check_ram(n_images, width, height, 1, margin=margin)
+        result["downgraded_from_level"] = 0
+    log = logger.warning if result["status"] == "tight" else logger.info
+    log(
+        f"RAM check ({result['status']}): DensifyPointCloud needs ~{result['required_gb']} GB for "
+        f"{n_images} images at level {result['resolution_level']}, container has {result['available_gb']} GB."
+    )
+    return result
 
 
 def parse_args():
@@ -673,7 +715,7 @@ def parse_args():
     parser.add_argument("--target_low_poly_faces", type=int, default=50000, help="Target face count for low-poly mesh (default: 50,000)")
     parser.add_argument("--export_scale", type=float, default=100.0, help="Scale factor applied to exported assets (default: 100.0 for real-world scale: 2.2mm -> 22cm)")
     parser.add_argument("--scale_to_mm", action="store_true", help="Shortcut to export OBJ in millimeters (sets export_scale=1000.0)")
-    parser.add_argument("--texturing_engine", choices=["texrecon", "alicevision", "openmvs"], default="texrecon", help="Texturing engine: 'texrecon' (mvs-texturing, default), 'alicevision', or 'openmvs'")
+    parser.add_argument("--texturing_engine", choices=["texrecon", "openmvs"], default="texrecon", help="Texturing engine: 'texrecon' (mvs-texturing, default) or 'openmvs' (TextureMesh)")
     parser.add_argument("--texrecon_bin", default=None, help="Custom path to texrecon executable or directory (e.g. C:\\texrecon\\bin or /usr/local/bin/texrecon)")
     parser.add_argument("--data_term", choices=list(TEXRECON_DATA_TERMS), default="gmi", help="texrecon data term: 'gmi' (default, gradient magnitude) or 'area' (less sensitive to reflections and mask borders)")
     parser.add_argument("--smoothness_term", default="potts", help="texrecon smoothness term (default: 'potts')")
@@ -688,9 +730,11 @@ def parse_args():
     parser.add_argument("--estimate_lift", action="store_true", help="Let turntable_poses estimate the real lift per level")
     parser.add_argument("--no_tag_refine", action="store_true", help="Disable turntable_poses --tagRefine (per-tag paper unevenness)")
     parser.add_argument("--intrinsics_in", default=None, help="Chessboard intrinsics JSON from calibrate_intrinsics.py, passed to turntable_poses --intrinsicsIn")
-    parser.add_argument("--unwrap_method", choices=["Basic", "LSCM", "ABF"], default="Basic", help="AliceVision UV unwrapping method: 'Basic' (fast & robust on high-poly), 'LSCM', or 'ABF'")
-    parser.add_argument("--visibility_remapping_method", choices=["MeshItself", "PullPush", "Pull", "Push"], default="MeshItself", help="AliceVision visibility remapping: 'MeshItself' (direct mesh raycasting) or 'PullPush'")
-    parser.add_argument("--alicevision_bin", default=None, help="Custom path to AliceVision bin directory or aliceVision_texturing executable (e.g. C:\\Meshroom\\aliceVision\\bin)")
+    parser.add_argument("--tag_scale", type=float, default=1.0, help="Print scale of the tag sheet: measured / designed distance (e.g. 0-6 centres: measured mm / 200), passed to turntable_poses --tagScale")
+    parser.add_argument("--workers", type=int, default=0, help="Parallel workers for masks, undistortion and texturing images (0 = automatic from CPUs and free RAM; env TURNTABLE_WORKERS)")
+    parser.add_argument("--work_dir", default=None, help="Fast directory for undistorted images and OpenMVS files (default: output_dir; env TURNTABLE_WORK_DIR)")
+    parser.add_argument("--keep_depth_maps", action="store_true", help="Keep OpenMVS depth*.dmap after fusion (~74 MB per image at level 1)")
+    parser.add_argument("--ram_margin", type=float, default=1.0, help="Safety factor on the DensifyPointCloud RAM estimate before starting (e.g. 1.3)")
     parser.add_argument("--mock_openmvs", action="store_true", help="Simulate OpenMVS for fast testing")
     return parser.parse_args()
 
@@ -717,9 +761,11 @@ def main():
         "estimate_lift": args.estimate_lift,
         "tag_refine": not args.no_tag_refine,
         "intrinsics_in": args.intrinsics_in,
-        "unwrap_method": args.unwrap_method,
-        "visibility_remapping_method": args.visibility_remapping_method,
-        "alicevision_bin": args.alicevision_bin,
+        "tag_scale": args.tag_scale,
+        "workers": args.workers,
+        "work_dir": args.work_dir,
+        "keep_depth_maps": args.keep_depth_maps,
+        "ram_margin": args.ram_margin,
         "openmvs_bin_dir": args.openmvs_bin_dir,
         "focal_length_mm": args.focal_length_mm,
         "resolution_level": args.resolution_level,

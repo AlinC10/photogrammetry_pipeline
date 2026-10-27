@@ -1,27 +1,8 @@
-# Core Scientific & Geometry Dependencies
+# Development / laptop / Pi: everything in the image plus the local tools.
 # Recommended Python version: 3.10 or 3.11 (Python 3.12 is also supported)
-# NOTE: Python 3.14 is NOT recommended as pre-compiled wheels for PyMeshLab/SciPy/PyTorch are not yet available.
+# NOTE: Python 3.14 is NOT recommended as pre-compiled wheels for PyMeshLab/SciPy are not yet available.
 
-numpy>=1.24.0,<2.1.0
-scipy>=1.10.0
-opencv-python-headless>=4.7.0.72
-pillow>=10.0.0
-pymeshlab>=2023.12
-trimesh[easy]>=4.0.0
-networkx>=3.0
-lxml>=4.9.0
-shapely>=2.0.0
-mapbox-earcut>=1.0.1
+-r requirements-runtime.txt
 
-# Telemetry & Utilities
-psutil>=5.9.0
-pydantic>=2.0.0
-rich>=13.0.0
-
-# Export & Compression
-pygltflib>=1.16.0
-
-# Cloud & Automation (Optional - for Cloudflare R2 / RunPod integration)
-boto3>=1.28.0
+# .env loading for tools/cloud_test_run.py and the Pi (the pod gets plain environment variables)
 python-dotenv>=1.0.0
-requests>=2.28.0

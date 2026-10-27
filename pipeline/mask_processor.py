@@ -6,8 +6,8 @@ Combines 3D cylinder visual hull projection with photometric foreground segmenta
 from __future__ import annotations
 
 import logging
-import os
-import shutil
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -377,6 +377,63 @@ def apply_mask_to_image(image_arr: np.ndarray, mask_arr: np.ndarray) -> np.ndarr
     return out_arr
 
 
+def _mask_one_view(task: Dict[str, Any]) -> Optional[Tuple[str, str, str]]:
+    """
+    Worker: one view -> mask files. Module level so ProcessPoolExecutor can pickle it.
+    Returns (source file name, view id, mask path) or None when the image is missing.
+    """
+    v = task["view"]
+    src_path = Path(v["path"])
+    if not src_path.is_file():
+        return None
+
+    R, C, K = task["R"], task["C"], task["K"]
+    tags = task["tags"]
+    tag_polygons = None
+    if task["tag_blackout"] and tags and R is not None and C is not None and K is not None:
+        tag_polygons = project_tags_to_2d(
+            tags=tags, R=R, C=C, K=K,
+            expansion_factor=task["tag_expansion_factor"],
+        )
+
+    mask = generate_hybrid_mask(
+        image=src_path,
+        R=R, C=C, K=K,
+        cylinder_radius_m=task["cylinder_radius_m"],
+        cylinder_y_min_m=task["cylinder_y_min_m"],
+        cylinder_y_max_m=task["cylinder_y_max_m"],
+        chroma_threshold=task["chroma_threshold"],
+        brightness_white_threshold=task["brightness_white_threshold"],
+        safety_dilation_px=task["safety_dilation_px"],
+        tag_polygons=tag_polygons,
+        tag_blackout=task["tag_blackout"],
+    )
+
+    out_dir = Path(task["out_dir"])
+    view_id = str(v.get("viewId", task["index"]))
+    stem_name = src_path.stem
+
+    # Canonical OpenMVS naming: {viewId}_{stem}.mask.png (e.g. 1000_f_1000.mask.png matching scene.mvs views).
+    # No flat f_1000.mask.png alias: in rig mode both cameras have an f_1000 and one overwrote the other.
+    dst_mask_path = out_dir / f"{view_id}_{stem_name}.mask.png"
+    targets = [dst_mask_path]
+    # In rig mode keep the per-camera copy rig/0 or 0/ (unique per camera folder)
+    if src_path.parent.name in {"0", "1", "rig0", "rig1"}:
+        rig_sub = out_dir / src_path.parent.name
+        rig_sub.mkdir(parents=True, exist_ok=True)
+        targets += [rig_sub / f"{stem_name}.mask.png", rig_sub / f"{src_path.name}.mask.png"]
+
+    if HAS_PIL:
+        p_mask = Image.fromarray(mask)
+        for t in targets:
+            p_mask.save(str(t), format="PNG")
+    elif HAS_CV2:
+        for t in targets:
+            cv2.imwrite(str(t), mask)
+
+    return src_path.name, view_id, str(dst_mask_path)
+
+
 def batch_generate_masks(
     views: List[Dict[str, Any]],
     poses_dict: Dict[str, Dict[str, Any]],
@@ -391,10 +448,12 @@ def batch_generate_masks(
     tag_blackout: bool = True,
     tag_expansion_factor: float = 1.25,
     tag_layout_path: Optional[Union[str, Path]] = None,
+    workers: int = 1,
 ) -> Dict[str, str]:
     """
-    Generates automated binary masks for all views in the dataset.
-    Saves `<image_name>.mask.png` in output_masks_dir.
+    Generates automated binary masks for all views in the dataset, `workers` images at a time
+    (separate processes; the result is identical to the serial run).
+    Saves `<viewId>_<stem>.mask.png` in output_masks_dir.
     Returns mapping: {image_filename: mask_file_path}.
     """
     out_dir = Path(output_masks_dir).resolve()
@@ -404,160 +463,46 @@ def batch_generate_masks(
     if tag_blackout and tags:
         logger.info(f"Loaded {len(tags)} AprilTags for disc blackout suppression (expansion={tag_expansion_factor:.2f}).")
 
-    mask_map: Dict[str, str] = {}
-    total = len(views)
-    logger.info(f"Starting automated background matting for {total} images...")
-
+    tasks = []
     for idx, v in enumerate(views):
-        src_path = Path(v["path"])
-        if not src_path.is_file():
-            continue
+        pose_info = poses_dict.get(str(v.get("poseId", v.get("viewId", ""))))
+        intr_info = intrinsics_dict.get(str(v.get("intrinsicId", "0")))
+        tasks.append({
+            "view": v, "index": idx, "out_dir": str(out_dir), "tags": tags,
+            "R": pose_info.get("R") if pose_info else None,
+            "C": pose_info.get("C") if pose_info else None,
+            "K": intr_info.get("K") if intr_info else None,
+            "cylinder_radius_m": cylinder_radius_m,
+            "cylinder_y_min_m": cylinder_y_min_m,
+            "cylinder_y_max_m": cylinder_y_max_m,
+            "chroma_threshold": chroma_threshold,
+            "brightness_white_threshold": brightness_white_threshold,
+            "safety_dilation_px": safety_dilation_px,
+            "tag_blackout": tag_blackout,
+            "tag_expansion_factor": tag_expansion_factor,
+        })
 
-        pose_id = str(v.get("poseId", v.get("viewId", "")))
-        intr_id = str(v.get("intrinsicId", "0"))
+    mask_map: Dict[str, str] = {}
+    total = len(tasks)
+    workers = max(1, min(int(workers or 1), total or 1))
+    logger.info(f"Starting automated background matting for {total} images ({workers} worker(s))...")
 
-        pose_info = poses_dict.get(pose_id)
-        intr_info = intrinsics_dict.get(intr_id)
+    def collect(done: int, result) -> None:
+        if result is not None:
+            name, view_id, dst = result
+            mask_map[name] = dst
+            mask_map[f"{view_id}_{name}"] = dst
+        if done % 10 == 0 or done == total:
+            logger.info(f"  Processed {done}/{total} masks ({done / total * 100:.0f}%)")
 
-        R = pose_info.get("R") if pose_info else None
-        C = pose_info.get("C") if pose_info else None
-        K = intr_info.get("K") if intr_info else None
-
-        tag_polygons = None
-        if tag_blackout and tags and R is not None and C is not None and K is not None:
-            tag_polygons = project_tags_to_2d(
-                tags=tags, R=R, C=C, K=K,
-                expansion_factor=tag_expansion_factor,
-            )
-
-        mask = generate_hybrid_mask(
-            image=src_path,
-            R=R, C=C, K=K,
-            cylinder_radius_m=cylinder_radius_m,
-            cylinder_y_min_m=cylinder_y_min_m,
-            cylinder_y_max_m=cylinder_y_max_m,
-            chroma_threshold=chroma_threshold,
-            brightness_white_threshold=brightness_white_threshold,
-            safety_dilation_px=safety_dilation_px,
-            tag_polygons=tag_polygons,
-            tag_blackout=tag_blackout,
-        )
-
-        view_id = str(v.get("viewId", idx))
-        stem_name = src_path.stem
-
-        # Save with canonical OpenMVS naming: {viewId}_{stem}.mask.png
-        # (e.g. 1000_f_1000.mask.png matching scene.mvs view names)
-        dst_mask_name = f"{view_id}_{stem_name}.mask.png"
-        dst_mask_path = out_dir / dst_mask_name
-
-        if HAS_PIL:
-            p_mask = Image.fromarray(mask)
-            p_mask.save(str(dst_mask_path), format="PNG")
-            # Also save compatibility aliases:
-            # 1. Image name without viewId: f_1000.mask.png and f_1000.jpg.mask.png
-            p_mask.save(str(out_dir / f"{stem_name}.mask.png"), format="PNG")
-            p_mask.save(str(out_dir / f"{src_path.name}.mask.png"), format="PNG")
-            # 2. In rig mode, maintain subdirectory rig/0 or 0:
-            if src_path.parent.name in {"0", "1", "rig0", "rig1"}:
-                rig_sub = out_dir / src_path.parent.name
-                rig_sub.mkdir(parents=True, exist_ok=True)
-                p_mask.save(str(rig_sub / f"{stem_name}.mask.png"), format="PNG")
-                p_mask.save(str(rig_sub / f"{src_path.name}.mask.png"), format="PNG")
-        elif HAS_CV2:
-            cv2.imwrite(str(dst_mask_path), mask)
-            cv2.imwrite(str(out_dir / f"{stem_name}.mask.png"), mask)
-            cv2.imwrite(str(out_dir / f"{src_path.name}.mask.png"), mask)
-            if src_path.parent.name in {"0", "1", "rig0", "rig1"}:
-                rig_sub = out_dir / src_path.parent.name
-                rig_sub.mkdir(parents=True, exist_ok=True)
-                cv2.imwrite(str(rig_sub / f"{stem_name}.mask.png"), mask)
-                cv2.imwrite(str(rig_sub / f"{src_path.name}.mask.png"), mask)
-
-        mask_map[src_path.name] = str(dst_mask_path)
-        mask_map[f"{view_id}_{src_path.name}"] = str(dst_mask_path)
-
-        if (idx + 1) % 10 == 0 or (idx + 1) == total:
-            logger.info(f"  Processed {idx + 1}/{total} masks ({(idx + 1)/total*100:.0f}%)")
+    if workers == 1:
+        for i, task in enumerate(tasks, 1):
+            collect(i, _mask_one_view(task))
+    else:
+        # "spawn": the pipeline has a telemetry thread running, and fork() of a multi-threaded process can deadlock
+        with ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn")) as ex:
+            for i, result in enumerate(ex.map(_mask_one_view, tasks), 1):
+                collect(i, result)
 
     logger.info(f"Completed automated masking: {len(mask_map)} masks saved in {out_dir}")
     return mask_map
-
-
-# -----------------------------------------------------------------------------
-# 4. Discovery & Legacy OpenMVS Utilities
-# -----------------------------------------------------------------------------
-
-def discover_masks(
-    masks_dir: str,
-    images_dir: str,
-) -> Dict[str, str]:
-    """
-    Finds existing masks and associates them with corresponding images.
-    Returns mapping of image filename -> mask file path.
-    """
-    m_dir = Path(masks_dir).resolve()
-    i_dir = Path(images_dir).resolve()
-
-    if not m_dir.is_dir():
-        logger.info(f"Masks directory not found: {m_dir}")
-        return {}
-
-    image_files = [
-        f for f in i_dir.iterdir()
-        if f.suffix.lower() in {".jpg", ".jpeg", ".png", ".tif", ".tiff"} and not f.name.endswith(".mask.png")
-    ]
-
-    mask_map = {}
-    for img in image_files:
-        stem = img.stem
-        candidates = [
-            m_dir / f"{stem}.mask.png",
-            m_dir / f"{stem}.png",
-            m_dir / f"{img.name}.mask.png",
-            m_dir / f"{stem}_mask.png",
-            m_dir / f"{img.name}",
-        ]
-        for c in candidates:
-            if c.is_file():
-                mask_map[img.name] = str(c.resolve())
-                break
-
-    logger.info(f"Discovered {len(mask_map)} / {len(image_files)} masks in {m_dir}")
-    return mask_map
-
-
-def prepare_openmvs_masks(
-    mask_map: Dict[str, str],
-    target_masks_dir: str,
-) -> str:
-    """
-    Copies or formats masks into target_masks_dir with the strict OpenMVS naming convention:
-    `<image_name>.mask.png`.
-    Ensures masks are 8-bit single-channel binary images (0 or 255).
-    """
-    target_dir = Path(target_masks_dir).resolve()
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    prepared_count = 0
-    for img_name, mask_src in mask_map.items():
-        dst_name = f"{img_name}.mask.png"
-        dst_path = target_dir / dst_name
-
-        if HAS_CV2:
-            mask = cv2.imread(mask_src, cv2.IMREAD_GRAYSCALE)
-            if mask is None:
-                logger.warning(f"Failed to read mask image: {mask_src}")
-                continue
-            _, binary_mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
-            cv2.imwrite(str(dst_path), binary_mask)
-            prepared_count += 1
-        elif HAS_PIL:
-            with Image.open(mask_src) as p_img:
-                gray = p_img.convert("L")
-                arr = (np.array(gray) > 128).astype(np.uint8) * 255
-                Image.fromarray(arr).save(str(dst_path), format="PNG")
-                prepared_count += 1
-
-    logger.info(f"Prepared {prepared_count} OpenMVS masks in {target_dir}")
-    return str(target_dir)

@@ -9,6 +9,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -17,6 +18,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import psutil
+
+from .resources import available_cpus, total_ram_gb
+from .run_metrics import STATS_SCHEMA_VERSION
 
 logger = logging.getLogger("TurntableStudio.Telemetry")
 
@@ -43,6 +47,47 @@ def get_process_tree_ram_mb() -> float:
         return total_rss / (1024 * 1024)
     except Exception:
         return 0.0
+
+
+def get_process_tree_cpu_seconds() -> float:
+    """
+    CPU seconds (user + system) of this process, its waited-for children (OpenMVS, texrecon, worker pools
+    after they exit) and the children still running.
+    """
+    try:
+        p = psutil.Process()
+        t = p.cpu_times()
+        total = t.user + t.system + getattr(t, "children_user", 0.0) + getattr(t, "children_system", 0.0)
+        for child in p.children(recursive=True):
+            try:
+                ct = child.cpu_times()
+                total += ct.user + ct.system
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        return total
+    except Exception:
+        return 0.0
+
+
+def get_disk_io_bytes() -> tuple:
+    """(read, written) bytes of all disks (host-wide inside a container: an indication, not exact)."""
+    try:
+        io = psutil.disk_io_counters()
+        return (io.read_bytes, io.write_bytes) if io else (0, 0)
+    except Exception:
+        return (0, 0)
+
+
+def get_dirs_size_bytes(dirs: List[str]) -> int:
+    total = 0
+    for d in dirs:
+        for root, _, files in os.walk(d):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+    return total
 
 
 def get_gpu_vram_mb() -> Optional[dict]:
@@ -79,6 +124,12 @@ class StepRecord:
     end_time_iso: str
     peak_ram_mb: float
     peak_vram_mb: Optional[float] = None
+    peak_vram_net_mb: Optional[float] = None    # minus the VRAM already used before the run (desktop, other apps)
+    cpu_seconds: Optional[float] = None         # process tree, including OpenMVS / texrecon / worker pools
+    cpu_utilization: Optional[float] = None     # cpu_seconds / (duration * CPUs): low = waiting on disk or GPU
+    io_read_gb: Optional[float] = None
+    io_write_gb: Optional[float] = None
+    peak_disk_gb: Optional[float] = None        # size of the watched output/work directories during the step
     extra_data: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -106,6 +157,18 @@ class SystemTelemetry:
         self.mesh_metrics: List[MeshMetrics] = []
         self.global_peak_ram_mb: float = get_process_tree_ram_mb()
         self.global_peak_vram_mb: float = 0.0
+        # Run parameters for RAM-model calibration (resources, n_images, resolution, workers, RAM check)
+        self.run_info: Dict[str, Any] = {}
+        self.run_id = time.strftime("%Y%m%d-%H%M%S", time.gmtime(self.start_wall_time))
+        self.outcome: Dict[str, Any] = {"state": "running"}
+        self.current_step: Optional[str] = None   # step running when an exception left the pipeline
+        self.cpus = available_cpus()
+        self.watch_dirs: List[str] = []
+        self.global_peak_disk_gb: float = 0.0
+        self.global_peak_swap_mb: float = 0.0
+        self._current_step_peak_disk: float = 0.0
+        self._disk_every = 5.0          # directory walks are slower than RAM samples
+        self._last_disk_sample = 0.0
 
         # Background RAM/VRAM sampler thread
         self._sampling = False
@@ -114,10 +177,11 @@ class SystemTelemetry:
         self._current_step_peak_vram: float = 0.0
         self._lock = threading.Lock()
 
-        # Initial GPU probe
+        # Initial GPU probe: what is already used before the run (Windows desktop ~700 MB) is the baseline
         initial_gpus = get_gpu_vram_mb()
+        self.vram_baseline_mb: float = max(g["used_mb"] for g in initial_gpus) if initial_gpus else 0.0
         if initial_gpus:
-            self.global_peak_vram_mb = max(g["used_mb"] for g in initial_gpus)
+            self.global_peak_vram_mb = self.vram_baseline_mb
 
     def start_sampling(self, interval_sec: float = 0.25):
         """Starts asynchronous background telemetry sampling."""
@@ -142,7 +206,20 @@ class SystemTelemetry:
             gpus = get_gpu_vram_mb()
             vram = max([g["used_mb"] for g in gpus]) if gpus else 0.0
 
+            try:
+                swap = psutil.swap_memory().used / (1024 * 1024)
+            except Exception:
+                swap = 0.0
+            disk = None
+            if self.watch_dirs and time.time() - self._last_disk_sample >= self._disk_every:
+                self._last_disk_sample = time.time()
+                disk = get_dirs_size_bytes(self.watch_dirs) / 1024 ** 3
+
             with self._lock:
+                self.global_peak_swap_mb = max(self.global_peak_swap_mb, swap)
+                if disk is not None:
+                    self.global_peak_disk_gb = max(self.global_peak_disk_gb, disk)
+                    self._current_step_peak_disk = max(self._current_step_peak_disk, disk)
                 if ram > self.global_peak_ram_mb:
                     self.global_peak_ram_mb = ram
                 if ram > self._current_step_peak_ram:
@@ -161,11 +238,15 @@ class SystemTelemetry:
         t0 = time.time()
         start_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t0))
         logger.info(f"▶ [STEP START] {name}")
+        self.current_step = name
 
         with self._lock:
             self._current_step_peak_ram = get_process_tree_ram_mb()
             gpus = get_gpu_vram_mb()
             self._current_step_peak_vram = max([g["used_mb"] for g in gpus]) if gpus else 0.0
+            self._current_step_peak_disk = 0.0
+        cpu0 = get_process_tree_cpu_seconds()
+        io0 = get_disk_io_bytes()
 
         try:
             yield
@@ -174,9 +255,14 @@ class SystemTelemetry:
             elapsed = t1 - t0
             end_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t1))
 
+            cpu_s = max(0.0, get_process_tree_cpu_seconds() - cpu0)
+            io1 = get_disk_io_bytes()
+            disk_now = get_dirs_size_bytes(self.watch_dirs) / 1024 ** 3 if self.watch_dirs else 0.0
             with self._lock:
                 step_peak_ram = max(self._current_step_peak_ram, get_process_tree_ram_mb())
                 step_peak_vram = self._current_step_peak_vram if self._current_step_peak_vram > 0 else None
+                step_peak_disk = max(self._current_step_peak_disk, disk_now)
+                self.global_peak_disk_gb = max(self.global_peak_disk_gb, step_peak_disk)
 
             rec = StepRecord(
                 name=name,
@@ -185,11 +271,33 @@ class SystemTelemetry:
                 end_time_iso=end_iso,
                 peak_ram_mb=round(step_peak_ram, 1),
                 peak_vram_mb=round(step_peak_vram, 1) if step_peak_vram else None,
+                peak_vram_net_mb=round(max(0.0, step_peak_vram - self.vram_baseline_mb), 1) if step_peak_vram else None,
+                cpu_seconds=round(cpu_s, 1),
+                cpu_utilization=round(cpu_s / max(elapsed * self.cpus, 1e-6), 3),
+                io_read_gb=round(max(0, io1[0] - io0[0]) / 1024 ** 3, 3),
+                io_write_gb=round(max(0, io1[1] - io0[1]) / 1024 ** 3, 3),
+                peak_disk_gb=round(step_peak_disk, 3) if self.watch_dirs else None,
                 extra_data=extra_data,
             )
             self.steps.append(rec)
+            if sys.exc_info()[0] is None:
+                self.current_step = None
             vram_str = f" | Peak VRAM: {rec.peak_vram_mb:.0f} MB" if rec.peak_vram_mb else ""
             logger.info(f"✔ [STEP FINISH] {name} in {elapsed:.2f}s | Peak RAM: {rec.peak_ram_mb:.0f} MB{vram_str}")
+
+    def watch(self, *dirs: str):
+        """Directories whose total size is sampled (peak disk usage per step and for the run)."""
+        for d in dirs:
+            if d and str(d) not in self.watch_dirs:
+                self.watch_dirs.append(str(d))
+
+    def set_outcome(self, state: str, **details):
+        """"ok" | "error" (+ error_type, error, failed_step) for the run."""
+        self.outcome = {"state": state, **details}
+
+    def set_info(self, **info):
+        """Adds run parameters (resources, image count, workers, RAM estimate) to stats.json."""
+        self.run_info.update(info)
 
     def record_mesh(self, file_path: str, is_watertight: Optional[bool] = None,
                     volume_cm3: Optional[float] = None, bbox_mm: Optional[List[float]] = None,
@@ -239,13 +347,23 @@ class SystemTelemetry:
         """Compiles the full telemetry dataset into a structured dictionary."""
         total_wall_sec = round(time.time() - self.start_wall_time, 2)
         return {
+            "schema_version": STATS_SCHEMA_VERSION,
+            "run_id": self.run_id,
+            "started_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.start_wall_time)),
+            "outcome": self.outcome,
             "total_execution_time_sec": total_wall_sec,
             "total_execution_time_human": f"{total_wall_sec // 60:.0f}m {total_wall_sec % 60:.1f}s",
             "global_peak_ram_mb": round(self.global_peak_ram_mb, 1),
             "global_peak_ram_gb": round(self.global_peak_ram_mb / 1024, 2),
             "global_peak_vram_mb": round(self.global_peak_vram_mb, 1),
             "global_peak_vram_gb": round(self.global_peak_vram_mb / 1024, 2) if self.global_peak_vram_mb > 0 else 0.0,
-            "system_ram_total_gb": round(psutil.virtual_memory().total / (1024**3), 1),
+            "vram_baseline_mb": round(self.vram_baseline_mb, 1),
+            "global_peak_vram_net_mb": round(max(0.0, self.global_peak_vram_mb - self.vram_baseline_mb), 1),
+            "global_peak_swap_mb": round(self.global_peak_swap_mb, 1),
+            "global_peak_disk_gb": round(self.global_peak_disk_gb, 3),
+            # cgroup-aware: inside a container psutil alone reports the host RAM
+            "system_ram_total_gb": round(total_ram_gb(), 1),
+            "run_info": self.run_info,
             "steps": [asdict(s) for s in self.steps],
             "exported_models": [asdict(m) for m in self.mesh_metrics],
         }

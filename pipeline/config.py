@@ -163,6 +163,8 @@ class OpenMVSConfig:
     max_resolution: int = 3200
     density_factor: float = 1.0
     number_views: int = 6             # min views for PatchMatch (6 for turntable precision)
+    max_threads: int = 0              # --max-threads for every OpenMVS app (0 = OpenMVS default: all cores)
+    keep_depth_maps: bool = False     # False: depth*.dmap (~74 MB each at level 1) are deleted after fusion
     smooth_mesh: int = 2              # OpenMVS ReconstructMesh --smooth (default 2)
     min_point_distance: float = 0.5   # mm distance filter
     texture_resolution: int = 4096    # high-res texture atlas
@@ -275,23 +277,7 @@ class TexturingImagesConfig:
     chroma_threshold: float = 20.0
     colour_normalize: bool = True            # Per-camera gains from the turntable paper (AWB of camera 1 differs)
     max_gain_deviation: float = 0.25         # Gains are clamped to [0.75, 1.25]
-    workers: int = 4
-
-
-@dataclass
-class AliceVisionConfig:
-    """Paths and settings for optional AliceVision multi-band texturing."""
-    bin_dir: Optional[str] = None
-    texturing_bin: Optional[str] = None
-    texture_side: int = 4096
-    unwrap_method: str = "Basic"       # Basic (fast, robust on high-poly), LSCM, ABF
-    use_udim: bool = False             # False = single standard (0,1) UV atlas for maximum 3D software compatibility
-    fill_holes: bool = True            # Inpainting for texture holes (eliminates black spots)
-    correct_ev: bool = True            # Exposure compensation across camera angles
-    color_mapping_type: str = "png"    # png (lossless) or jpg
-    padding: int = 5
-    multi_band_downscale: int = 2       # 2 = finer frequency decomposition (studio grade sharpness)
-    visibility_remapping_method: str = "MeshItself"  # MeshItself (direct raycasting on mesh, no dense point cloud required)
+    workers: int = 0                         # 0 = automatic (resources.resolve_workers)
 
 
 @dataclass
@@ -300,15 +286,13 @@ class PipelineConfig:
     input_dir: str = "input_images"
     output_dir: str = "output"
     rig_mode: bool = False             # True if images are in rig/0 and rig/1
-    two_sides_mode: bool = False       # True if images are in rig1/ and rig2/
     use_masks: bool = True
     masks_dir: Optional[str] = None
-    texturing_engine: str = "texrecon" # "texrecon" (mvs-texturing), "alicevision", or "openmvs"
+    texturing_engine: str = "texrecon" # "texrecon" (mvs-texturing) or "openmvs" (TextureMesh)
     masking: MaskingConfig = field(default_factory=MaskingConfig)
     texturing_images: TexturingImagesConfig = field(default_factory=TexturingImagesConfig)
     texrecon: TexReconConfig = field(default_factory=TexReconConfig)
     openmvs: OpenMVSConfig = field(default_factory=OpenMVSConfig)
-    alicevision: AliceVisionConfig = field(default_factory=AliceVisionConfig)
     turntable: TurntableConfig = field(default_factory=TurntableConfig)
     cleaning: MeshCleaningConfig = field(default_factory=MeshCleaningConfig)
 

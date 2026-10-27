@@ -225,9 +225,12 @@ class TestBridgeSFM(unittest.TestCase):
             sfm_json_path=str(sfm_file),
             output_colmap_dir=str(colmap_out),
             undistorted_images_dir=str(undist_out),
+            workers=4,  # undistortion in a thread pool: every view still gets its own image
         )
 
         self.assertEqual(res["registered_views"], 4)
+        self.assertEqual(sorted(p.name for p in undist_out.glob("*.jpg")),
+                         [f"{200 + i}_cam_img.jpg" for i in range(4)])
         # Verify valid proxy points with multi-view coverage
         with open(colmap_out / "points3D.txt") as f:
             lines = [l for l in f if not l.startswith("#")]

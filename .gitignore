@@ -1,7 +1,45 @@
-__pycache__
-__pycache__/**
-**/__pycache__/**
-**/__pycache__
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Rezultatele rulărilor (GB de depth maps, imagini nedistorsionate, modele)
+output/
+output_*/
+
+# Note locale (id conversație etc.)
 conv
-output
-.venv
+
+# LaTeX (doar sursele .tex se păstrează)
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+
+# Editor / sistem
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+
+deprecated/
+to_delete/
+input_images/
+# Rezultatele descărcate din cloud (tools/cloud_test_run.py)
+results/
+docs/
+
+# Chei (R2, Cloudflare, RunPod): doar local. Modelul fără valori e .env.example
+.env
+.env.*
+!.env.example
+
+deprecated
+plans
+to_delete

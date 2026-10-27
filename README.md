@@ -1,327 +1,301 @@
-# Turntable Studio — Industrial 3D Photogrammetry Pipeline
+# Turntable Studio — 3D scanning pipeline for a turntable rig
 
-Turntable Studio is a high-precision, studio-grade 3D photogrammetry pipeline designed for turntable scanning rigs (e.g. dual Arducam Sony IMX477 cameras). It replaces the heavy and noisy parts of Meshroom (DepthMap, Meshing, Texturing) with **OpenMVS**, enforces rigidly locked camera poses via **TurntablePoses**, seals the base into a watertight CAD-ready 3D print pedestal, and exports multi-LOD assets with full telemetry.
+Turns the photos of a turntable scanner (two Sony IMX477 cameras on a vertical carriage, a 260 mm disc with
+12 AprilTags) into textured, watertight 3D models: OBJ, GLB, STL and 3MF in a high- and a low-poly version.
+
+* Camera poses come from the **AprilTags on the disc** (`turntable_poses.py`), not from feature matching, and are
+  locked: on dark, glossy or plain plastics classic structure-from-motion drifts.
+* Geometry: **OpenMVS** (CUDA PatchMatch depth maps → Delaunay / graph-cut mesh).
+* Texture: **mvs-texturing (`texrecon`)**, with OpenMVS `TextureMesh` as fallback.
+* Runs locally (Docker or native) or **in the cloud**: one RunPod pod per scan, photos and results through
+  Cloudflare R2.
 
 ---
 
-## 1. System Architecture
+## 1. How it works
 
 ```mermaid
 flowchart TD
-    A["Input Images<br/>(Flat or rig/0 & rig/1)"] --> B["1. CameraInit<br/>(IMX477 3.9mm preset / EXIF)"]
-    B --> C["2. TurntablePoses<br/>(Rigidly LOCKED Poses & Calibration)"]
-    C --> D["3. Bridge SFM<br/>(OpenCV Undistort & COLMAP Exporter)"]
-    D --> E["4. OpenMVS Geometry<br/>(InterfaceCOLMAP &rarr; Densify &rarr; ReconstructMesh)"]
-    E --> F["5. Watertight Mesh Cleaner<br/>(Planar Slice at 3mm &rarr; Skirt &rarr; Ear-Clipping Base)"]
-    F --> G{"Texturing Engine Selection"}
-    G -->|Default / Recommended| H1["mvs-texturing (texrecon)<br/>• MRF Graph-Cut + GMI<br/>• Poisson Global & Local Seam Leveling"]
-    G -->|Multi-Band LSCM| H2["AliceVision Texturing<br/>• Frequency decomposition"]
-    G -->|Fast Built-in| H3["OpenMVS TextureMesh<br/>• Direct mesh texturing"]
-    H1 --> I["6. Multi-LOD Exporter<br/>(OBJ, STL, 3MF, Draco GLB & output.zip)"]
-    H2 --> I
-    H3 --> I
-    I --> J["7. Telemetry & Stats<br/>(Peak RAM, Peak VRAM, per-step timing, stats.json)"]
+    A["Photos<br/>input_images/rig/0 and rig/1"] --> B["1. CameraInit<br/>views + intrinsics (3.9 mm lens)"]
+    B --> C["2. turntable_poses<br/>AprilTags -> locked camera poses"]
+    C --> D["2.5 Masks<br/>disc cylinder + colour (parallel)"]
+    D --> E["3. Bridge<br/>undistortion + COLMAP model (parallel)"]
+    E --> R{"RAM check"}
+    R --> F["4. OpenMVS<br/>DensifyPointCloud -> ReconstructMesh"]
+    F --> G["5. Mesh cleaning<br/>cut the disc at 3 mm, close the base, repair, decimate"]
+    G --> H["5.5 Texturing images<br/>PNG, mesh-silhouette masks, colour gains"]
+    H --> T["4.4 texrecon<br/>(fallback: OpenMVS TextureMesh)"]
+    T --> X["6. Export<br/>OBJ / GLB / STL / 3MF, high + low"]
+    X --> Z["output.zip + stats.json + logs"]
 ```
+
+| Step | What happens | Module |
+|---|---|---|
+| 1. CameraInit | Finds the photos, reads the level / step from the file name (`f_2005.jpg` = level 2, step 5), writes `cameraInit.sfm` | `pipeline/camera_init.py` |
+| 2. Poses | Detects the 12 AprilTags in every photo and fits one rigid turntable model (step angle, rotation axis, lift per level, camera intrinsics). Writes `cameras_known.sfm`, `turntable_report.txt` (RMS, lift, per-photo errors) and `turntable_calib.json` | `pipeline/turntable_poses.py` (**never modified**, called as a subprocess) |
+| 2.5 Masks | Object vs background: inside an 80 mm × 350 mm cylinder around the axis, not white, not a tag | `pipeline/mask_processor.py` |
+| 3. Bridge | Undistorts photos and masks, writes the COLMAP model OpenMVS imports (poses + 1500 synthetic tracking points) | `pipeline/bridge_sfm.py` |
+| RAM check | Estimates DensifyPointCloud's RAM from photos × resolution and stops in seconds if the container cannot hold it | `pipeline/resources.py` |
+| 4. OpenMVS | Depth map per photo on the GPU, fusion into a dense point cloud, surface mesh. Depth maps are deleted after fusion | `pipeline/openmvs_runner.py` |
+| 5. Cleaning | Keeps the largest part, cuts at Y = 3 mm (removes the disc), closes the base flat, repairs, decimates to 250 k faces + a 50 k low-poly copy | `pipeline/mesh_cleaner.py`, `pipeline/exporter.py` |
+| 5.5 Texturing images | Lossless PNGs where everything outside the mesh silhouette is exactly black, per-camera colour gains from the white paper | `pipeline/texture_prep.py`, `pipeline/mesh_masks.py` |
+| 4.4 Texturing | `texrecon` picks the best photo per face and builds the atlases; unseen faces are coloured like their neighbours | `pipeline/texrecon_runner.py` |
+| 6. Export | OBJ + MTL + PNG/JPG, GLB with embedded textures, watertight STL / 3MF at real scale, `output.zip` | `pipeline/exporter.py` |
+
+Everything the run measured (time, RAM, VRAM, CPU, disk per step, hardware, object, mesh quality) goes into
+`stats.json`; the full log into `run_log.txt` (section 7).
+
+### Coordinates and units
+The model is built in **metres**, Y up, the disc surface at Y = 0. Exports use `--export_scale 100`
+(the OBJ/GLB/STL/3MF units then read as the real size in the slicer / viewer; tested — do not change).
+The AliceVision `.sfm` conventions (column-major rotations, principal point as offset from the centre) are in `AGENTS.md`.
 
 ---
 
-## 2. Python Environment & Versioning
+## 2. Input
 
-> [!IMPORTANT]
-> **Use Python 3.10 or 3.11.**
-> Do **NOT** use Python 3.14 (or early alpha releases). Scientific packages like `pymeshlab`, `scipy`, `trimesh`, and `opencv-python` do not have pre-built wheels for Python 3.14 on Linux/Windows and will fail during installation.
+```text
+input_images/
+└── rig/
+    ├── 0/                 # camera 0
+    │   ├── f_1000.jpg     # level 1, step 0
+    │   ├── f_1001.jpg     # level 1, step 1 (18° later)
+    │   ├── ...
+    │   ├── f_2000.jpg     # level 2 (carriage moved up)
+    │   └── ...
+    └── 1/                 # camera 1, same names
+```
 
-### Quick Setup with `uv` (Recommended):
+* File names end in `<level><3-digit step>` (`f_1005` → level 1, step 5). 20 steps of 18° per level.
+* Without `rig/` (flat folder, one camera) run without `--rig_mode`.
+* Optional: own masks in `input_images/masks/` (`<viewId>_<stem>.mask.png`); otherwise they are generated.
+
+### Good scans
+* The disc must stay **in frame** on every level (at least ~4 tags per photo; the report shows `tag-uri pe poză: min`).
+* The real carriage lift was measured at ~85 mm, not the nominal 80/100 mm: use **`--estimate_lift`**.
+* Plain, glossy surfaces (a cap of one colour) give no depth (nothing to match between photos): side lighting or
+  matte scanning spray help. Open issues and their fixes: `plans/AUDIT_RECONSTRUCTIE_GENERALA.md`.
+
+---
+
+## 3. Running
+
+### A. Docker on the GPU machine (Windows + Docker Desktop, or Linux)
+
 ```bash
-# Create Python 3.11 virtual environment
-uv venv .venv --python 3.11
-source .venv/bin/activate
+# once, and after code changes (GIT_COMMIT is recorded in stats.json)
+GIT_COMMIT=$(git rev-parse --short HEAD) docker compose build
 
-# Install dependencies
+# a scan: photos in ./input_images, results in ./output
+docker compose run --rm turntable-studio --input_dir /workspace/input_images --output_dir /workspace/output --rig_mode --estimate_lift
+```
+
+PowerShell: `docker compose build`, then the same `docker compose run ...` line. No `| tee` is needed:
+the log is written to `output/run_log.txt` by the pipeline itself (UTF-8).
+
+What `docker-compose.yml` mounts:
+
+| Host | Container | Contents |
+|---|---|---|
+| `./input_images` | `/workspace/input_images` (read-only) | photos |
+| `./output` | `/workspace/output` | models, `output.zip`, `stats.json`, logs, reports, masks, texrecon files |
+| volume `turntable_work` | `/tmp/turntable_work` | undistorted images, COLMAP files, OpenMVS scene and depth maps |
+
+The work volume matters on Windows: a folder of `D:\` mounted through WSL is several times slower for the ~9 GB of
+depth maps (DensifyPointCloud spent ~14 of its 18.5 minutes on disk there). It persists between runs, so `--resume`
+still works. To keep everything in `./output` (e.g. for `tools/debug_texturing.py`) add `--work_dir /workspace/output`.
+
+Re-texture / re-export without recomputing the geometry:
+```bash
+docker compose run --rm turntable-studio --input_dir /workspace/input_images --output_dir /workspace/output --rig_mode --estimate_lift --resume
+```
+`--resume` reuses `cameras_known.sfm` and the OpenMVS mesh. Run **without** it after changing photos, poses or
+intrinsics.
+
+WSL memory: DensifyPointCloud needs ~10–12 GB for 80–120 photos. If Docker Desktop has less, raise `memory=` in
+`%UserProfile%\.wslconfig` and run `wsl --shutdown`.
+
+### B. Native (without Docker)
+
+Needs OpenMVS (with CUDA) and `texrecon` on the machine; Python 3.10 or 3.11 (not 3.14: no wheels for pymeshlab / scipy).
+```bash
+uv venv .venv --python 3.11 && source .venv/bin/activate     # Windows: .venv\Scripts\activate
 uv pip install -r requirements.txt
+python main.py --input_dir ./input_images --output_dir ./output --rig_mode --estimate_lift \
+    --openmvs_bin_dir /path/to/OpenMVS --texrecon_bin /path/to/texrecon
 ```
+OpenMVS is also searched in `OPENMVS_BIN_DIR`, `PATH`, `/usr/local/bin/OpenMVS`, `C:\OpenMVS\...`; texrecon in
+`TEXRECON_BIN`. Without texrecon the pipeline falls back to OpenMVS `TextureMesh`.
 
-### Standard `venv` Setup:
+Quick check without OpenMVS (fake geometry, all later steps run):
 ```bash
-python3.11 -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+python main.py --mock_openmvs --rig_mode --input_dir ./input_images --output_dir ./output_test
 ```
 
----
+### C. Cloud: RunPod + Cloudflare R2
 
-## 3. Input Directory Layouts
-
-### A. Rig Mode (`--rig_mode`)
-Designed for dual-camera rigs where both cameras shoot simultaneously at each turntable step:
-```text
-input_images/
-├── rig/
-│   ├── 0/               # Camera 1 (Lower angle)
-│   │   ├── 0000.jpg
-│   │   ├── 0001.jpg
-│   │   └── ...
-│   └── 1/               # Camera 2 (Upper angle)
-│       ├── 0000.jpg
-│       ├── 0001.jpg
-│       └── ...
-└── masks/               # Optional SAM / BiRefNet masks
-    ├── 0000.mask.png
-    └── ...
+One scan = one pod, created for the job and terminated as soon as the result is in R2.
 ```
-
-### B. Flat Mode
-Single camera turntable scan:
-```text
-input_images/
-├── 0000.jpg
-├── 0001.jpg
-├── ...
-└── 0019.jpg
+laptop / Pi ──upload photos──▶ R2 jobs/<id>/input/ ──▶ pod: download, run, upload ──▶ R2 jobs/<id>/output/
+            ◀──────────────── download results/<id>/, delete jobs/<id>/ ◀────────────────────────────
 ```
+* The pod gets **temporary R2 keys** (1 hour, read-only on its photos, write-only on its output), never your keys,
+  never the RunPod key.
+* GPU: the first available from a list ordered by price, with a minimum host RAM computed from the photos and a
+  minimum vCPU count. GPU speed barely matters; RAM, CPUs and disk do.
+* Every pod is terminated, also after errors, timeouts and cancels; one retry with more RAM if it ran out of memory.
 
----
+Once:
+1. Push the image to a registry: `docker tag turntable-studio:latest ghcr.io/<user>/turntable-studio:v1 && docker push ...`
+   (private registry: add its credentials in RunPod → Settings → Container Registry Auth).
+2. `cp .env.example .env` and fill in: R2 bucket key, Cloudflare API token with R2 permissions only,
+   `CLOUDFLARE_ACCOUNT_ID`, `RUNPOD_API_KEY`, `TURNTABLE_IMAGE`.
 
-## 4. Running with Docker (Linux Server / RunPod / Cloud / Local)
-
-Docker is the recommended deployment method for automated, isolated photogrammetry on Linux servers, cloud instances (RunPod, AWS, GCP), or locally via Docker Desktop with NVIDIA GPU passthrough.
-
-### A. How Host Volume Mounting Works
-The container uses two host directory mounts configured in [`docker-compose.yml`](file:///home/alin/Desktop/template_meshroom/turntable_studio/docker-compose.yml):
-* **`./input_images` &rarr; `/workspace/input_images:ro`**: Put your input photos in the `turntable_studio/input_images/` directory on your computer.
-* **`./output` &rarr; `/workspace/output:rw`**: As soon as the reconstruction pipeline finishes, all multi-LOD 3D models and archives appear **directly on your host machine** inside `turntable_studio/output/`.
-
-### B. Build the Container
+Then, from the repository root:
 ```bash
-# Build the headless CUDA 12 + OpenMVS v2.3.0 + mvs-texturing container
-docker compose build
+python tools/cloud_test_run.py --dry_run     # R2 check + RAM/disk estimate + the pod request, no pod, no cost
+python tools/cloud_test_run.py               # upload input_images/ -> pod -> results/<job_id>/ -> clean R2
+python tools/cloud_test_run.py --keep_remote # leave the job in R2 (debugging)
+python tools/cloud_test_run.py --job_id <id> --skip_upload   # retry with the photos already in R2
+```
+It prints the time of every phase, the GPU / RAM / vCPU received and the cost estimate. Details, key permissions,
+`status.json` and the Pi upload queue: [`cloud/README.md`](cloud/README.md).
+
+---
+
+## 4. Output
+
+```text
+output/
+├── glb/high_model.glb, low_model.glb          # open in Windows 3D Viewer, Blender, any glTF viewer
+├── obj/high/model_high.obj + .mtl + model_high_tex_*.png
+├── obj/low/model_low.obj   + .mtl + model_low_tex_*.jpg   (≤ 2048 px)
+├── stl/high_model.stl, low_model.stl          # watertight, flat base: straight into the slicer
+├── 3mf/high_model.3mf, low_model.3mf
+├── output.zip       # all of the above + stats.json + reports + logs/ (run_log, OpenMVS, texrecon)
+├── stats.json       # measurements of the run (section 7)
+├── run_log.txt      # full log, UTF-8
+├── turntable_report.txt, turntable_calib.json # pose quality: RMS, tags per photo, lift, per-photo errors
+├── cameraInit.sfm, cameras_known.sfm          # views, locked poses
+├── masks/, texturing_images/, texrecon/       # intermediate files (useful for debugging)
+└── model_cleaned_watertight.obj, cleaned_mesh_low.obj
+```
+Blender: switch the viewport to *Material Preview*. If two runs reuse the same texture file names, Blender may show
+the old texture from its cache: reload the images or restart Blender.
+
+### Reading `turntable_report.txt`
+* `Total: ... RMS x px`: tag reprojection error. ~3 px today; < 1 px needs a chessboard calibration (`--intrinsics_in`).
+* `Urcare: x mm/nivel, unghi față de axă y°`: lift per level. A large angle (> 2°) or a large free-pose difference on one
+  level means the lift is wrong: use `--estimate_lift`.
+* `tag-uri pe poză: min n`: below ~4 the top level loses the disc.
+
+---
+
+## 5. Options
+
+Run `python main.py --help` for all of them. The ones that matter:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--rig_mode` | off | photos in `rig/0`, `rig/1` |
+| `--estimate_lift` | off | estimate the carriage lift (recommended; the real lift is ~85 mm) |
+| `--lift_mm` | 100 | fixed lift per level when not estimated |
+| `--tag_scale` | 1.0 | printed / designed size of the tag sheet (measure tag 0–6 centres: designed 200 mm) |
+| `--intrinsics_in` | – | chessboard calibration from `pipeline/calibrate_intrinsics.py` |
+| `--no_tag_refine` | off | disable the per-tag paper-height correction |
+| `--resolution_level` | 1 | DensifyPointCloud at 1/2 resolution (0 = full: ~4× GPU time and much more RAM) |
+| `--resume` | off | reuse poses and the OpenMVS mesh |
+| `--texturing_engine` | texrecon | or `openmvs` (TextureMesh) |
+| `--data_term` | gmi | texrecon: `gmi` or `area` |
+| `--target_low_poly_faces` | 50000 | low-poly size |
+| `--workers` | 0 = auto | parallel images for masks / undistortion / texturing images: `min(CPUs − 1, free RAM / 0.5 GB)` from the container limits |
+| `--work_dir` | output dir (Docker: `/tmp/turntable_work`) | where the large intermediate files go |
+| `--keep_depth_maps` | off | keep OpenMVS `depth*.dmap` (~74 MB each) |
+| `--ram_margin` | 1.0 | safety factor on the RAM estimate before DensifyPointCloud |
+| `--mock_openmvs` | off | fake geometry for quick tests |
+
+Texture tuning (texrecon seam leveling, unseen faces, mask margin, colour gains) and the OpenMVS `TextureMesh`
+options are listed by `--help`.
+
+---
+
+## 6. Resources
+
+* **RAM.** DensifyPointCloud dominates: ≈ 6.8 GB + 12 bytes × photos × working pixels (80 photos → 9.8 GB, 120 → 11.3 GB
+  at level 1; full resolution ~25–40 GB). The check uses the container's limit (cgroup), not the host RAM.
+  `tools/fit_ram_model.py <stats.json...>` refits the formula from more runs.
+* **Parallelism** only raises RAM inside the parallel steps (~0.5 GB per worker), which stay below DensifyPointCloud.
+  Masks: 66 s → 15 s with 8 workers on 120 photos.
+* **GPU.** NVIDIA with CUDA is required (OpenMVS is built with CUDA); its speed matters little (~4 of 30 minutes).
+  OpenMVS uses ~0.6 GB of VRAM (one depth map at a time); more VRAM does not speed one job up.
+* **Disk.** ~9 GB of depth maps at their peak for 120 photos at level 1 (4× at level 0); a fast disk matters most.
+* **Docker image.** Runtime on `nvidia/cuda:12.2.2-base` with only the OpenMVS apps used, `texrecon` and the libraries
+  `ldd` reports (`docker/runtime_deps.sh`); the build fails with "Missing shared libraries" if one is missing.
+
+---
+
+## 7. stats.json and the log
+
+`stats.json` (`schema_version` 2) is meant as training data for predicting RAM, time, disk, cost and quality:
+
+* **run:** id, start time, outcome (`ok` / `error` + error type + failed step), code version (git commit / image);
+* **hardware:** CPU model and cores, GPU model / VRAM / compute capability / driver, host (local, WSL, RunPod),
+  measured disk write/read speed of the work and output directories, container CPUs and RAM, workers;
+* **input:** photos per level and camera, resolution, JPEG size, settings; pose quality (RMS, tags per photo, lift,
+  free-pose difference per level); the object in the images (fraction of the frame, texture inside the mask,
+  brightness, saturation, white/specular share, bounding box);
+* **per step:** duration, peak RAM, peak VRAM minus what was already in use, CPU seconds and utilisation
+  (low = waiting on disk or GPU), disk read/write, peak disk usage;
+* **results:** OpenMVS GPU seconds, discarded depths, dense points, Delaunay cells; raw and cleaned mesh (faces,
+  components, boundary edges, watertight); texrecon unseen faces; warnings / errors; zip size;
+* **cloud jobs:** the pod rented (GPU, RAM, vCPU), price, cost, image pull + boot time, transfer times.
+
+`python tools/collect_stats.py results/*/stats.json output/stats.json -o runs.csv` turns many runs into one table.
+
+`run_log.txt` contains everything printed plus the OpenMVS output; `output.zip/logs/` also holds the OpenMVS and
+texrecon logs.
+
+---
+
+## 8. Repository
+
+```text
+main.py                  pipeline (CLI and run_pipeline(job))
+runpod_job.py            inside a RunPod pod: R2 -> run_pipeline -> R2
+docker_entrypoint.sh     container entry: runpod_job.py if JOB_ID is set, else main.py
+Dockerfile, docker-compose.yml, docker/runtime_deps.sh
+requirements-runtime.txt (image) / requirements.txt (+ local tools)
+.env.example             keys for the cloud flow (.env is ignored by git and Docker)
+pipeline/                the steps of section 1, resources.py (RAM/CPU), run_metrics.py (stats), telemetry.py
+cloud/                   cloudflare_r2.py, runpod.py, job.py, README.md
+tools/                   local only: cloud_test_run.py, collect_stats.py, fit_ram_model.py,
+                         debug_texturing.py (texture diagnostics), debug_blender_compare.py (headless Blender)
+tests/                   unit tests (no GPU, no network)
+plans/                   open plans (AUDIT_RECONSTRUCTIE_GENERALA.md = next fixes); plans/implemented/ = done
+docs/                    architecture description, competition documentation
+deprecated/              code no longer used (AliceVision texturing, inspect_rig_poses.py)
+to_delete/               superseded files, kept until reviewed
 ```
 
-### C. Run with Docker Compose
-
-1. **Run with OpenMVS Texturing Engine:**
-   ```bash
-   docker compose run --rm turntable-studio --input_dir /workspace/input_images --output_dir /workspace/output --rig_mode --texturing_engine openmvs
-   ```
-
-2. **Run with `mvs-texturing` (`texrecon` - Recommended):**
-   ```bash
-   docker compose run --rm turntable-studio --input_dir /workspace/input_images --output_dir /workspace/output --rig_mode --texturing_engine texrecon
-   ```
-
-3. **Default execution (`docker compose up`):**
-   ```bash
-   docker compose up
-   ```
-
-### D. Run Directly via Docker CLI (Standalone)
+Tests:
 ```bash
-docker run --gpus all --rm \
-  -v "$(pwd)/input_images:/workspace/input_images:ro" \
-  -v "$(pwd)/output:/workspace/output:rw" \
-  turntable-studio:latest \
-  --input_dir /workspace/input_images \
-  --output_dir /workspace/output \
-  --rig_mode \
-  --texturing_engine openmvs \
-  --resolution_level 1
+uv run --with numpy --with opencv-python-headless --with scipy --with trimesh --with shapely --with mapbox-earcut \
+  --with psutil --with pillow --with networkx --with pymeshlab --with boto3 --with requests --with lxml \
+  python -m unittest discover -s tests
 ```
 
 ---
 
-## 5. Running Locally on Windows x64 (Native)
+## 9. Troubleshooting
 
-You can run Turntable Studio directly on Windows without Docker:
-
-1. **Install OpenMVS and Optional Texturing Engines:**
-   - **OpenMVS:** Download the latest pre-compiled Windows x64 release from [OpenMVS Releases](https://github.com/cdcseacave/openMVS/releases) (e.g. `openMVS_v2.4.0_win64.zip`) and extract it to `C:\OpenMVS`. The pipeline automatically scans subfolders:
-     * `C:\OpenMVS\vc17\x64\Release` (Visual Studio 2022)
-     * `C:\OpenMVS\vc16\x64\Release` (Visual Studio 2019)
-     * `C:\OpenMVS\bin`
-   - **mvs-texturing (`texrecon` - Recommended):** Extract `texrecon.exe` and its OpenMP DLLs to `C:\texrecon\bin` or specify `--texrecon_bin "C:\texrecon\bin"`.
-   - **AliceVision (Alternative):** If you have Meshroom installed (e.g. `D:\Meshroom-2025.1.0`), point to its binary folder with `--alicevision_bin "D:\Meshroom-2025.1.0\aliceVision\bin"`.
-
-2. **Run the Python Pipeline:**
-   ```powershell
-   # Default Studio Pipeline (mvs-texturing + IMX477 3.9mm lens)
-   python main.py --input_dir .\input_images --output_dir .\output --rig_mode --focal_length_mm 3.9
-
-   # Run with AliceVision Texturing (Multi-Band frequency blending)
-   python main.py --texturing_engine alicevision --alicevision_bin "D:\Meshroom-2025.1.0\aliceVision\bin" --rig_mode
-
-   # Run with OpenMVS TextureMesh
-   python main.py --texturing_engine openmvs --openmvs_bin_dir "C:\OpenMVS\vc17\x64\Release" --rig_mode
-
-   # Fast resume (reuses existing dense point cloud and mesh, running only texturing and export)
-   python main.py --resume
-   ```
-
----
-
-## 6. CLI Arguments & Configuration
-
-### A. I/O & Execution Modes
-| Parameter | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `--input_dir`, `--input`, `-i` | `str` | `./input_images` | Path to images directory |
-| `--output_dir`, `--output`, `-o` | `str` | `./output` | Path for deliverables |
-| `--rig_mode` | `flag` | `False` | Enables dual-camera rig layout (`rig/0`, `rig/1`) |
-| `--resume` | `flag` | `False` | Skips densification/reconstruction if point cloud/mesh already exists |
-| `--mock_openmvs` | `flag` | `False` | Simulates OpenMVS and texturing for fast unit/smoke testing |
-
-### B. Camera Optics & Calibration
-| Parameter | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `--focal_length_mm`, `--focal_mm` | `float` | `3.9` | Camera lens focal length in mm (calibrated for IMX477 M12 lens) |
-| `--step_deg` | `float` | `18.0` | Turntable rotation step in degrees (`18.0` for 20 steps/turn) |
-| `--lift_mm` | `float` | `100.0` | Carriage lift per level passed to `turntable_poses --liftMm` (the script's own default is 80 mm) |
-| `--estimate_lift` | `flag` | `False` | Let `turntable_poses` estimate the real lift per level |
-| `--no_tag_refine` | `flag` | `False` | Disable `turntable_poses --tagRefine` (per-tag paper unevenness; RMS 4.09 → 2.48 px on the Parkside set) |
-| `--intrinsics_in` | `str` | `None` | Chessboard intrinsics JSON from `calibrate_intrinsics.py` (`turntable_poses --intrinsicsIn`) |
-
-### C. Texturing Engine Selection & Settings
-| Parameter | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `--texturing_engine` | `choice` | `texrecon` | Texturing engine: `texrecon` (mvs-texturing, default), `alicevision`, or `openmvs` |
-| `--texrecon_bin` | `str` | `None` | Path to `texrecon` executable or directory (e.g. `C:\texrecon\bin`) |
-| `--data_term` | `choice` | `gmi` | `texrecon` data term: `gmi` (gradient magnitude integral, default) or `area` — the only two texrecon accepts |
-| `--smoothness_term` | `str` | `potts` | `texrecon` smoothness term MRF regularizer (default: `potts`) |
-| `--outlier_removal` | `choice` | `gauss_damping` | `texrecon` photometric outlier removal: `gauss_damping`, `none`, or `gauss_clamping` |
-| `--texrecon_global_seam_leveling` | `int` | `0` | `texrecon` global seam leveling (`1` = enable; worth re-testing now that the background is masked cleanly) |
-| `--no_keep_unseen_faces` | `flag` | `False` | Let texrecon drop faces no camera sees (default keeps them, coloured like their neighbours, so the OBJ/GLB has no holes) |
-| `--write_intermediate_results` | `flag` | `False` | texrecon writes `<prefix>_labeling.vec` (which view textured each face), read by `debug_texturing.py labels` |
-| `--no_mesh_texture_masks` | `flag` | `False` | Texture from the bridge JPEGs + photometric masks instead of `texturing_images/` (PNG, mesh-silhouette masks) |
-| `--texture_mask_margin_px` | `int` | `2` | Dilation of the mesh silhouette used as texturing mask |
-| `--no_colour_normalize` | `flag` | `False` | Disable per-camera colour gains measured on the turntable paper |
-| `--alicevision_bin` | `str` | `None` | Path to AliceVision binary directory (e.g. `C:\Meshroom\aliceVision\bin`) |
-| `--unwrap_method` | `choice` | `Basic` | AliceVision UV unwrapping method: `Basic` (fast & robust on high-poly), `LSCM`, or `ABF` |
-| `--visibility_remapping_method` | `choice` | `MeshItself` | AliceVision visibility test: `MeshItself` (direct mesh raycasting) or `PullPush` |
-| `--cost_smoothness_ratio` | `float` | `1.0` | OpenMVS texturing smoothness ratio (`1.0` prevents chart confetti) |
-| `--outlier_threshold` | `float` | `0.0` | OpenMVS outlier rejection (`0.0` disabled to texture shiny plastics without holes) |
-| `--empty_color` | `int` | `0` | OpenMVS empty/unobserved face color in decimal RGB (`0` = Black, `16744231` = Orange) |
-| `--global_seam_leveling` | `int` | `0` | OpenMVS global Poisson seam leveling (`0` disables dark background bleeding) |
-| `--local_seam_leveling` | `int` | `1` | OpenMVS local seam edge blending (`1` = enabled) |
-
-### D. OpenMVS Geometry & Mesh Cleaning
-| Parameter | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `--openmvs_bin_dir`, `--bin_dir` | `str` | `None` | Path to OpenMVS binaries directory (e.g. `C:\OpenMVS\vc17\x64\Release`) |
-| `--resolution_level` | `int` | `1` | OpenMVS densify downscale (`0` = 4K full, `1` = 2K, `2` = 1K) |
-| `--target_low_poly_faces` | `int` | `50000` | Target triangle count for decimated low-poly model |
-
----
-
-## 7. Deliverables & Multi-LOD Assets (Where to Find Generated Models)
-
-Once the pipeline completes (`Pipeline completed successfully`), all deliverables are immediately accessible on your host computer inside the **`turntable_studio/output/`** folder:
-
-```text
-turntable_studio/output/
-├── glb/
-│   ├── high_model.glb          # Full-res 3D model with embedded PNG texture (Double-click to open in Windows 3D Viewer or Blender)
-│   └── low_model.glb           # Web/AR-optimized 3D model with embedded JPG texture (~50,000 faces)
-│
-├── obj/
-│   ├── high/
-│   │   ├── model_high.obj      # High-poly OBJ scaled to real-world dimensions (100x scale, ~22 cm)
-│   │   ├── model_high.mtl      # Material definition pointing to lossless PNG texture
-│   │   └── model_high_texture.png # Uncompressed master texture atlas
-│   └── low/
-│       ├── model_low.obj       # Decimated low-poly OBJ with preserved UV mapping coordinates
-│       ├── model_low.mtl       # Material definition pointing to JPG texture
-│       └── model_low_texture.jpg # Downscaled web texture atlas (max 2048px)
-│
-├── stl/
-│   ├── high_model.stl          # Watertight (2-manifold) STL with planar sliced pedestal base (Y=0mm) for 3D printing
-│   └── low_model.stl           # Decimated STL for fast slicing in Bambu Studio / PrusaSlicer / Cura
-│
-├── 3mf/
-│   ├── high_model.3mf          # Modern CAD/3D printing asset with physical millimeter scale
-│   └── low_model.3mf
-│
-├── stats.json                  # JSON telemetry report (RAM, VRAM, per-step execution timing, face counts)
-├── turntable_report.txt        # AprilTag disc calibration and angular step accuracy report
-└── output.zip                  # Complete multi-LOD archive ready for Cloudflare R2 / AWS S3 deployment
-```
-
-### Quick Guide to Opening & Using the Models:
-1. **Instant Visual Inspection:** Double-click `output/glb/high_model.glb` to open it directly in **Windows 3D Viewer** or drag-and-drop it into any web glTF viewer ([gltf-viewer.donmccurdy.com](https://gltf-viewer.donmccurdy.com/)).
-2. **3D Printing (Slicers):** Drag `output/stl/high_model.stl` or `output/3mf/high_model.3mf` directly into **Bambu Studio**, **PrusaSlicer**, or **UltiMaker Cura**. The flat base is already sliced at $Y = 0\text{ mm}$ with inward-facing normals, sitting completely flat on the virtual print bed without requiring manual mesh cutting.
-3. **CAD & VFX (Blender / Maya / 3ds Max):** Import `output/obj/high/model_high.obj` (the `.mtl` and `.png` textures are automatically linked).
-4. **Cloud Distribution:** Upload `output.zip` directly to Cloudflare R2 or Amazon S3 buckets.
-
----
-
-## 8. Multi-Engine Texturing & Optics Optimization
-
-### A. Tri-Engine Texturing Architecture
-
-Turntable Studio supports three interchangeable texturing engines via `--texturing_engine`:
-
-1. **`texrecon` (`mvs-texturing` - TU Darmstadt — Default & Recommended):**
-   - Implements the ECCV 2014 paper *"Let There Be Color! — Large-Scale Texturing of 3D Reconstructions"*.
-   - Uses Markov Random Field (MRF) Graph-Cut energy minimization with the GMI (Gradient Magnitude + Intensity) data term to choose the sharpest, least-occluded camera for each polygon chart.
-   - Applies global Poisson seam leveling and local image-space edge blending without matrix singularities.
-   - Natively textures watertight CAD meshes with zero black holes and clean UV charts.
-
-2. **`alicevision` (Meshroom Multi-Band Texturing):**
-   - Decomposes images into low and high frequency bands, blending low-frequency color gradients seamlessly while retaining crisp high-frequency details (branding, fine plastic texture).
-   - Uses direct raycasting visibility (`visibility_remapping_method="MeshItself"`).
-
-3. **`openmvs` (`TextureMesh`):**
-   - High-speed direct texturing from the reconstruction mesh.
-   - Optimized with `--cost-smoothness-ratio 1.0` (encouraging continuous charts rather than micro-confetti) and `--empty-color 0` (clean black for unobserved underside faces).
-
-### B. Optical Calibration: IMX477 3.9mm Lens (`--focal_length_mm 3.9`)
-
-> [!IMPORTANT]
-> The Arducam / Raspberry Pi HQ Camera (Sony IMX477 12MP, sensor width $6.287\text{ mm}$, resolution $4056 \times 3040$) uses manual M12 lenses **without electronic EXIF contacts**.
-> - **Lens Focal Length:** $3.9\text{ mm}$ (FOV $\approx 78^\circ$).
-> - **Focal Length in Pixels:** $f_x = 3.9 \cdot \frac{4056}{6.287} \approx \mathbf{2516.19\text{ px}}$.
-> - If left to generic defaults ($6.0\text{ mm} \implies 3870.8\text{ px}$), the $54\%$ focal length discrepancy throws camera projection rays completely off target, causing textures to appear scrambled or full of black voids. Turntable Studio defaults to $3.9\text{ mm}$ across all modules.
-
----
-
-## 9. Telemetry & Performance Monitoring
-
-The pipeline automatically benchmarks each stage and outputs a telemetry summary:
-
-```text
-==============================================================================
-                   TURNTABLE STUDIO — EXECUTION TELEMETRY
-==============================================================================
- Total Time : 1m 42.5s (102.5s)
- Peak RAM   : 4.82 GB (4935.6 MB) / 31.2 GB Total
- Peak VRAM  : 6.14 GB (6287.0 MB)
-------------------------------------------------------------------------------
- STEP NAME                        | TIME (s)   | PEAK RAM (MB)  | VRAM (MB)
-------------------------------------------------------------------------------
- 1. Camera Discovery & Init       |      0.45s |          124.0 |        -
- 2. Turntable Poses (Rigid Lock)  |      8.20s |         1420.5 |        -
- 3. Bridge SFM & Undistortion     |      5.12s |         1845.2 |        -
- 4.1 OpenMVS InterfaceCOLMAP      |      1.10s |          450.0 |        -
- 4.2 OpenMVS DensifyPointCloud    |     48.30s |         4935.6 |     6140
- 4.3 OpenMVS ReconstructMesh      |     14.80s |         3210.0 |     4200
- 4.4 OpenMVS TextureMesh          |     12.40s |         2100.4 |     3800
- 5. Watertight Base Slicing       |      3.20s |         1120.0 |        -
- 6. Multi-LOD Export              |      8.93s |         1850.0 |        -
-------------------------------------------------------------------------------
-```
-
----
-
-## 10. Troubleshooting & FAQs
-
-### Q: Why did my model appear pitch black in Blender?
-- **Cause 1 (Stale `--resume` cache):** If you ran `--resume` after changing camera intrinsics or script code, OpenMVS skipped `InterfaceCOLMAP` and projected textures using the old camera calibration, missing the object and sampling the black background. Run without `--resume` (or delete `output/openmvs`) to re-import the camera calibration.
-- **Cause 2 (Viewport Shading in Blender):** In Blender, switch from "Solid" mode to **"Material Preview"** (Z &rarr; Material Preview) or **"Rendered"** mode. Ensure your material has the image texture connected to the *Base Color* of the Principled BSDF node.
-
-### Q: Why did the low-poly model appear completely white?
-- **Cause:** Standard quadric decimation strips away vertex texture coordinates (`vt`). Turntable Studio uses `meshing_decimation_quadric_edge_collapse_with_texture` to ensure UV mapping is preserved on the decimated mesh. Ensure you are running the latest version from `main`.
-
-### Q: How do I re-texture without waiting 11 minutes for DensifyPointCloud?
-- If your point cloud `output/openmvs/scene_dense.mvs` and mesh `output/openmvs/scene_mesh.ply` are already reconstructed with the correct camera calibration:
-  ```powershell
-  python main.py --resume
-  ```
-  The pipeline will detect the existing mesh, perform base slicing, and proceed directly to `TextureMesh` and multi-LOD packaging in seconds!
+* **Pieces or holes on one level, `turntable_report.txt` RMS ≫ 3 px or a large free-pose difference on the upper
+  levels** → wrong lift: `--estimate_lift`.
+* **"Not enough RAM: DensifyPointCloud needs about X GB"** → more memory for Docker/WSL, a pod with more RAM, or
+  `--resolution_level 1` / fewer photos.
+* **DensifyPointCloud killed without a message (exit 137)** → out of memory (WSL limit); same fixes.
+* **Black model in Blender** → *Material Preview*; after `--resume` with changed poses run without `--resume`.
+* **Holes in the middle of the object, flattened plain caps** → masks and plain surfaces: see
+  `plans/AUDIT_RECONSTRUCTIE_GENERALA.md` (G1–G3) and the debugging images it lists.
+* **Red `NativeCommandError` in PowerShell** → only docker writing a warning to stderr; not an error of the run.
+* **Texture debugging** → `python tools/debug_texturing.py all --output_dir output --input_dir input_images`
+  (needs `undistorted/` in `output/`: run with `--work_dir /workspace/output`).

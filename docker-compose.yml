@@ -1,10 +1,11 @@
-version: "3.8"
-
 services:
   turntable-studio:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # stats.json records it: GIT_COMMIT=$(git rev-parse --short HEAD) docker compose build
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
     image: turntable-studio:latest
     container_name: turntable_studio_worker
     deploy:
@@ -22,4 +23,10 @@ services:
       # Mount input images and output deliverables
       - ./input_images:/workspace/input_images:ro
       - ./output:/workspace/output:rw
+      # Undistorted images + OpenMVS depth maps (~9 GB): a Docker volume is much faster than a
+      # Windows folder bind-mounted through WSL. Logs, reports and deliverables still land in ./output.
+      - turntable_work:/tmp/turntable_work
     command: ["--input_dir", "/workspace/input_images", "--output_dir", "/workspace/output", "--rig_mode", "--texturing_engine", "texrecon", "--focal_length_mm", "3.9"]
+
+volumes:
+  turntable_work:

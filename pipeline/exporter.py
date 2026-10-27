@@ -420,6 +420,65 @@ def package_textured_model(
                 pass
 
 
+DELIVERABLE_DIRS = (("obj", "high"), ("obj", "low"), ("stl",), ("3mf",), ("glb",))
+# Reports packed next to the deliverables (pose quality: RMS, lift; poses for re-use)
+REPORT_FILES = ("turntable_report.txt", "turntable_calib.json")
+
+
+def collect_log_files(output_dir: str, extra_dirs: Optional[List[str]] = None) -> Dict[str, str]:
+    """
+    Log files to pack under logs/ in output.zip: run_log.txt, the OpenMVS app logs and the texrecon logs.
+    extra_dirs: OpenMVS work directories outside output_dir (--work_dir). Returns {arcname: path}.
+    """
+    out_base = Path(output_dir).resolve()
+    logs: Dict[str, str] = {}
+    run_log = out_base / "run_log.txt"
+    if run_log.is_file():
+        logs["logs/run_log.txt"] = str(run_log)
+    openmvs_dirs = [out_base / "openmvs"] + [Path(d) for d in (extra_dirs or [])]
+    for d in openmvs_dirs:
+        for f in sorted(d.glob("*.log")) if d.is_dir() else []:
+            logs[f"logs/openmvs/{f.name}"] = str(f)
+    tr_dir = out_base / "texrecon"
+    for f in sorted(tr_dir.glob("*.log")) if tr_dir.is_dir() else []:
+        logs[f"logs/texrecon/{f.name}"] = str(f)
+    return logs
+
+
+def package_output_zip(
+    output_dir: str,
+    zip_name: str = "output.zip",
+    stats_json_path: Optional[str] = None,
+    log_files: Optional[Dict[str, str]] = None,
+) -> Path:
+    """
+    Builds output.zip: obj/, stl/, 3mf/, glb/, stats.json, turntable_report.txt,
+    turntable_calib.json and logs/ (log_files = {arcname: path}).
+    """
+    out_base = Path(output_dir).resolve()
+    zip_path = out_base / zip_name
+    logger.info(f"Packaging multi-LOD assets into ZIP archive: {zip_path}...")
+
+    with zipfile.ZipFile(str(zip_path), "w", compression=zipfile.ZIP_DEFLATED) as zipf:
+        if stats_json_path and Path(stats_json_path).is_file():
+            zipf.write(stats_json_path, arcname="stats.json")
+        for name in REPORT_FILES:
+            if (out_base / name).is_file():
+                zipf.write(out_base / name, arcname=name)
+        for parts in DELIVERABLE_DIRS:
+            folder = out_base.joinpath(*parts)
+            for root, _, files in os.walk(folder):
+                for f in sorted(files):
+                    file_p = Path(root) / f
+                    zipf.write(file_p, arcname=str(file_p.relative_to(out_base)))
+        for arcname, path in sorted((log_files or {}).items()):
+            if Path(path).is_file():
+                zipf.write(path, arcname=arcname)
+
+    logger.info(f"Created {zip_path.name} ({zip_path.stat().st_size / (1024 * 1024):.2f} MB)")
+    return zip_path
+
+
 def export_multi_lod_bundle(
     cleaned_mesh_path: str,
     textured_obj_path: Optional[str],
@@ -606,24 +665,9 @@ def export_multi_lod_bundle(
     except Exception as e:
         logger.warning(f"Low-poly 3MF export warning: {e}")
 
-    # 3. Create output.zip containing the entire tree
-    zip_path = out_base / config.zip_name
-    logger.info(f"Packaging multi-LOD assets into ZIP archive: {zip_path}...")
-
-    with zipfile.ZipFile(str(zip_path), "w", compression=zipfile.ZIP_DEFLATED) as zipf:
-        # Include stats.json if provided
-        if stats_json_path and Path(stats_json_path).is_file():
-            zipf.write(stats_json_path, arcname="stats.json")
-
-        for folder in [obj_high_dir, obj_low_dir, stl_dir, mf_dir, glb_dir]:
-            for root, _, files in os.walk(folder):
-                for f in files:
-                    file_p = Path(root) / f
-                    rel_p = file_p.relative_to(out_base)
-                    zipf.write(file_p, arcname=str(rel_p))
-
+    # 3. Create output.zip containing the entire tree (main.py repackages it at the very end with the logs)
+    zip_path = package_output_zip(str(out_base), config.zip_name, stats_json_path)
     zip_size_mb = zip_path.stat().st_size / (1024 * 1024)
-    logger.info(f"Created {zip_path.name} ({zip_size_mb:.2f} MB)")
 
     return {
         "zip_path": str(zip_path),

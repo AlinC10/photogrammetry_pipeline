@@ -6,12 +6,10 @@ InterfaceCOLMAP, DensifyPointCloud, ReconstructMesh, RefineMesh, TextureMesh.
 from __future__ import annotations
 
 import logging
-import os
 import subprocess
-import sys
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from .config import OpenMVSConfig
 
@@ -40,6 +38,8 @@ class OpenMVSRunner:
 
     def _execute_cmd(self, cmd: List[str], step_name: str) -> None:
         """Runs an external CLI command with real-time log streaming."""
+        if self.config.max_threads and self.config.max_threads > 0:
+            cmd = list(cmd) + ["--max-threads", str(self.config.max_threads)]
         logger.info(f"Executing [{step_name}]: {' '.join(cmd)}")
         t0 = time.time()
 
@@ -133,7 +133,23 @@ class OpenMVSRunner:
         self._execute_cmd(cmd, "DensifyPointCloud")
         if not out_file.is_file():
             raise FileNotFoundError(f"DensifyPointCloud output missing: {out_file}")
+        if not self.config.keep_depth_maps:
+            self.remove_depth_maps()
         return str(out_file)
+
+    def remove_depth_maps(self) -> int:
+        """Deletes depth*.dmap (only needed during fusion; ~9 GB for 120 images at level 1)."""
+        removed, freed = 0, 0
+        for dmap in self.work_dir.glob("depth*.dmap"):
+            try:
+                freed += dmap.stat().st_size
+                dmap.unlink()
+                removed += 1
+            except OSError as e:
+                logger.warning(f"Could not delete {dmap.name}: {e}")
+        if removed:
+            logger.info(f"Deleted {removed} depth maps ({freed / 1024 ** 3:.2f} GB) after fusion.")
+        return removed
 
     def run_reconstruct_mesh(
         self,

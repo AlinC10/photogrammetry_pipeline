@@ -1,6 +1,11 @@
 # ==============================================================================
 # Turntable Studio Dockerfile
-# Headless Linux + Nvidia CUDA 12 + OpenMVS v2.3.0 + Python 3.10
+# Headless Linux + Nvidia CUDA 12 + OpenMVS v2.3.0 + mvs-texturing + Python 3.10
+#
+# Two stages: everything is compiled in the -devel image; the runtime image starts from the small
+# nvidia/cuda:*-base and receives only the OpenMVS apps the pipeline runs, texrecon and the shared
+# libraries ldd says they need (docker/runtime_deps.sh), instead of the -dev packages (OpenCV, Ceres,
+# SuiteSparse...) the previous image installed. The build fails if any library is missing.
 # ==============================================================================
 
 FROM nvidia/cuda:12.2.2-devel-ubuntu22.04 AS builder
@@ -92,57 +97,62 @@ RUN git clone https://github.com/nmoehrle/mvs-texturing.git mvs-texturing && \
     cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-Wno-template-body -Wno-template-id-cdtor" .. && \
     make -j$(nproc)
 
+# 6. Runtime payload: only the OpenMVS apps the pipeline runs (no Viewer), texrecon, and their libraries
+COPY docker/runtime_deps.sh /opt/runtime_deps.sh
+RUN mkdir -p /opt/payload/bin && \
+    for app in InterfaceCOLMAP DensifyPointCloud ReconstructMesh RefineMesh TextureMesh; do \
+        cp "$(find /opt/openmvs_bin/bin -type f -name "$app" | head -n 1)" /opt/payload/bin/; \
+    done && \
+    cp /opt/mvs-texturing/build/apps/texrecon/texrecon /opt/payload/bin/ && \
+    sh /opt/runtime_deps.sh /opt/payload/lib /opt/payload/bin/*
+# Debug symbols are not needed at run time (a failed strip only costs size, so it is not fatal)
+RUN strip --strip-unneeded /opt/payload/bin/* /opt/payload/lib/*.so* 2>/dev/null || true
+
 # ==============================================================================
 # Final Runtime Stage
 # ==============================================================================
-FROM nvidia/cuda:12.2.2-runtime-ubuntu22.04
+FROM nvidia/cuda:12.2.2-base-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV OPENMVS_BIN_DIR=/usr/local/bin/OpenMVS
-ENV TEXRECON_BIN=/usr/local/bin/texrecon
+ENV TEXRECON_BIN=/usr/local/bin/OpenMVS/texrecon
 ENV PATH="${OPENMVS_BIN_DIR}:${PATH}"
+# Undistorted images and OpenMVS files: fast container disk, not the bind-mounted output folder
+ENV TURNTABLE_WORK_DIR=/tmp/turntable_work
 
-# Install Python 3.10 runtime & graphic libraries
+# Python runtime only (no python3-dev, no -dev libraries). libgl1/libglib2.0-0/libgomp1: PyMeshLab and OpenMP.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
-    python3-dev \
-    libgl1-mesa-glx \
-    libglu1-mesa \
+    libgl1 \
     libglib2.0-0 \
     libgomp1 \
-    libtbb2 \
-    libpng16-16 \
-    libjpeg-turbo8 \
-    libtiff5 \
-    libboost-iostreams1.74.0 \
-    libboost-program-options1.74.0 \
-    libboost-serialization1.74.0 \
-    libboost-filesystem1.74.0 \
-    libboost-system1.74.0 \
-    libgmp10 \
-    libmpfr6 \
-    libopencv-dev \
-    libceres-dev \
-    libsuitesparse-dev \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy OpenMVS and texrecon binaries from builder stage
-COPY --from=builder /opt/openmvs_bin/bin /usr/local/bin/OpenMVS
-COPY --from=builder /opt/mvs-texturing/build/apps/texrecon/texrecon /usr/local/bin/texrecon
+COPY --from=builder /opt/payload/bin /usr/local/bin/OpenMVS
+COPY --from=builder /opt/payload/lib /usr/local/lib/turntable
+RUN echo /usr/local/lib/turntable > /etc/ld.so.conf.d/turntable.conf && ldconfig && \
+    missing="$(for b in /usr/local/bin/OpenMVS/*; do ldd "$b" | grep 'not found' | grep -v -e libcuda -e libnvidia; done)"; \
+    if [ -n "$missing" ]; then echo "Missing shared libraries:"; echo "$missing"; exit 1; fi
 
-# Setup workspace
 WORKDIR /workspace/turntable_studio
 
-# Copy requirements and install
-COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
+# Dependencies before the code: a code change only rebuilds the last small layers
+COPY requirements-runtime.txt .
+RUN pip3 install --no-cache-dir -r requirements-runtime.txt
 
-# Copy application source code
+# Code version recorded in stats.json (.git is not copied into the image). After the pip layer, so a new
+# commit does not reinstall the Python packages:
+#   docker build --build-arg GIT_COMMIT=$(git rev-parse --short HEAD) ...
+ARG GIT_COMMIT=unknown
+ENV TURNTABLE_GIT_COMMIT=${GIT_COMMIT}
+
+# Application source code (.dockerignore keeps out images, outputs, tests, docs, plans and tools)
 COPY . .
+RUN chmod +x docker_entrypoint.sh
 
-# Default command
-ENTRYPOINT ["python3", "main.py"]
+# RunPod pod (JOB_ID set): runpod_job.py. Otherwise main.py with the given options.
+ENTRYPOINT ["./docker_entrypoint.sh"]
 CMD ["--input_dir", "/workspace/input_images", "--output_dir", "/workspace/output", "--rig_mode"]

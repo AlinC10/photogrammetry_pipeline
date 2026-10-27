@@ -64,7 +64,7 @@ To prevent dark patches, Poisson bleeding, and micro-confetti texture atlases:
 - `--empty-color 0`: Fills unobserved faces (e.g. flat cut bottom) and empty atlas areas with clean black (`RGB 0,0,0`), not neon orange.
 
 ### RULE 9: Testing & Documentation Integrity
-- All unit tests in `tests/` (43 at the time of writing) must pass before any commit.
+- All unit tests in `tests/` (78 at the time of writing) must pass before any commit.
 - Preserve existing docstrings, comments, and structure.
 
 ---
@@ -73,16 +73,27 @@ To prevent dark patches, Poisson bleeding, and micro-confetti texture atlases:
 
 ```text
 turntable_studio/
-├── main.py                     # Master CLI and pipeline execution orchestrator
-├── debug_texturing.py          # Texture diagnostics on an output/ folder (overlays, texrecon labels, validity, colours, GLB)
-├── debug_blender_compare.py    # Headless Blender: textured OBJ vs GLB materials and renders
+├── main.py                     # Master CLI and pipeline execution orchestrator (writes output/run_log.txt itself)
+├── runpod_job.py               # Inside a RunPod pod: download photos from R2, run_pipeline, upload output + status.json
+├── docker_entrypoint.sh        # Container entry: runpod_job.py when JOB_ID is set, otherwise main.py
+├── docker/runtime_deps.sh      # Copies the shared libraries of OpenMVS/texrecon into the slim runtime image
+├── requirements-runtime.txt    # Python packages of the image (requirements.txt = runtime + local tools)
+├── .env.example                # Keys for the cloud flow (.env is ignored by git and Docker)
+├── cloud/
+│   ├── cloudflare_r2.py        # R2 client, jobs/<id>/input|output layout, temporary prefix-scoped credentials
+│   ├── runpod.py               # RunPod REST pods: GPU list + min RAM/vCPU, guaranteed termination, bounded retries
+│   └── job.py                  # Whole cloud flow for one scan (upload -> pod -> download -> cleanup)
+├── tools/                      # Local only (not in the image): cloud_test_run.py, fit_ram_model.py, collect_stats.py,
+│                               #   debug_texturing.py (texture diagnostics), debug_blender_compare.py (headless Blender)
 ├── Dockerfile                  # Multi-stage CUDA 12 + OpenMVS production container
 ├── docker-compose.yml          # Container configuration with GPU passthrough
 ├── requirements.txt            # Python dependencies (NumPy, SciPy, Trimesh, PyMeshLab, etc.)
 ├── pipeline/
 │   ├── __init__.py             # Public package exports
 │   ├── config.py               # Dataclass configurations and OpenMVS binary locator
-│   ├── telemetry.py            # Hardware resource profiler (Peak RAM, VRAM, per-step timing)
+│   ├── telemetry.py            # Hardware resource profiler (Peak RAM, VRAM, per-step timing, run_info)
+│   ├── resources.py            # cgroup-aware CPUs/RAM, DensifyPointCloud RAM estimate + check, worker count
+│   ├── run_metrics.py          # stats.json features for RAM/time/quality models (hardware, disk speed, object, logs)
 │   ├── camera_init.py          # Image discovery (flat or rig/0 + rig/1) and CameraInit SFM
 │   ├── turntable_poses.py      # AprilTag disc detection and rigid pose calculation (LOCKED)
 │   ├── platan_260mm_layout.json# 260mm disc tag layout coordinates
@@ -102,6 +113,9 @@ turntable_studio/
     ├── test_texrecon_runner.py # .cam export, scene/ rebuilt per run, unseen-face patch
     ├── test_texture_prep.py    # Mesh rasterizer, PNG background exactly 0, colour gains
     ├── test_camera_init.py     # turntable_poses command line (--liftMm, --tagRefine)
+    ├── test_resources.py       # cgroup limits, RAM estimate vs measured runs, worker count
+    ├── test_run_metrics.py     # log parsers, object/mesh metrics, telemetry step fields, CSV collector
+    ├── test_cloud.py           # R2 layout, temporary credentials, pod lifecycle (in-memory S3, fake RunPod)
     └── test_telemetry.py       # RAM/VRAM profiler and timer tests
 ```
 
@@ -123,9 +137,9 @@ The following features are slated for upcoming agent implementations:
 - Compute root-mean-square error (RMSE) of AprilTag reprojections.
 - If $\text{RMSE} > 0.8\text{ px}$, trigger automatic calibration warning or recommend lens lock adjustment.
 
-### Priority 4: Serverless Cloud Deployment (RunPod + Cloudflare R2)
-- Expose `run_pipeline(job)` as a RunPod Serverless handler.
-- Automatically upload `output.zip` to Cloudflare R2 and return presigned download URLs.
+### Priority 4: Cloud Deployment (RunPod pods + Cloudflare R2) — implemented, first real run pending
+- One pod per scan (`cloud/job.py`, `runpod_job.py`); see `cloud/README.md`.
+- Pending: first measured run (`tools/cloud_test_run.py`), image pushed to a registry, GPU id list checked.
 
 ---
 
@@ -136,11 +150,11 @@ When modifying code in `turntable_studio`:
 ```bash
 # 1. Run full unit test suite
 cd turntable_studio
-uv run --with numpy --with opencv-python-headless --with scipy --with trimesh --with shapely --with mapbox-earcut --with psutil --with pillow python -m unittest discover -v -s tests
+uv run --with numpy --with opencv-python-headless --with scipy --with trimesh --with shapely --with mapbox-earcut --with psutil --with pillow --with networkx --with pymeshlab --with boto3 --with requests --with lxml python -m unittest discover -v -s tests
 
 # 2. Test CLI argument parser
 uv run --with pillow --with opencv-python-headless --with scipy --with trimesh --with shapely --with mapbox-earcut --with psutil python main.py --help
 
 # 3. Test mock execution (smoketest without OpenMVS binaries)
-python main.py --mock_openmvs --input_dir ./input_images --output_dir ./output_test
+python main.py --mock_openmvs --rig_mode --input_dir ./input_images --output_dir ./output_test
 ```

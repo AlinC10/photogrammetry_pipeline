@@ -21,7 +21,7 @@ UZ:
   python3 calibrate_intrinsics.py --images "calib/cam2/*.jpg" --serial cam2 ... --out intrinsics.json
   (al doilea apel adaugă camera în același fișier)
 
-  --serial trebuie să fie EXACT serialNumber-ul camerei din Meshroom (CameraInit → Intrinsics),
+  --serial trebuie să fie EXACT serialNumber-ul camerei din cameraInit.sfm (intrinsics),
   adică Exif:BodySerialNumber din poze (la tine: cam1 / cam2).
   --cols/--rows = numărul de COLȚURI INTERIOARE (o tablă de 10×7 pătrate are 9×6 colțuri interioare).
 
@@ -35,7 +35,7 @@ import sys
 
 import numpy as np
 
-# Windows: când Meshroom trimite ieșirea în fișierul de log, consola folosește cp1252 și
+# Windows: când ieșirea e redirecționată într-un fișier de log, consola folosește cp1252 și
 # diacriticele (ă, ș, ț) dau UnicodeEncodeError. Forțăm UTF-8 pentru ieșire.
 for _s in (sys.stdout, sys.stderr):
     try:
@@ -52,7 +52,7 @@ except ImportError:
 def main():
     ap = argparse.ArgumentParser(description="Calibrare cameră cu tablă de șah (model radialk3, ca AliceVision).")
     ap.add_argument("--images", required=True, help='pozele, cu ghilimele: "folder/*.jpg"')
-    ap.add_argument("--serial", required=True, help="serialNumber-ul camerei din Meshroom (ex: cam1)")
+    ap.add_argument("--serial", required=True, help="serialNumber-ul camerei din cameraInit.sfm (ex: cam1)")
     ap.add_argument("--cols", type=int, default=9, help="colțuri interioare pe orizontală")
     ap.add_argument("--rows", type=int, default=6, help="colțuri interioare pe verticală")
     ap.add_argument("--square", type=float, default=25.0, help="latura MĂSURATĂ a unui pătrat, în mm")
