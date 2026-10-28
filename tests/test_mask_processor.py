@@ -23,6 +23,7 @@ from pipeline.mask_processor import (
     batch_generate_masks,
     load_tag_layout,
     project_tags_to_2d,
+    tag_may_be_occluded,
 )
 
 
@@ -239,6 +240,31 @@ class TestMaskProcessor(unittest.TestCase):
         self.assertEqual(mask_bo[170, 180], 0)
         # Foreground outside the tag must remain 255
         self.assertEqual(mask_bo[100, 200], 255)
+
+
+    def test_tag_behind_the_object_is_not_blacked_out(self):
+        """Only tags whose camera ray misses the masking cylinder may be blacked out (G1)."""
+        C = np.array([0.0, 0.15, 0.40])
+
+        def tag(z, x=0.0):
+            return {"center": [x, 0.0, z], "corners": [[x - 0.01, 0.0, z - 0.01], [x + 0.01, 0.0, z - 0.01],
+                                                       [x + 0.01, 0.0, z + 0.01], [x - 0.01, 0.0, z + 0.01]]}
+
+        self.assertTrue(tag_may_be_occluded(tag(-0.10), C, 0.08, 0.001, 0.35))          # behind the object
+        self.assertFalse(tag_may_be_occluded(tag(0.10), C, 0.08, 0.001, 0.35))          # in front of it
+        self.assertFalse(tag_may_be_occluded(tag(-0.10, x=0.06), C, 0.02, 0.001, 0.35))  # ray passes beside a thin volume
+
+    @unittest.skipUnless(HAS_PIL, "PIL required for mask hole test")
+    def test_white_label_inside_the_object_stays_in_the_mask(self):
+        """A white label fails the photometric test, but a hole enclosed by the object is filled (G3)."""
+        img = np.full((300, 400, 3), [160, 160, 165], dtype=np.uint8)
+        img[50:200, 150:250] = [40, 140, 50]
+        img[90:150, 170:230] = [235, 235, 235]                          # white label
+        filled = generate_hybrid_mask(image=img, brightness_white_threshold=130.0, fill_holes=True)
+        self.assertEqual(filled[120, 200], 255)
+        self.assertEqual(filled[20, 20], 0)
+        holed = generate_hybrid_mask(image=img, brightness_white_threshold=130.0, fill_holes=False)
+        self.assertEqual(holed[120, 200], 0)
 
 
 if __name__ == "__main__":

@@ -19,9 +19,10 @@ flowchart TD
     A["Photos<br/>input_images/rig/0 and rig/1"] --> B["1. CameraInit<br/>views + intrinsics (3.9 mm lens)"]
     B --> C["2. turntable_poses<br/>AprilTags -> locked camera poses"]
     C --> D["2.5 Masks<br/>disc cylinder + colour (parallel)"]
-    D --> E["3. Bridge<br/>undistortion + COLMAP model (parallel)"]
+    D --> V["2.6 Visual hull<br/>volume carved from the masks"]
+    V --> E["3. Bridge<br/>undistortion + COLMAP model (parallel)"]
     E --> R{"RAM check"}
-    R --> F["4. OpenMVS<br/>DensifyPointCloud -> ReconstructMesh"]
+    R --> F["4. OpenMVS<br/>DensifyPointCloud -> 4.2b hull correction -> ReconstructMesh"]
     F --> G["5. Mesh cleaning<br/>cut the disc at 3 mm, close the base, repair, decimate"]
     G --> H["5.5 Texturing images<br/>PNG, mesh-silhouette masks, colour gains"]
     H --> T["4.4 texrecon<br/>(fallback: OpenMVS TextureMesh)"]
@@ -33,11 +34,13 @@ flowchart TD
 |---|---|---|
 | 1. CameraInit | Finds the photos, reads the level / step from the file name (`f_2005.jpg` = level 2, step 5), writes `cameraInit.sfm` | `pipeline/camera_init.py` |
 | 2. Poses | Detects the 12 AprilTags in every photo and fits one rigid turntable model (step angle, rotation axis, lift per level, camera intrinsics). Writes `cameras_known.sfm`, `turntable_report.txt` (RMS, lift, per-photo errors) and `turntable_calib.json` | `pipeline/turntable_poses.py` (**never modified**, called as a subprocess) |
-| 2.5 Masks | Object vs background: inside an 80 mm × 350 mm cylinder around the axis, not white, not a tag | `pipeline/mask_processor.py` |
-| 3. Bridge | Undistorts photos and masks, writes the COLMAP model OpenMVS imports (poses + 1500 synthetic tracking points) | `pipeline/bridge_sfm.py` |
+| 2.5 Masks | Object vs background: inside an 80 mm × 350 mm cylinder around the axis, not white, not a tag the object cannot cover; holes enclosed by the object (white labels) are filled | `pipeline/mask_processor.py` |
+| 2.6 Visual hull | Voxels (1.5 mm) carved by the masks of all views; its box sets the volume of the synthetic tracking points | `pipeline/visual_hull.py` |
+| 3. Bridge | Undistorts photos and masks, writes the COLMAP model OpenMVS imports (poses + 1500 synthetic tracking points inside the hull box: they set OpenMVS's ROI and depth range) | `pipeline/bridge_sfm.py` |
 | RAM check | Estimates DensifyPointCloud's RAM from photos × resolution and stops in seconds if the container cannot hold it | `pipeline/resources.py` |
 | 4. OpenMVS | Depth map per photo on the GPU, fusion into a dense point cloud, surface mesh. Depth maps are deleted after fusion | `pipeline/openmvs_runner.py` |
-| 5. Cleaning | Keeps the largest part, cuts at Y = 3 mm (removes the disc), closes the base flat, repairs, decimates to 250 k faces + a 50 k low-poly copy | `pipeline/mesh_cleaner.py`, `pipeline/exporter.py` |
+| 4.2b Hull correction | Before ReconstructMesh: drops dense points > 5 mm inside the hull fused from ≤ 3 views (wrong depths on uniform plastic, e.g. a single-colour cap) and adds hull-surface points where nothing is left. The plain cloud stays as `scene_dense_mvs.ply`; ReconstructMesh falls back to it if it fails | `pipeline/visual_hull.py` |
+| 5. Cleaning | Keeps the largest part, cuts at Y = 3 mm (removes the disc), keeps the largest part again (disc rim pieces), closes the base flat, repairs, decimates to 1 M faces + a 50 k low-poly copy | `pipeline/mesh_cleaner.py`, `pipeline/exporter.py` |
 | 5.5 Texturing images | Lossless PNGs where everything outside the mesh silhouette is exactly black, per-camera colour gains from the white paper | `pipeline/texture_prep.py`, `pipeline/mesh_masks.py` |
 | 4.4 Texturing | `texrecon` picks the best photo per face and builds the atlases; unseen faces are coloured like their neighbours | `pipeline/texrecon_runner.py` |
 | 6. Export | OBJ + MTL + PNG/JPG, GLB with embedded textures, watertight STL / 3MF at real scale, `output.zip` | `pipeline/exporter.py` |
@@ -213,6 +216,10 @@ Run `python main.py --help` for all of them. The ones that matter:
 | `--work_dir` | output dir (Docker: `/tmp/turntable_work`) | where the large intermediate files go |
 | `--keep_depth_maps` | off | keep OpenMVS `depth*.dmap` (~74 MB each) |
 | `--ram_margin` | 1.0 | safety factor on the RAM estimate before DensifyPointCloud |
+| `--no_visual_hull` | off | no hull: fixed proxy volume, no cloud correction (the behaviour before 2026-10-28) |
+| `--no_visual_hull_refine` | off | hull only for the proxy volume; ReconstructMesh gets the plain dense cloud |
+| `--visual_hull_voxel_mm` | 1.5 | hull voxel size |
+| `--densify_masks` | blackout | how DensifyPointCloud sees the masks: `blackout` (background pixels set to 0), `mask_path` (unchanged photos + OpenMVS `--mask-path`), `none` |
 | `--mock_openmvs` | off | fake geometry for quick tests |
 
 Texture tuning (texrecon seam leveling, unseen faces, mask margin, colour gains) and the OpenMVS `TextureMesh`

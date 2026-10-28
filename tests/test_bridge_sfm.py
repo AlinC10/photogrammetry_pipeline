@@ -243,5 +243,68 @@ class TestBridgeSFM(unittest.TestCase):
                 self.assertGreaterEqual(len(track_elements), 4)  # at least 2 pairs (img_id, pt2d_idx)
 
 
+    def _one_view_sfm(self, test_path, img_path):
+        sfm = {
+            "version": ["1", "0", "0"],
+            "intrinsics": [{"intrinsicId": "0", "width": 400, "height": 300, "sensorWidth": 6.287,
+                            "focalLength": 6.0, "distortionParams": [0.0, 0.0]}],
+            "views": [{"viewId": "1000", "poseId": "1000", "intrinsicId": "0", "path": str(img_path)}],
+            "poses": [{"poseId": "1000", "pose": {"transform": {
+                "rotation": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], "center": [0.0, 0.0, -0.35]}}}],
+        }
+        sfm_file = test_path / "cameras_known.sfm"
+        sfm_file.write_text(json.dumps(sfm))
+        return sfm_file
+
+    def test_generated_masks_are_found_and_applied(self):
+        """
+        mask_processor writes <viewId>_<stem>.mask.png: the bridge must find it (a return inside the candidate
+        loop used to give up after the first candidate) and black out the background, or leave the image unchanged.
+        """
+        test_path = Path(self.test_dir)
+        img_path = test_path / "rig" / "0" / "f_1000.jpg"
+        img_path.parent.mkdir(parents=True)
+        cv2.imwrite(str(img_path), np.full((300, 400, 3), 120, dtype=np.uint8))
+        masks = test_path / "masks"
+        masks.mkdir()
+        mask = np.zeros((300, 400), dtype=np.uint8)
+        mask[:, 200:] = 255
+        cv2.imwrite(str(masks / "1000_f_1000.mask.png"), mask)
+        sfm_file = self._one_view_sfm(test_path, img_path)
+
+        for blackout in (True, False):
+            und = test_path / f"undistorted_{blackout}"
+            res = convert_sfm_to_colmap(str(sfm_file), str(test_path / "colmap"), str(und), masks_src_dir=str(masks),
+                                        masks_dst_dir=str(masks), blackout_background=blackout)
+            self.assertEqual(res["masks_applied"], 1)
+            self.assertTrue((und / "1000_f_1000.mask.png").is_file())
+            out = cv2.imread(str(und / "1000_f_1000.jpg"))
+            self.assertGreater(out[150, 300].mean(), 100)
+            if blackout:
+                self.assertLess(out[150, 50].mean(), 5)
+            else:
+                self.assertGreater(out[150, 50].mean(), 100)
+
+    def test_proxy_points_follow_the_given_bounds(self):
+        """The proxy volume (DensifyPointCloud ROI and depth range) comes from proxy_bounds, not 220 mm / 85 mm."""
+        pts = generate_proxy_3d_points(n_points=1500, y_max=0.30, r_max=0.05, r_min=0.01)
+        above_base = pts[pts[:, 1] > 0.002 + 1e-9]
+        self.assertAlmostEqual(above_base[:, 1].max(), 0.30, places=6)
+        self.assertLessEqual(np.hypot(above_base[:, 0], above_base[:, 2]).max(), 0.05 + 1e-9)
+
+        test_path = Path(self.test_dir)
+        img_path = test_path / "img.jpg"
+        cv2.imwrite(str(img_path), np.zeros((300, 400, 3), dtype=np.uint8))
+        sfm_file = self._one_view_sfm(test_path, img_path)
+        convert_sfm_to_colmap(str(sfm_file), str(test_path / "colmap"), str(test_path / "und"),
+                              proxy_bounds={"y_max": 0.12, "r_max": 0.04})
+        rows = [ln.split() for ln in (test_path / "colmap" / "points3D.txt").read_text().splitlines()
+                if ln and not ln.startswith("#")]
+        xyz = np.array([[float(r[1]), float(r[2]), float(r[3])] for r in rows])
+        body = xyz[xyz[:, 1] > 0.002 + 1e-9]
+        self.assertLessEqual(body[:, 1].max(), 0.12 + 1e-6)
+        self.assertLessEqual(np.hypot(body[:, 0], body[:, 2]).max(), 0.04 + 1e-6)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2,7 +2,7 @@
 Turntable Studio - Studio-grade 3D scanning pipeline with OpenMVS.
 """
 
-from .config import PipelineConfig, OpenMVSConfig, TexReconConfig, TurntableConfig, MeshCleaningConfig, MaskingConfig, TexturingImagesConfig
+from .config import PipelineConfig, OpenMVSConfig, TexReconConfig, TurntableConfig, MeshCleaningConfig, MaskingConfig, TexturingImagesConfig, VisualHullConfig
 from .camera_init import scan_input_directory, generate_camera_init_sfm, run_turntable_poses
 from .bridge_sfm import convert_sfm_to_colmap
 from .mask_processor import batch_generate_masks, generate_hybrid_mask, apply_mask_to_image, load_tag_layout, project_tags_to_2d
@@ -25,6 +25,7 @@ __all__ = [
     "MeshCleaningConfig",
     "MaskingConfig",
     "TexturingImagesConfig",
+    "VisualHullConfig",
     "scan_input_directory",
     "generate_camera_init_sfm",
     "run_turntable_poses",

@@ -59,20 +59,26 @@ from pipeline.camera_init import (
     scan_input_directory,
 )
 from pipeline.config import (
+    MaskingConfig,
     TexReconConfig,
     TexturingImagesConfig,
     MeshCleaningConfig,
     OpenMVSConfig,
     PipelineConfig,
     TurntableConfig,
+    VisualHullConfig,
 )
 from pipeline.exporter import collect_log_files, decimate_mesh, export_multi_lod_bundle, package_output_zip
 from pipeline.mesh_cleaner import clean_and_repair_mesh
+from pipeline.mesh_masks import load_sfm_cameras
+from pipeline import visual_hull
 from pipeline.openmvs_runner import OpenMVSRunner
 from pipeline import run_metrics
 from pipeline.resources import InsufficientRamError, check_ram, describe_resources, resolve_workers
 from pipeline.telemetry import SystemTelemetry
 from pipeline.texrecon_runner import TEXRECON_DATA_TERMS
+
+DENSIFY_MASK_MODES = ("blackout", "mask_path", "none")
 from pipeline.texture_prep import prepare_texturing_images
 
 
@@ -124,7 +130,8 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         settings={k: job.get(k) for k in (
             "rig_mode", "resolution_level", "texturing_engine", "data_term", "estimate_lift", "lift_mm",
             "tag_refine", "tag_scale", "intrinsics_in", "target_low_poly_faces", "export_scale", "keep_depth_maps",
-            "mesh_texture_masks", "colour_normalize", "resume", "mock_openmvs", "ram_margin")},
+            "mesh_texture_masks", "colour_normalize", "resume", "mock_openmvs", "ram_margin", "visual_hull",
+            "visual_hull_refine", "visual_hull_voxel_mm", "densify_masks")},
     )
 
     logger.info("=" * 70)
@@ -151,6 +158,10 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             texturing_engine = "openmvs"
         elif detected_tr:
             logger.info(f"Using mvs-texturing (texrecon): {detected_tr}")
+
+    densify_masks = job.get("densify_masks", "blackout")
+    if densify_masks not in DENSIFY_MASK_MODES:
+        raise ValueError(f"densify_masks must be one of {DENSIFY_MASK_MODES}, got '{densify_masks}'")
 
     data_term = job.get("data_term", "gmi")
     if data_term not in TEXRECON_DATA_TERMS:
@@ -209,6 +220,12 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             max_radius_m=job.get("max_radius_m", 0.12),
             target_low_poly_faces=job.get("target_low_poly_faces", 50000),
             target_high_poly_faces=int(job.get("target_high_poly_faces", 1000000)),
+        ),
+        masking=MaskingConfig(densify_masks=densify_masks),
+        visual_hull=VisualHullConfig(
+            enabled=bool(job.get("visual_hull", True)),
+            refine_cloud=bool(job.get("visual_hull_refine", True)),
+            voxel_m=float(job.get("visual_hull_voxel_mm", 1.5)) / 1000.0,
         ),
         export_scale=job.get("export_scale", 100.0),
         scale_stl_to_mm=job.get("scale_stl_to_mm", True),
@@ -279,6 +296,12 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
 
         if config.use_masks and config.masking.enabled and config.masking.auto_generate:
             with telemetry.step("2.5. Automated Masking & Turntable Elimination"):
+                # Masks of an earlier scan with more photos would otherwise be picked up by name
+                stale = list(Path(masks_out_dir).rglob("*.mask.png")) if Path(masks_out_dir).is_dir() else []
+                for old_mask in stale:
+                    old_mask.unlink()
+                if stale:
+                    logger.info(f"Removed {len(stale)} mask file(s) of a previous run from {masks_out_dir}.")
                 if not mock_openmvs:
                     with open(cameras_known_sfm, "r", encoding="utf-8") as f:
                         sfm_data_mask = json.load(f)
@@ -328,20 +351,37 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                     masks_src = masks_out_dir
 
         # ----------------------------------------------------------------------
+        # STEP 2.6: Visual hull from the masks (proxy-point bounds; dense-cloud correction in 4.2b)
+        # ----------------------------------------------------------------------
+        hull = None
+        hull_path = work_path / "visual_hull.npz"
+        proxy_bounds = None
+        if config.visual_hull.enabled and not mock_openmvs and masks_src and Path(masks_src).is_dir():
+            hull = _carve_visual_hull(cameras_known_sfm, masks_src, config, str(hull_path), telemetry)
+            proxy_bounds = visual_hull.proxy_bounds_from_hull(
+                hull, config.masking.cylinder_radius_m, config.masking.cylinder_y_max_m,
+                config.visual_hull.proxy_margin_m,
+            )
+
+        # ----------------------------------------------------------------------
         # STEP 3: Convert SFM to COLMAP & Undistort Images/Masks
         # ----------------------------------------------------------------------
         colmap_dir = str(work_path / "colmap")
         undistorted_dir = str(work_path / "undistorted")
 
         with telemetry.step("3. Bridge SFM & Image Undistortion"):
-            convert_sfm_to_colmap(
+            bridge = convert_sfm_to_colmap(
                 sfm_json_path=cameras_known_sfm,
                 output_colmap_dir=colmap_dir,
                 undistorted_images_dir=undistorted_dir,
                 masks_src_dir=masks_src if masks_src and Path(masks_src).is_dir() else None,
                 masks_dst_dir=masks_out_dir if masks_src and Path(masks_src).is_dir() else None,
                 workers=workers,
+                proxy_bounds=proxy_bounds,
+                blackout_background=config.masking.densify_masks == "blackout",
             )
+        telemetry.set_info(bridge={"masks_applied": bridge.get("masks_applied"), "proxy_bounds": proxy_bounds,
+                                   "densify_masks": config.masking.densify_masks})
         telemetry.set_info(object_images=run_metrics.object_image_stats(undistorted_dir))
 
         # ----------------------------------------------------------------------
@@ -384,20 +424,38 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                     runner.run_interface_colmap(colmap_dir, undistorted_dir)
 
                 with telemetry.step("4.2 OpenMVS DensifyPointCloud"):
-                    # Architectural principle: DensifyPointCloud runs cleanly on the full scene
-                    # without mask constraints (preventing OpenMVS fail-fast aborts and edge depth voids).
-                    # Turntable disc is cleanly sliced at Y = 3.0mm by mesh_cleaner.py.
-                    # Masks are strictly used for Texturing (texrecon / TextureMesh).
+                    # densify_masks "blackout" (default): DensifyPointCloud IS masked, through the background
+                    # pixels set to 0 in undistorted/ by bridge_sfm. "mask_path": unchanged images, and OpenMVS
+                    # reads <image stem>.mask.png from undistorted/ (A/B test, plans/AUDIT_RECONSTRUCTIE_GENERALA.md
+                    # G7). The disc left in either case is sliced at Y = 3 mm by mesh_cleaner.py.
                     effective_densify_masks = (
-                        masks_out_dir
-                        if config.masking.enabled and config.masking.use_for_densify and Path(masks_out_dir).is_dir()
+                        undistorted_dir
+                        if config.masking.enabled and config.masking.densify_masks == "mask_path" and masks_src
                         else None
                     )
                     runner.run_densify(masks_dir=effective_densify_masks)
 
             if not skip_reconstruct:
+                dense_ply = openmvs_dir / "scene_dense.ply"
+                refined = False
+                if config.visual_hull.enabled and config.visual_hull.refine_cloud and dense_ply.is_file():
+                    if hull is None and hull_path.is_file():
+                        hull = visual_hull.load_hull(str(hull_path))      # resumed run
+                    if hull is not None:
+                        with telemetry.step("4.2b Visual Hull Cloud Refinement"):
+                            refined = _refine_dense_cloud(str(dense_ply), hull, cameras_known_sfm, undistorted_dir,
+                                                          config, telemetry)
+
                 with telemetry.step("4.3 OpenMVS ReconstructMesh"):
-                    runner.run_reconstruct_mesh()
+                    try:
+                        runner.run_reconstruct_mesh()
+                    except Exception as rm_err:
+                        if not (refined and visual_hull.restore_dense_cloud(str(dense_ply))):
+                            raise
+                        logger.warning(f"ReconstructMesh failed on the refined cloud ({rm_err}); "
+                                       f"retrying on the plain DensifyPointCloud output.")
+                        telemetry.set_info(visual_hull_refine_reverted=str(rm_err)[:300])
+                        runner.run_reconstruct_mesh()
 
             # Identify raw reconstructed surface geometry (.ply or .obj)
             candidate_raw_meshes = [
@@ -664,6 +722,69 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         raise
 
 
+def _carve_visual_hull(cameras_known_sfm: str, masks_dir: str, config: PipelineConfig, hull_path: str,
+                       telemetry: SystemTelemetry) -> Optional[Dict[str, Any]]:
+    """Step 2.6: hull from the masks of the original photos; None (with a warning) when it cannot be built."""
+    try:
+        with telemetry.step("2.6 Visual Hull"):
+            cams = load_sfm_cameras(cameras_known_sfm)
+            mask_paths = visual_hull.source_mask_paths(cams, masks_dir)
+            found = sum(1 for m in mask_paths if m)
+            if found < max(3, int(0.8 * len(cams))):
+                logger.warning(f"Visual hull skipped: masks found for only {found}/{len(cams)} views in {masks_dir}.")
+                return None
+            vh = config.visual_hull
+            hull = visual_hull.carve_visual_hull(
+                cams, mask_paths,
+                radius_m=config.masking.cylinder_radius_m,
+                y_min_m=config.cleaning.slice_y_m,
+                y_max_m=config.masking.cylinder_y_max_m,
+                voxel_m=vh.voxel_m,
+                min_bg_votes=vh.min_bg_votes,
+                distorted=True,
+            )
+            stats = visual_hull.hull_stats(hull)
+            telemetry.set_info(visual_hull=stats)
+            if stats.get("voxels", 0) < 100:
+                logger.warning("Visual hull is empty (masks or poses wrong?); proxy points use the masking cylinder.")
+                return None
+            visual_hull.save_hull(hull, hull_path)
+            logger.info(
+                f"Visual hull: {stats['volume_cm3']} cm3, height {stats['y_min_mm']}-{stats['y_max_mm']} mm, "
+                f"max radius {stats['radius_max_mm']} mm."
+            )
+            return hull
+    except Exception as e:
+        logger.warning(f"Visual hull failed ({e}); continuing without it.")
+        return None
+
+
+def _refine_dense_cloud(dense_ply: str, hull: Dict[str, Any], cameras_known_sfm: str, undistorted_dir: str,
+                        config: PipelineConfig, telemetry: SystemTelemetry) -> bool:
+    """Step 4.2b: prune wrong depths inside the hull and fill bare surfaces; True when the cloud was changed."""
+    vh = config.visual_hull
+    try:
+        cams = load_sfm_cameras(cameras_known_sfm)
+        images, masks = visual_hull.bridge_image_paths(cams, undistorted_dir)
+        stats = visual_hull.refine_dense_cloud_with_hull(
+            dense_ply, hull, cams, images, masks,
+            prune_depth_m=vh.prune_depth_m,
+            prune_max_views=vh.prune_max_views,
+            fill=vh.fill,
+            support_dist_m=vh.support_dist_m,
+            max_normal_y=vh.max_normal_y,
+            min_y_m=config.cleaning.slice_y_m + 0.002,
+            brightness_white_threshold=config.masking.brightness_white_threshold,
+            chroma_threshold=config.masking.chroma_threshold,
+        )
+        telemetry.set_info(visual_hull_refine=stats)
+        return bool(stats.get("pruned_inside") or stats.get("added"))
+    except Exception as e:
+        logger.warning(f"Visual hull refinement failed ({e}); ReconstructMesh uses the plain dense cloud.")
+        visual_hull.restore_dense_cloud(dense_ply)
+        return False
+
+
 def _check_densify_ram(cameras_known_sfm: str, config: PipelineConfig, job: Dict[str, Any]) -> Dict[str, Any]:
     """
     RAM estimate for DensifyPointCloud against the container RAM (resources.check_ram).
@@ -739,6 +860,10 @@ def parse_args():
     parser.add_argument("--work_dir", default=None, help="Fast directory for undistorted images and OpenMVS files (default: output_dir; env TURNTABLE_WORK_DIR)")
     parser.add_argument("--keep_depth_maps", action="store_true", help="Keep OpenMVS depth*.dmap after fusion (~74 MB per image at level 1)")
     parser.add_argument("--ram_margin", type=float, default=1.0, help="Safety factor on the DensifyPointCloud RAM estimate before starting (e.g. 1.3)")
+    parser.add_argument("--no_visual_hull", action="store_true", help="Do not carve the visual hull (proxy points use the fixed volume, no cloud refinement)")
+    parser.add_argument("--no_visual_hull_refine", action="store_true", help="Keep the hull for the proxy volume, but feed ReconstructMesh the plain DensifyPointCloud output")
+    parser.add_argument("--visual_hull_voxel_mm", type=float, default=1.5, help="Voxel size of the visual hull in mm (default: 1.5)")
+    parser.add_argument("--densify_masks", choices=list(DENSIFY_MASK_MODES), default="blackout", help="How DensifyPointCloud sees the masks: 'blackout' (background pixels set to 0, default), 'mask_path' (unchanged images + --mask-path), 'none'")
     parser.add_argument("--mock_openmvs", action="store_true", help="Simulate OpenMVS for fast testing")
     return parser.parse_args()
 
@@ -783,6 +908,10 @@ def main():
         "target_low_poly_faces": args.target_low_poly_faces,
         "target_high_poly_faces": args.target_high_poly_faces,
         "min_point_distance": args.min_point_distance,
+        "visual_hull": not args.no_visual_hull,
+        "visual_hull_refine": not args.no_visual_hull_refine,
+        "visual_hull_voxel_mm": args.visual_hull_voxel_mm,
+        "densify_masks": args.densify_masks,
         "export_scale": export_scale,
         "scale_stl_to_mm": True,
         "mock_openmvs": args.mock_openmvs,

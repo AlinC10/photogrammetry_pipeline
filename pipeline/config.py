@@ -261,10 +261,27 @@ class MaskingConfig:
     chroma_threshold: float = 20.0           # Threshold for color vs neutral background
     brightness_white_threshold: float = 135.0 # Threshold for white photo-booth wall
     safety_dilation_px: int = 1              # Edge safety margin
-    tag_blackout: bool = True                # Explicit geometric blackout of all 12 AprilTags
+    tag_blackout: bool = True                # Blackout of the AprilTags the object cannot cover (camera ray misses the cylinder)
     tag_expansion_factor: float = 1.25       # Expand tag quad by 25% to guarantee full black border suppression
     apply_to_texturing_images: bool = True   # Set background to black RGB(0,0,0) for TextureMesh / texrecon
-    use_for_densify: bool = False            # False: Densify runs cleanly on full scene; turntable is sliced at Y=1mm by mesh_cleaner
+    # How DensifyPointCloud sees the masks: "blackout" = background pixels of undistorted/ set to 0 (default),
+    # "mask_path" = images unchanged + --mask-path/--ignore-mask-label 0, "none" = images unchanged, no masks
+    densify_masks: str = "blackout"
+
+
+@dataclass
+class VisualHullConfig:
+    """Volume carved from the masks (visual_hull.py): proxy-point bounds and dense-cloud correction."""
+    enabled: bool = True                     # Carve the hull after masking; its box bounds the proxy points / ROI
+    refine_cloud: bool = True                # Prune wrong depths inside it and fill bare surfaces before ReconstructMesh
+    voxel_m: float = 0.0015                  # 1.5 mm voxels: ~15 s for 120 views
+    min_bg_votes: int = 2                    # Views that must see a voxel as background to remove it
+    proxy_margin_m: float = 0.010            # Margin around the hull box for the proxy points
+    prune_depth_m: float = 0.005             # Points deeper than this inside the hull ...
+    prune_max_views: int = 3                 # ... and fused from at most this many views are dropped
+    fill: bool = True                        # Append hull surface points where no MVS point is left
+    support_dist_m: float = 0.003            # A hull point is "bare" with no MVS point within this distance
+    max_normal_y: float = 0.8                # No fill on near-horizontal hull surfaces (the hull top is least reliable)
 
 
 @dataclass
@@ -290,6 +307,7 @@ class PipelineConfig:
     masks_dir: Optional[str] = None
     texturing_engine: str = "texrecon" # "texrecon" (mvs-texturing) or "openmvs" (TextureMesh)
     masking: MaskingConfig = field(default_factory=MaskingConfig)
+    visual_hull: VisualHullConfig = field(default_factory=VisualHullConfig)
     texturing_images: TexturingImagesConfig = field(default_factory=TexturingImagesConfig)
     texrecon: TexReconConfig = field(default_factory=TexReconConfig)
     openmvs: OpenMVSConfig = field(default_factory=OpenMVSConfig)

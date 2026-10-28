@@ -99,6 +99,17 @@ def seal_watertight_pedestal(
     # Merge duplicate coincident vertices created by the planar cut
     sliced.merge_vertices()
 
+    # The disc rim rises above the cut: before slicing it hangs on the object through the disc, after it the rim
+    # pieces are separate components (multimeter: 7 pieces at radius 118-127 mm). One object per scan: keep the largest.
+    pieces = sliced.split(only_watertight=False)
+    if len(pieces) > 1:
+        main_piece = max(pieces, key=lambda m: len(m.faces))
+        logger.info(
+            f"Dropped {len(pieces) - 1} component(s) left after the cut "
+            f"({len(sliced.faces) - len(main_piece.faces):,d} faces, e.g. disc rim pieces)."
+        )
+        sliced = main_piece
+
     # 2. Extract boundary edges (edges with only 1 adjacent face)
     # trimesh edges_unique and edges_face count
     edges = sliced.edges_sorted
@@ -308,7 +319,7 @@ def clean_and_repair_mesh(
 
         ms.meshing_repair_non_manifold_edges()
         ms.meshing_repair_non_manifold_vertices()
-        ms.meshing_close_holes(maxholesize=30)
+        ms.meshing_close_holes(maxholesize=30, newfaceselected=False)
 
         # High-Poly Conditioning: Decimate to optimal face count if needed
         # (Preserves embossed lettering/logos while eliminating micro-triangle depth noise)
@@ -321,6 +332,9 @@ def clean_and_repair_mesh(
                 f"(preserving boundaries, normal relief, and planar quadrics)..."
             )
             try:
+                # Quadric decimation does nothing while faces are selected (close_holes used to leave them selected:
+                # 640k faces instead of 250k on the multimeter)
+                ms.set_selection_none()
                 ms.meshing_decimation_quadric_edge_collapse(
                     targetfacenum=target_high,
                     preserveboundary=True,
@@ -329,10 +343,13 @@ def clean_and_repair_mesh(
                     planarquadric=True,
                     optimalplacement=True,
                 )
+                decimated = ms.current_mesh().face_number()
+                if decimated > target_high * 1.1:
+                    logger.warning(f"High-poly decimation stopped at {decimated:,d} faces (target {target_high:,d}).")
                 # Edge collapses can still leave a few non-manifold edges: repair and re-close
                 ms.meshing_repair_non_manifold_edges()
                 ms.meshing_repair_non_manifold_vertices()
-                ms.meshing_close_holes(maxholesize=30)
+                ms.meshing_close_holes(maxholesize=30, newfaceselected=False)
             except Exception as de:
                 logger.warning(f"Quadric edge collapse decimation warning: {de}")
 

@@ -149,5 +149,35 @@ class TestMeshCleaner(unittest.TestCase):
                 np.testing.assert_allclose(lengths[valid], 1.0, atol=1e-2)
 
 
+    def test_pieces_left_after_the_cut_are_dropped(self):
+        """Disc rim pieces rising above the cut become separate components: only the object is kept (G4)."""
+        obj = trimesh.creation.cylinder(radius=0.03, height=0.10)
+        obj.apply_transform(trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0]))
+        obj.apply_translation([0.0, 0.048, 0.0])                        # y from -0.002 to 0.098
+        rim = trimesh.creation.box(extents=[0.01, 0.010, 0.02])
+        rim.apply_translation([0.115, 0.003, 0.0])                     # y from -0.002 to 0.008, radius ~115 mm
+        both = trimesh.util.concatenate([obj, rim])
+
+        sealed = seal_watertight_pedestal(both, slice_y=0.003, skirt_y=0.003, max_radius=0.12)
+        self.assertEqual(len(sealed.split(only_watertight=False)), 1)
+        self.assertLess(np.hypot(sealed.vertices[:, 0], sealed.vertices[:, 2]).max(), 0.035)
+        self.assertTrue(sealed.is_watertight)
+
+    def test_high_poly_decimation_after_closing_a_hole(self):
+        """close_holes used to leave its new faces selected and the quadric decimation then did nothing (G5)."""
+        sphere = trimesh.creation.icosphere(subdivisions=6, radius=0.04)
+        sphere.apply_translation([0.0, 0.06, 0.0])
+        sphere.update_faces(np.arange(len(sphere.faces)) != 7)         # one small hole for close_holes
+        sphere.remove_unreferenced_vertices()
+        in_path = Path(self.test_dir) / "holed.obj"
+        out_path = Path(self.test_dir) / "clean.obj"
+        sphere.export(str(in_path))
+
+        config = MeshCleaningConfig(slice_y_m=0.003, skirt_bottom_y_m=0.003, target_high_poly_faces=5000)
+        res = clean_and_repair_mesh(str(in_path), str(out_path), config)
+        self.assertLessEqual(res["face_count"], 5500)
+        self.assertTrue(res["is_watertight"])
+
+
 if __name__ == "__main__":
     unittest.main()

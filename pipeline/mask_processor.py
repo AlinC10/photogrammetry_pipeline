@@ -125,6 +125,29 @@ def load_tag_layout(layout_path: Optional[Union[str, Path]] = None) -> List[Dict
         return []
 
 
+def tag_may_be_occluded(
+    tag: Dict[str, Any],
+    C: np.ndarray,
+    radius_m: float,
+    y_min_m: float,
+    y_max_m: float,
+    n_samples: int = 64,
+) -> bool:
+    """
+    True when the object can stand between the camera and the tag: a ray from the camera centre C to the tag
+    centre or one of its corners passes through the masking cylinder (the volume the object must fit in).
+    Such a tag is usually the one BEHIND the object, and its projected polygon falls on the object: blacking it out
+    cut a band across the object in every view (G1). Tags in front of the cylinder can never be covered by it.
+    """
+    pts = np.array([tag.get("center", [0.0, 0.0, 0.0])] + list(tag.get("corners", [])), dtype=np.float64)
+    C_vec = np.asarray(C, dtype=np.float64).flatten()
+    t = np.linspace(0.0, 1.0, n_samples, endpoint=False)[1:, None, None]   # (S, 1, 1): camera -> just before the tag
+    samples = C_vec + t * (pts[None, :, :] - C_vec)                          # (S, P, 3)
+    r = np.hypot(samples[..., 0], samples[..., 2])
+    inside = (r < radius_m) & (samples[..., 1] > y_min_m) & (samples[..., 1] < y_max_m)
+    return bool(np.any(inside))
+
+
 def project_tags_to_2d(
     tags: List[Dict[str, Any]],
     R: np.ndarray,
@@ -192,9 +215,11 @@ def generate_hybrid_mask(
     Generates a high-precision binary silhouette mask (0 = background, 255 = foreground).
     Guarantees that ONLY the scanned physical object is visible:
     1. 3D Bounding Cylinder projection (cuts away booth walls, aluminum rails, and turntable disc at y <= 0.001m).
-    2. Explicit geometric AprilTag blackout (forces all 12 AprilTag regions to 0/background).
+    2. Explicit geometric AprilTag blackout (forces the given tag polygons to 0/background; batch_generate_masks
+       passes only the tags the object cannot cover, see tag_may_be_occluded).
     3. Photometric segmentation (separates colorful plastic / dark rubber from bright white booth & white disc).
-    4. Connected component filtering (isolates largest component / tool, drops isolated tag fragments).
+    4. Connected component filtering (isolates largest component / tool, drops isolated tag fragments),
+       then holes enclosed by the object are filled (fill_holes).
     5. Morphological safety boundary.
     """
     # 1. Load image as RGB NumPy array
@@ -348,6 +373,17 @@ def generate_hybrid_mask(
     else:
         final_mask = (is_fg.astype(np.uint8)) * 255
 
+    # Holes completely surrounded by the object are part of it: white labels, bar codes and highlights fail the
+    # photometric test (brightness > threshold, low chroma) and used to be cut out of the mask, then out of the mesh.
+    # A real through-hole (closed handle) is filled too; DensifyPointCloud still sees the background through it.
+    # At full resolution: the bilinear upsampling above can itself open small holes.
+    if fill_holes:
+        try:
+            from scipy.ndimage import binary_fill_holes
+            final_mask = binary_fill_holes(final_mask > 0).astype(np.uint8) * 255
+        except ImportError:
+            pass
+
     # 7. Strictly enforce AprilTag blackout on final mask (overrides dilation/upsampling)
     if np.any(tag_mask):
         final_mask[tag_mask] = 0
@@ -390,6 +426,11 @@ def _mask_one_view(task: Dict[str, Any]) -> Optional[Tuple[str, str, str]]:
     R, C, K = task["R"], task["C"], task["K"]
     tags = task["tags"]
     tag_polygons = None
+    if task["tag_blackout"] and tags and C is not None:
+        # Only tags the object cannot cover; the others stay to the photometric test (they lie on the disc,
+        # which mesh_cleaner cuts at Y = 3 mm anyway)
+        tags = [t for t in tags if not tag_may_be_occluded(
+            t, C, task["cylinder_radius_m"], task["cylinder_y_min_m"], task["cylinder_y_max_m"])]
     if task["tag_blackout"] and tags and R is not None and C is not None and K is not None:
         tag_polygons = project_tags_to_2d(
             tags=tags, R=R, C=C, K=K,

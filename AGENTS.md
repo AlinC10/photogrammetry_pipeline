@@ -36,7 +36,9 @@ The system replaces the slow and noisy components of Meshroom (DepthMap, Meshing
 
 ### RULE 5: Bidirectional Covisibility Tracks for Proxy 3D Points
 - `InterfaceCOLMAP` requires valid 3D points in `points3D.txt` with multi-view observations.
-- `pipeline/bridge_sfm.py` generates 1,500 synthetic proxy 3D points inside a cylindrical bounding volume.
+- `pipeline/bridge_sfm.py` generates 1,500 synthetic proxy 3D points inside a cylindrical bounding volume: the box of the
+  visual hull (`pipeline/visual_hull.py`) plus 10 mm, or the masking cylinder without a hull. DensifyPointCloud derives
+  its ROI and per-view depth range from them, so the volume must enclose the whole object.
 - Points are projected into each camera view; only points visible in $\ge 2$ cameras are retained.
 - Triplet projections $(u, v, \text{point\_id})$ in `images.txt` and track lists $(\text{image\_id}, \text{point2d\_idx})$ in `points3D.txt` must be strictly synchronized and 0-based.
 
@@ -64,7 +66,7 @@ To prevent dark patches, Poisson bleeding, and micro-confetti texture atlases:
 - `--empty-color 0`: Fills unobserved faces (e.g. flat cut bottom) and empty atlas areas with clean black (`RGB 0,0,0`), not neon orange.
 
 ### RULE 9: Testing & Documentation Integrity
-- All unit tests in `tests/` (84 at the time of writing) must pass before any commit.
+- All unit tests in `tests/` (97 at the time of writing) must pass before any commit.
 - Preserve existing docstrings, comments, and structure.
 
 ---
@@ -98,6 +100,7 @@ turntable_studio/
 │   ├── turntable_poses.py      # AprilTag disc detection and rigid pose calculation (LOCKED)
 │   ├── platan_260mm_layout.json# 260mm disc tag layout coordinates
 │   ├── bridge_sfm.py           # SFM-to-COLMAP bridge, OpenCV undistortion, proxy 3D points
+│   ├── visual_hull.py          # Volume carved from the masks: proxy bounds, scene_dense.ply prune + fill before ReconstructMesh
 │   ├── openmvs_runner.py       # Cross-platform CLI runner for OpenMVS binaries
 │   ├── mesh_cleaner.py         # Planar slicing, skirt extrusion, Ear-Clipping base capping
 │   ├── mesh_masks.py           # Vectorised rasterizer: mesh silhouette / face-id buffers from locked poses
@@ -107,7 +110,8 @@ turntable_studio/
 │   ├── mask_processor.py       # Alpha mask utilities
 │   └── calibrate_intrinsics.py # Chessboard/Charuco camera matrix calibration
 └── tests/
-    ├── test_bridge_sfm.py      # Camera matrix, quaternion, and proxy track tests
+    ├── test_bridge_sfm.py      # Camera matrix, quaternion, proxy track tests, generated masks found and applied
+    ├── test_visual_hull.py     # Hull carving, proxy bounds, dense PLY I/O, prune + fill on a synthetic cylinder
     ├── test_mesh_cleaner.py    # 2D Ear-clipping and watertight base tests
     ├── test_exporter.py        # Multi-LOD OBJ, MTL, JPG/PNG, and GLB bundle tests (incl. multi-material GLB)
     ├── test_texrecon_runner.py # .cam export, scene/ rebuilt per run, unseen-face patch

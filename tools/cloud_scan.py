@@ -56,7 +56,8 @@ PIPELINE_OPTIONS = {
     "export_scale", "scale_stl_to_mm", "texturing_engine", "data_term", "smoothness_term", "outlier_removal",
     "texrecon_global_seam_leveling", "keep_unseen_faces", "write_intermediate_results", "mesh_texture_masks",
     "texture_mask_margin_px", "colour_normalize", "lift_mm", "estimate_lift", "tag_refine", "tag_scale", "workers",
-    "keep_depth_maps", "ram_margin", "min_point_distance", "target_high_poly_faces",
+    "keep_depth_maps", "ram_margin", "min_point_distance", "target_high_poly_faces", "visual_hull",
+    "visual_hull_refine", "visual_hull_voxel_mm", "densify_masks",
 }
 
 

@@ -163,9 +163,11 @@ def _undistort_view_images(
     undist_img_path: Path,
     masks_src_dir: Optional[str],
     masks_dst_dir: Optional[str],
+    blackout_background: bool = True,
 ) -> bool:
     """
-    Undistorts one view's image (and its mask, if one is found) and blacks out the background.
+    Undistorts one view's image (and its mask, if one is found) and blacks out the background
+    (unless `blackout_background` is False: DensifyPointCloud then reads the masks through --mask-path).
     Returns True when a mask was found. Independent per view, so it runs in a thread pool.
     """
     src_img_path = Path(v["path"])
@@ -226,19 +228,22 @@ def _undistort_view_images(
                 shutil.copy2(dst_mask_in_undist, m_dst / dst_full_mask_name)
 
             # Zero out background in undistorted image (pitch-black RGB 0,0,0 for texrecon & OpenMVS)
-            try:
-                u_img = cv2.imread(str(dst_img_path), cv2.IMREAD_COLOR)
-                u_mask = cv2.imread(str(dst_mask_in_undist), cv2.IMREAD_GRAYSCALE)
-                if u_img is not None and u_mask is not None:
-                    u_img[u_mask < 128] = 0
-                    cv2.imwrite(str(dst_img_path), u_img)
-            except Exception as m_err:
-                logger.warning(f"Failed to apply mask black-out to {dst_img_path.name}: {m_err}")
+            if blackout_background:
+                try:
+                    u_img = cv2.imread(str(dst_img_path), cv2.IMREAD_COLOR)
+                    u_mask = cv2.imread(str(dst_mask_in_undist), cv2.IMREAD_GRAYSCALE)
+                    if u_img is not None and u_mask is not None:
+                        u_img[u_mask < 128] = 0
+                        cv2.imwrite(str(dst_img_path), u_img)
+                except Exception as m_err:
+                    logger.warning(f"Failed to apply mask black-out to {dst_img_path.name}: {m_err}")
 
             found_mask = True
             break
 
-        return found_mask
+    # After the loop: the first candidate is next to the photo and rarely exists (the return used to sit inside
+    # the loop, so generated masks were never found and DensifyPointCloud got unmasked images)
+    return found_mask
 
 
 def convert_sfm_to_colmap(
@@ -248,8 +253,12 @@ def convert_sfm_to_colmap(
     masks_src_dir: Optional[str] = None,
     masks_dst_dir: Optional[str] = None,
     workers: int = 1,
+    proxy_bounds: Optional[Dict[str, float]] = None,
+    blackout_background: bool = True,
 ) -> Dict[str, Any]:
     """
+    `proxy_bounds`: {"y_max", "r_max"} of the proxy points (visual_hull.proxy_bounds_from_hull). DensifyPointCloud
+    sets its ROI and the depth range of each view from them, so they must enclose the whole object.
     Reads AliceVision cameras_known.sfm, undistorts images and masks,
     converts rotation and translation to COLMAP format, projects proxy 3D points
     to establish bidirectional tracks, and outputs cameras.txt, images.txt, points3D.txt.
@@ -324,7 +333,12 @@ def convert_sfm_to_colmap(
         poses_by_id[pose_id] = {"R": R, "C": C}
 
     # 3. Generate 1,500 proxy 3D points spanning turntable scanning volume
-    proxy_points = generate_proxy_3d_points(n_points=1500)
+    proxy_kwargs = {}
+    if proxy_bounds:
+        r_max = float(proxy_bounds["r_max"])
+        proxy_kwargs = {"y_max": float(proxy_bounds["y_max"]), "r_max": r_max, "r_min": min(0.010, r_max / 2.0)}
+        logger.info(f"Proxy points volume: height {proxy_kwargs['y_max'] * 1000:.0f} mm, radius {r_max * 1000:.0f} mm.")
+    proxy_points = generate_proxy_3d_points(n_points=1500, **proxy_kwargs)
 
     # 4. Undistort images and collect view geometry
     views = sfm.get("views", [])
@@ -378,13 +392,20 @@ def convert_sfm_to_colmap(
 
     def run_task(task) -> bool:
         tv, tc, tname = task
-        return _undistort_view_images(tv, tc, tname, undist_img_path, masks_src_dir, masks_dst_dir)
+        return _undistort_view_images(tv, tc, tname, undist_img_path, masks_src_dir, masks_dst_dir,
+                                      blackout_background)
 
     if workers == 1:
-        list(map(run_task, image_tasks))
+        found = list(map(run_task, image_tasks))
     else:
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            list(ex.map(run_task, image_tasks))
+            found = list(ex.map(run_task, image_tasks))
+    masks_applied = int(sum(found))
+    if masks_src_dir:
+        logger.info(f"Masks found for {masks_applied}/{len(image_tasks)} images "
+                    f"({'background blacked out' if blackout_background else 'images left unchanged'}).")
+        if masks_applied < len(image_tasks):
+            logger.warning(f"{len(image_tasks) - masks_applied} image(s) have no mask in {masks_src_dir}.")
 
     # Pass 1: Project points into all views to calculate visibility
     pt_visibility = {pt_idx + 1: [] for pt_idx in range(len(proxy_points))}
@@ -472,4 +493,5 @@ def convert_sfm_to_colmap(
         "undistorted_images_dir": str(undist_img_path),
         "registered_views": registered_views_count,
         "proxy_points_count": len(proxy_points),
+        "masks_applied": masks_applied,
     }
