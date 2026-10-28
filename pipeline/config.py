@@ -227,8 +227,13 @@ class MeshCleaningConfig:
     max_radius_m: float = 0.12        # Radial bounding cylinder (120 mm)
     keep_largest_only: bool = True
     remove_duplicate_faces: bool = True
-    target_low_poly_faces: int = 50000
-    target_high_poly_faces: int = 1000000 # High-poly cap (~500k vertices); denser meshes are decimated to it
+    # Decimation as a share of the sealed mesh, so every object is decimated (and denoised) a little, whatever
+    # its size. A fixed target > 0 overrides the ratio (old behaviour: 250 000 high / 50 000 low).
+    high_poly_ratio: float = 0.75         # high-poly keeps 75 % of the faces
+    low_poly_ratio: float = 0.2           # low-poly keeps 20 % of the faces of the same sealed mesh ...
+    low_poly_max_faces: int = 50000       # ... but never more than this (web model); 0 = no cap
+    target_high_poly_faces: int = 0       # 0 = use high_poly_ratio
+    target_low_poly_faces: int = 0        # 0 = use low_poly_ratio
     smooth_iterations: int = 12       # Taubin volume-preserving smoothing (eliminates 2-4mm ripples)
     high_poly_smooth_iterations: int = 5 # Taubin steps for high-poly (smooths 200um noise without loss of detail)
 

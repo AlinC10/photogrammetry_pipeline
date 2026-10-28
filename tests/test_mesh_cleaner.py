@@ -18,6 +18,7 @@ import trimesh
 from pipeline.config import MeshCleaningConfig
 from pipeline.mesh_cleaner import (
     clean_and_repair_mesh,
+    face_target,
     seal_watertight_pedestal,
     triangulate_2d_polygon,
 )
@@ -177,6 +178,28 @@ class TestMeshCleaner(unittest.TestCase):
         res = clean_and_repair_mesh(str(in_path), str(out_path), config)
         self.assertLessEqual(res["face_count"], 5500)
         self.assertTrue(res["is_watertight"])
+
+
+    def test_face_target_ratio_and_fixed(self):
+        """Decimation targets are a share of the mesh; a fixed target > 0 overrides the ratio."""
+        self.assertEqual(face_target(800000, 0.8), 640000)
+        self.assertEqual(face_target(800000, 0.2), 160000)
+        self.assertEqual(face_target(800000, 0.8, fixed=250000), 250000)
+        self.assertEqual(face_target(2000, 0.1), 1000)          # never below the minimum
+        self.assertEqual(face_target(500, 0.1), 500)            # never above the mesh itself
+        self.assertEqual(face_target(800000, 0.2, maximum=50000), 50000)    # low poly: min(20 %, 50 000)
+        self.assertEqual(face_target(100000, 0.2, maximum=50000), 20000)
+
+    def test_high_poly_ratio_decimates_every_mesh(self):
+        """With the default ratio a mesh of any size loses ~25 % of its faces (no fixed cap left it untouched)."""
+        sphere = trimesh.creation.icosphere(subdivisions=5, radius=0.04)
+        sphere.apply_translation([0.0, 0.06, 0.0])
+        in_path = Path(self.test_dir) / "sphere.obj"
+        out_path = Path(self.test_dir) / "clean.obj"
+        sphere.export(str(in_path))
+        res = clean_and_repair_mesh(str(in_path), str(out_path), MeshCleaningConfig(slice_y_m=0.003, skirt_bottom_y_m=0.003))
+        self.assertEqual(res["sealed_faces"], len(sphere.faces))
+        self.assertAlmostEqual(res["face_count"] / len(sphere.faces), 0.75, delta=0.01)
 
 
 if __name__ == "__main__":

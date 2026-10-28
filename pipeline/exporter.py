@@ -445,7 +445,7 @@ def package_textured_model(
 
 DELIVERABLE_DIRS = (("obj", "high"), ("obj", "low"), ("stl",), ("3mf",), ("glb",))
 # Reports packed next to the deliverables (pose quality: RMS, lift; poses for re-use)
-REPORT_FILES = ("turntable_report.txt", "turntable_calib.json")
+REPORT_FILES = ("object.json", "turntable_report.txt", "turntable_calib.json")
 
 
 def collect_log_files(output_dir: str, extra_dirs: Optional[List[str]] = None) -> Dict[str, str]:

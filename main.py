@@ -69,7 +69,8 @@ from pipeline.config import (
     VisualHullConfig,
 )
 from pipeline.exporter import collect_log_files, decimate_mesh, export_multi_lod_bundle, package_output_zip
-from pipeline.mesh_cleaner import clean_and_repair_mesh
+from pipeline.mesh_cleaner import clean_and_repair_mesh, face_target
+from pipeline.object_info import write_object_info
 from pipeline.mesh_masks import load_sfm_cameras
 from pipeline import visual_hull
 from pipeline.openmvs_runner import OpenMVSRunner
@@ -129,7 +130,8 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         disk=disk,
         settings={k: job.get(k) for k in (
             "rig_mode", "resolution_level", "texturing_engine", "data_term", "estimate_lift", "lift_mm",
-            "tag_refine", "tag_scale", "intrinsics_in", "target_low_poly_faces", "export_scale", "keep_depth_maps",
+            "tag_refine", "tag_scale", "intrinsics_in", "target_low_poly_faces", "target_high_poly_faces",
+            "high_poly_ratio", "low_poly_ratio", "low_poly_max_faces", "title", "export_scale", "keep_depth_maps",
             "mesh_texture_masks", "colour_normalize", "resume", "mock_openmvs", "ram_margin", "visual_hull",
             "visual_hull_refine", "visual_hull_voxel_mm", "densify_masks")},
     )
@@ -218,8 +220,11 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             slice_y_m=job.get("slice_y_m", 0.003),
             skirt_bottom_y_m=job.get("skirt_bottom_y_m", 0.000),
             max_radius_m=job.get("max_radius_m", 0.12),
-            target_low_poly_faces=job.get("target_low_poly_faces", 50000),
-            target_high_poly_faces=int(job.get("target_high_poly_faces", 1000000)),
+            high_poly_ratio=float(job.get("high_poly_ratio", 0.75)),
+            low_poly_ratio=float(job.get("low_poly_ratio", 0.2)),
+            low_poly_max_faces=int(job.get("low_poly_max_faces", 50000)),
+            target_high_poly_faces=int(job.get("target_high_poly_faces") or 0),
+            target_low_poly_faces=int(job.get("target_low_poly_faces") or 0),
         ),
         masking=MaskingConfig(densify_masks=densify_masks),
         visual_hull=VisualHullConfig(
@@ -434,6 +439,11 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                         else None
                     )
                     runner.run_densify(masks_dir=effective_densify_masks)
+                # A fresh cloud: the plain-cloud copy of a previous run (work dirs persist, e.g. the Docker
+                # volume) must not be taken for the original of this one by the 4.2b refinement
+                stale_original = openmvs_dir / "scene_dense_mvs.ply"
+                if stale_original.is_file():
+                    stale_original.unlink()
 
             if not skip_reconstruct:
                 dense_ply = openmvs_dir / "scene_dense.ply"
@@ -492,6 +502,9 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                 )
 
             telemetry.set_info(cleaned_mesh=run_metrics.mesh_quality(cleaned_obj_path, "cleaned"))
+            _resolve_low_poly_target(config, clean_res, telemetry)
+            write_object_info(cleaned_obj_path, str(out_path), job.get("title"), job.get("description"),
+                              _object_extra(job, clean_res, config))
 
             # Generate dedicated low-poly geometry for branching texturing (eliminates white untextured low-poly!)
             cleaned_low_path = out_path / "cleaned_mesh_low.obj"
@@ -628,6 +641,9 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                     output_obj_path=cleaned_obj_path,
                     config=config.cleaning,
                 )
+            _resolve_low_poly_target(config, clean_res, telemetry)
+            write_object_info(cleaned_obj_path, str(out_path), job.get("title"), job.get("description"),
+                              _object_extra(job, clean_res, config))
 
             cleaned_low_path = out_path / "cleaned_mesh_low.obj"
             try:
@@ -720,6 +736,33 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         telemetry.print_table()
         detach_run_log(run_log_handler)
         raise
+
+
+def _resolve_low_poly_target(config: PipelineConfig, clean_res: Dict[str, Any], telemetry: SystemTelemetry) -> None:
+    """
+    Low-poly face count: min(low_poly_ratio x sealed faces, low_poly_max_faces) unless a fixed target was given. Written back into
+    config.cleaning.target_low_poly_faces: the exporter's fallback decimations read the same number.
+    """
+    c = config.cleaning
+    sealed = int(clean_res.get("sealed_faces") or clean_res.get("face_count") or 0)
+    c.target_low_poly_faces = face_target(sealed, c.low_poly_ratio, c.target_low_poly_faces, minimum=500,
+                                          maximum=c.low_poly_max_faces)
+    telemetry.set_info(decimation={"sealed_faces": sealed, "high_faces": clean_res.get("face_count"),
+                                   "low_target_faces": c.target_low_poly_faces,
+                                   "high_poly_ratio": c.high_poly_ratio, "low_poly_ratio": c.low_poly_ratio,
+                                   "low_poly_max_faces": c.low_poly_max_faces})
+    logger.info(f"Face counts: sealed {sealed:,d} -> high {clean_res.get('face_count') or 0:,d}, "
+                f"low target {c.target_low_poly_faces:,d}.")
+
+
+def _object_extra(job: Dict[str, Any], clean_res: Dict[str, Any], config: PipelineConfig) -> Dict[str, Any]:
+    """Fields of object.json besides the measurements."""
+    return {
+        "job_id": job.get("job_id"),
+        "faces_high": clean_res.get("face_count"),
+        "faces_low_target": config.cleaning.target_low_poly_faces,
+        "tag_scale": job.get("tag_scale", 1.0),
+    }
 
 
 def _carve_visual_hull(cameras_known_sfm: str, masks_dir: str, config: PipelineConfig, hull_path: str,
@@ -836,8 +879,13 @@ def parse_args():
     parser.add_argument("--global_seam_leveling", type=int, default=0, help="OpenMVS global Poisson seam leveling (0=disabled to avoid dark bleeding, 1=enabled)")
     parser.add_argument("--local_seam_leveling", type=int, default=1, help="OpenMVS local seam edge blending (1=enabled, 0=disabled)")
     parser.add_argument("--min_point_distance", type=float, default=0.5, help="ReconstructMesh --min-point-distance in pixels (default 0.5; OpenMVS default 2.5: fewer points, faster Delaunay + graph-cut)")
-    parser.add_argument("--target_high_poly_faces", type=int, default=1000000, help="High-poly face cap (default 1,000,000 = ~500k vertices; denser cleaned meshes are decimated to it, 0 = never)")
-    parser.add_argument("--target_low_poly_faces", type=int, default=50000, help="Target face count for low-poly mesh (default: 50,000)")
+    parser.add_argument("--high_poly_ratio", type=float, default=0.75, help="High-poly keeps this share of the faces of the sealed mesh (default 0.75)")
+    parser.add_argument("--low_poly_ratio", type=float, default=0.2, help="Low-poly keeps this share of the faces of the sealed mesh (default 0.2) ...")
+    parser.add_argument("--low_poly_max_faces", type=int, default=50000, help="... but at most this many faces (default 50,000; 0 = no cap)")
+    parser.add_argument("--target_high_poly_faces", type=int, default=0, help="Fixed high-poly face count instead of --high_poly_ratio (0 = use the ratio)")
+    parser.add_argument("--target_low_poly_faces", type=int, default=0, help="Fixed low-poly face count instead of --low_poly_ratio (0 = use the ratio)")
+    parser.add_argument("--title", default=None, help="Object title written to object.json")
+    parser.add_argument("--description", default=None, help="Object description written to object.json")
     parser.add_argument("--export_scale", type=float, default=100.0, help="Scale factor applied to exported assets (default: 100.0 for real-world scale: 2.2mm -> 22cm)")
     parser.add_argument("--scale_to_mm", action="store_true", help="Shortcut to export OBJ in millimeters (sets export_scale=1000.0)")
     parser.add_argument("--texturing_engine", choices=["texrecon", "openmvs"], default="texrecon", help="Texturing engine: 'texrecon' (mvs-texturing, default) or 'openmvs' (TextureMesh)")
@@ -907,6 +955,11 @@ def main():
         "local_seam_leveling": args.local_seam_leveling,
         "target_low_poly_faces": args.target_low_poly_faces,
         "target_high_poly_faces": args.target_high_poly_faces,
+        "high_poly_ratio": args.high_poly_ratio,
+        "low_poly_ratio": args.low_poly_ratio,
+        "low_poly_max_faces": args.low_poly_max_faces,
+        "title": args.title,
+        "description": args.description,
         "min_point_distance": args.min_point_distance,
         "visual_hull": not args.no_visual_hull,
         "visual_hull_refine": not args.no_visual_hull_refine,

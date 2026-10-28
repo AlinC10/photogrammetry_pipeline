@@ -56,6 +56,7 @@ The pipeline must always produce the following asset structure in `output/`:
 - **Low-Poly OBJ (`output/obj/low/`):** `model_low.obj`, `model_low.mtl`, and web-optimized `model_low_texture.jpg` (downscaled, max 2048px). **Must contain valid UV texture coordinates (`vt`)**.
 - **GLB Models (`output/glb/`):** `high_model.glb` (embedded PNG texture) and `low_model.glb` (embedded JPG texture).
 - **3D Printing Assets:** Watertight `high_model.stl`, `low_model.stl`, `high_model.3mf`, `low_model.3mf`.
+- **Object Card (`output/object.json`):** title, description, length × width × height (mm) and volume (cm³) of the cleaned mesh.
 - **Package Archive:** `output.zip` containing all multi-LOD deliverables for Cloudflare R2 / S3.
 
 ### RULE 8: OpenMVS Texturing Optimization
@@ -66,7 +67,7 @@ To prevent dark patches, Poisson bleeding, and micro-confetti texture atlases:
 - `--empty-color 0`: Fills unobserved faces (e.g. flat cut bottom) and empty atlas areas with clean black (`RGB 0,0,0`), not neon orange.
 
 ### RULE 9: Testing & Documentation Integrity
-- All unit tests in `tests/` (97 at the time of writing) must pass before any commit.
+- All unit tests in `tests/` (101 at the time of writing) must pass before any commit.
 - Preserve existing docstrings, comments, and structure.
 
 ---
@@ -85,7 +86,7 @@ turntable_studio/
 │   ├── cloudflare_r2.py        # R2 client, jobs/<id>/input|output layout, temporary prefix-scoped credentials
 │   ├── runpod.py               # RunPod REST pods: GPU list + min RAM/vCPU, guaranteed termination, bounded retries
 │   └── job.py                  # Whole cloud flow for one scan (upload -> pod -> download -> cleanup)
-├── tools/                      # Local only (not in the image): cloud_scan.py, fit_ram_model.py, collect_stats.py,
+├── tools/                      # Local only (not in the image): cloud_scan.py, docker_scan.ps1, fit_ram_model.py, collect_stats.py,
 │                               #   debug_texturing.py (texture diagnostics), debug_blender_compare.py (headless Blender)
 ├── Dockerfile                  # Multi-stage CUDA 12 + OpenMVS production container
 ├── docker-compose.yml          # Container configuration with GPU passthrough
@@ -107,10 +108,12 @@ turntable_studio/
 │   ├── texture_prep.py         # texturing_images/: PNG, background exactly 0, mesh masks, per-camera colour gains
 │   ├── texrecon_runner.py      # .cam scene export (rebuilt every run) and texrecon execution
 │   ├── exporter.py             # Multi-LOD decimation, texture conversion, GLB embedding
+│   ├── object_info.py          # object.json: title, description, real size (mm) and volume of the cleaned mesh
 │   ├── mask_processor.py       # Alpha mask utilities
 │   └── calibrate_intrinsics.py # Chessboard/Charuco camera matrix calibration
 └── tests/
     ├── test_bridge_sfm.py      # Camera matrix, quaternion, proxy track tests, generated masks found and applied
+    ├── test_object_info.py     # object.json measurements independent of the turn on the disc
     ├── test_visual_hull.py     # Hull carving, proxy bounds, dense PLY I/O, prune + fill on a synthetic cylinder
     ├── test_mesh_cleaner.py    # 2D Ear-clipping and watertight base tests
     ├── test_exporter.py        # Multi-LOD OBJ, MTL, JPG/PNG, and GLB bundle tests (incl. multi-material GLB)

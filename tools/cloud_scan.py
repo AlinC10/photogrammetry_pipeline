@@ -57,7 +57,9 @@ PIPELINE_OPTIONS = {
     "texrecon_global_seam_leveling", "keep_unseen_faces", "write_intermediate_results", "mesh_texture_masks",
     "texture_mask_margin_px", "colour_normalize", "lift_mm", "estimate_lift", "tag_refine", "tag_scale", "workers",
     "keep_depth_maps", "ram_margin", "min_point_distance", "target_high_poly_faces", "visual_hull",
-    "visual_hull_refine", "visual_hull_voxel_mm", "densify_masks",
+    "visual_hull_refine", "visual_hull_voxel_mm", "densify_masks", "high_poly_ratio", "low_poly_ratio",
+    "low_poly_max_faces", "title",
+    "description",
 }
 
 
@@ -118,6 +120,8 @@ def main(argv=None) -> int:
     ap.add_argument("input_dir", nargs="?", default=str(ROOT / "input_images"),
                     help="photos (flat, or rig/0 + rig/1); default: input_images/")
     ap.add_argument("--name", default=None, help="label of the scan: job id and result folder start with it")
+    ap.add_argument("--title", default=None, help="object title in object.json (default: --name)")
+    ap.add_argument("--description", default=None, help="object description in object.json")
     ap.add_argument("--results_dir", default=str(ROOT / "results"))
     ap.add_argument("--job_id", default=None, help="reuse a job id (with --skip_upload: photos already in R2)")
     ap.add_argument("--image", default=None, help="Docker image (default: TURNTABLE_IMAGE from .env)")
@@ -147,6 +151,10 @@ def main(argv=None) -> int:
         "lift_mm": args.lift_mm,
         "texturing_engine": "texrecon",
     }
+    if args.title or args.name:
+        options["title"] = args.title or args.name
+    if args.description:
+        options["description"] = args.description
     options.update(parse_set(args.set))
     if args.mock:
         options["mock_openmvs"] = True

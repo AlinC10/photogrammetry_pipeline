@@ -40,7 +40,7 @@ flowchart TD
 | RAM check | Estimates DensifyPointCloud's RAM from photos × resolution and stops in seconds if the container cannot hold it | `pipeline/resources.py` |
 | 4. OpenMVS | Depth map per photo on the GPU, fusion into a dense point cloud, surface mesh. Depth maps are deleted after fusion | `pipeline/openmvs_runner.py` |
 | 4.2b Hull correction | Before ReconstructMesh: drops dense points > 5 mm inside the hull fused from ≤ 3 views (wrong depths on uniform plastic, e.g. a single-colour cap) and adds hull-surface points where nothing is left. The plain cloud stays as `scene_dense_mvs.ply`; ReconstructMesh falls back to it if it fails | `pipeline/visual_hull.py` |
-| 5. Cleaning | Keeps the largest part, cuts at Y = 3 mm (removes the disc), keeps the largest part again (disc rim pieces), closes the base flat, repairs, decimates to 1 M faces + a 50 k low-poly copy | `pipeline/mesh_cleaner.py`, `pipeline/exporter.py` |
+| 5. Cleaning | Keeps the largest part, cuts at Y = 3 mm (removes the disc), keeps the largest part again (disc rim pieces), closes the base flat, repairs, decimates the high poly to 75 % of its faces + a low-poly copy with min(20 %, 50 000) faces (`--high_poly_ratio`, `--low_poly_ratio`, `--low_poly_max_faces`). Writes `object.json`: title, description, length × width × height in mm, volume | `pipeline/mesh_cleaner.py`, `pipeline/exporter.py` |
 | 5.5 Texturing images | Lossless PNGs where everything outside the mesh silhouette is exactly black, per-camera colour gains from the white paper | `pipeline/texture_prep.py`, `pipeline/mesh_masks.py` |
 | 4.4 Texturing | `texrecon` picks the best photo per face and builds the atlases; unseen faces are coloured like their neighbours | `pipeline/texrecon_runner.py` |
 | 6. Export | OBJ + MTL + PNG/JPG, GLB with embedded textures, watertight STL / 3MF at real scale, `output.zip` | `pipeline/exporter.py` |
@@ -95,6 +95,16 @@ docker compose run --rm turntable-studio --input_dir /workspace/input_images --o
 
 PowerShell: `docker compose build`, then the same `docker compose run ...` line. No `| tee` is needed:
 the log is written to `output/run_log.txt` by the pipeline itself (UTF-8).
+
+With the image from Docker Hub and any folders (Windows, PowerShell, from the repository root):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\docker_scan.ps1 -Name t1 -Title "Parkside"
+powershell -ExecutionPolicy Bypass -File tools\docker_scan.ps1 -Name t2 -InputDir D:\scanari\fixativ -Extra "--densify_masks","none"
+```
+
+Photos from `-InputDir` (default `input_images\`), results in `teste\<Name>\` (or `-OutputDir`), image `-Image`
+(default `alinc10/turntable-studio:v4`); `-Extra` takes any `main.py` options.
 
 What `docker-compose.yml` mounts:
 
@@ -211,7 +221,10 @@ Run `python main.py --help` for all of them. The ones that matter:
 | `--resume` | off | reuse poses and the OpenMVS mesh |
 | `--texturing_engine` | texrecon | or `openmvs` (TextureMesh) |
 | `--data_term` | gmi | texrecon: `gmi` or `area` |
-| `--target_low_poly_faces` | 50000 | low-poly size |
+| `--high_poly_ratio` / `--low_poly_ratio` | 0.75 / 0.2 | share of the sealed mesh's faces kept in the high / low poly (every object is decimated a little) |
+| `--low_poly_max_faces` | 50000 | cap of the low poly (web model): it gets min(ratio × faces, cap) |
+| `--target_high_poly_faces` / `--target_low_poly_faces` | 0 | fixed face counts instead of the ratios (0 = use the ratios) |
+| `--title` / `--description` | – | written to `object.json` with the measured size and volume (`tools/cloud_scan.py --title`; default: `--name`) |
 | `--workers` | 0 = auto | parallel images for masks / undistortion / texturing images: `min(CPUs − 1, free RAM / 0.5 GB)` from the container limits |
 | `--work_dir` | output dir (Docker: `/tmp/turntable_work`) | where the large intermediate files go |
 | `--keep_depth_maps` | off | keep OpenMVS `depth*.dmap` (~74 MB each) |

@@ -264,6 +264,19 @@ def seal_watertight_pedestal(
     return assembled_mesh
 
 
+def face_target(faces: int, ratio: float, fixed: int = 0, minimum: int = 1000, maximum: int = 0) -> int:
+    """
+    Face count to decimate to: `fixed` when > 0, otherwise `ratio` x `faces`, capped at `maximum` (> 0), never
+    below `minimum` and never above `faces`.
+    """
+    if fixed and fixed > 0:
+        return int(fixed)
+    target = round(faces * float(ratio))
+    if maximum and maximum > 0:
+        target = min(target, maximum)
+    return int(min(faces, max(minimum, target)))
+
+
 def clean_and_repair_mesh(
     input_obj_path: str,
     output_obj_path: str,
@@ -306,6 +319,7 @@ def clean_and_repair_mesh(
     # 3. PyMeshLab manifold repair
     is_watertight = sealed.is_watertight
     volume_cm3 = None
+    sealed_faces = len(sealed.faces)
 
     try:
         import pymeshlab
@@ -321,11 +335,13 @@ def clean_and_repair_mesh(
         ms.meshing_repair_non_manifold_vertices()
         ms.meshing_close_holes(maxholesize=30, newfaceselected=False)
 
-        # High-Poly Conditioning: Decimate to optimal face count if needed
+        # High-Poly Conditioning: decimate by a share of the sealed mesh (or to a fixed target)
         # (Preserves embossed lettering/logos while eliminating micro-triangle depth noise)
         curr = ms.current_mesh()
         curr_faces = curr.face_number()
-        target_high = getattr(config, "target_high_poly_faces", 250000)
+        sealed_faces = curr_faces
+        target_high = face_target(curr_faces, getattr(config, "high_poly_ratio", 0.75),
+                                  getattr(config, "target_high_poly_faces", 0))
         if target_high and curr_faces > target_high:
             logger.info(
                 f"Conditioning High-Poly mesh: decimating from {curr_faces:,d} to {target_high:,d} faces "
@@ -412,6 +428,7 @@ def clean_and_repair_mesh(
 
     return {
         "output_path": str(out_p),
+        "sealed_faces": sealed_faces,   # before the high-poly decimation (reference of the face ratios)
         "vertex_count": v_count,
         "face_count": f_count,
         "is_watertight": is_watertight,
