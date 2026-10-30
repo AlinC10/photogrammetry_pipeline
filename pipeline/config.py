@@ -207,12 +207,17 @@ class TurntableConfig:
         default_factory=lambda: str(Path(__file__).resolve().parent / "platan_260mm_layout.json")
     )
     step_deg: float = 18.0            # 20 steps per full 360 rotation
-    tag_scale: float = 1.0
+    # Print scale of the tag sheet (measured / designed). The sheet of this rig came out of the printer at ~98 %
+    # ("fit to page"): disc 255 instead of 260 mm, tags 0-6 196 instead of 200 mm, Parkside 221.5 mm vs 226.9 mm
+    # modelled at 1.0. Set 1.0 for a sheet printed at actual size.
+    tag_scale: float = 0.98
     name_regex: str = r"(?P<level>\d)[_]?(?P<index>\d{1,4})$"
     sensor_width_mm: float = DEFAULT_SENSOR_WIDTH_MM
     default_focal_mm: float = DEFAULT_FOCAL_LENGTH_MM
-    lift_mm: float = 100.0            # Z carriage travel per level (scanner z_axis.distance_mm); turntable_poses defaults to 80
-    estimate_lift: bool = False       # True = turntable_poses estimates the real lift instead of trusting lift_mm
+    lift_mm: float = 80.0             # Z carriage travel per level the scanner commands (z_axis.distance_mm)
+    # None = automatic: estimated by turntable_poses when the scan has >= 2 levels (with one level there is nothing
+    # to estimate). The commanded 80 mm measured ~85 mm in the photos (multimeter, fixativ), so it is estimated.
+    estimate_lift: Optional[bool] = None
     tag_refine: bool = True           # Per-tag height/tilt (paper unevenness): RMS 4.09 -> 2.48 px on the Parkside set
     intrinsics_in: Optional[str] = None  # Optional chessboard calibration JSON from calibrate_intrinsics.py
 
@@ -322,6 +327,10 @@ class PipelineConfig:
     # Scaling and units
     export_scale: float = 100.0        # Default 100.0 scales raw photogrammetry mesh (2.2mm) to real-world scale (22cm / 220mm)
     scale_stl_to_mm: bool = True
+
+    # GLB geometry compressed with Draco (KHR_draco_mesh_compression): high GLB ~22 -> ~6 MB. Viewers need a
+    # Draco decoder (Blender, three.js DRACOLoader, model-viewer, Babylon); False for tools without one.
+    glb_draco: bool = True
 
     # Cloud & Artifact export
     export_zip: bool = True

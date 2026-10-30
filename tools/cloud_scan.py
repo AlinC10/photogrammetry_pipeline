@@ -9,9 +9,13 @@ results/<name>-<job_id>/ -> delete the job from R2. Not part of the Docker image
   python tools/cloud_scan.py --name fixativ                  # input_images/ -> results/fixativ-<job_id>/
   python tools/cloud_scan.py D:\\scans\\multimetru --name multimetru --set tag_scale=1.002 --set resolution_level=0
   python tools/cloud_scan.py --keep_remote                   # leave jobs/<id>/ in R2 (debugging)
+  python tools/cloud_scan.py --keep_old_jobs                 # do not delete the folders of earlier jobs in R2
   python tools/cloud_scan.py --job_id <id> --skip_upload     # retry a job whose photos are already in R2
 
 Ctrl+C at any time stops the wait and terminates the pod (photos stay in R2 for a retry).
+Before uploading, the jobs/<id>/ folders of all earlier jobs are deleted (photos and results of old scans; one scan
+runs at a time). Only jobs/: anything else in the bucket (e.g. the scanner's own folder) is never touched.
+With two cloud scans at the same time, start them with --keep_old_jobs, or the second deletes the first.
 --set takes any run_pipeline() option (see PIPELINE_OPTIONS: lift_mm, tag_scale, data_term ...); values are read
 as JSON when possible (1, 0.5, true), otherwise as text. main.py's negative flags work too: --set no_tag_refine
 is tag_refine=false. Unknown keys are refused (a typo would otherwise be silently ignored by the pod).
@@ -58,7 +62,7 @@ PIPELINE_OPTIONS = {
     "texture_mask_margin_px", "colour_normalize", "lift_mm", "estimate_lift", "tag_refine", "tag_scale", "workers",
     "keep_depth_maps", "ram_margin", "min_point_distance", "target_high_poly_faces", "visual_hull",
     "visual_hull_refine", "visual_hull_voxel_mm", "densify_masks", "high_poly_ratio", "low_poly_ratio",
-    "low_poly_max_faces", "title",
+    "low_poly_max_faces", "glb_draco", "title",
     "description",
 }
 
@@ -128,6 +132,9 @@ def main(argv=None) -> int:
     ap.add_argument("--dry_run", action="store_true", help="no upload, no pod: print the plan and the pod request")
     ap.add_argument("--skip_upload", action="store_true")
     ap.add_argument("--keep_remote", action="store_true")
+    ap.add_argument("--keep_old_jobs", action="store_true",
+                    help="keep the jobs/<id>/ folders of earlier jobs in R2 (default: all deleted before the upload; "
+                         "use this when two scans run in the cloud at the same time)")
     ap.add_argument("--mock", action="store_true",
                     help="pod runs the pipeline with simulated OpenMVS/texrecon: tests image, keys, R2 and termination")
     ap.add_argument("--yes", "-y", action="store_true", help="do not ask before starting the pod")
@@ -136,8 +143,9 @@ def main(argv=None) -> int:
                          'or the list in cloud/runpod.py)')
     ap.add_argument("--min_vcpu", type=int, default=8)
     ap.add_argument("--resolution_level", type=int, default=1)
-    ap.add_argument("--no_estimate_lift", action="store_true", help="use --lift_mm instead of estimating the lift")
-    ap.add_argument("--lift_mm", type=float, default=100.0)
+    ap.add_argument("--no_estimate_lift", action="store_true",
+                    help="use --lift_mm instead of estimating the lift (default: estimated when there are >= 2 levels)")
+    ap.add_argument("--lift_mm", type=float, default=80.0, help="lift the scanner commands per level (mm)")
     ap.add_argument("--set", action="append", metavar="KEY=VALUE", help="any run_pipeline option (repeatable)")
     args = ap.parse_args(argv)
 
@@ -147,10 +155,11 @@ def main(argv=None) -> int:
     options = {
         "rig_mode": (Path(args.input_dir) / "rig").is_dir(),
         "resolution_level": args.resolution_level,
-        "estimate_lift": not args.no_estimate_lift,
         "lift_mm": args.lift_mm,
         "texturing_engine": "texrecon",
     }
+    if args.no_estimate_lift:
+        options["estimate_lift"] = False
     if args.title or args.name:
         options["title"] = args.title or args.name
     if args.description:
@@ -179,6 +188,7 @@ def main(argv=None) -> int:
         input_dir=args.input_dir, results_dir=args.results_dir, job_id=job_id, pipeline_options=options,
         image=args.image, dry_run=args.dry_run, skip_upload=args.skip_upload, keep_remote=args.keep_remote,
         min_vcpu=args.min_vcpu,
+        delete_stale_after_s=None if args.keep_old_jobs else 0.0,
     )
     report["timings_s"]["total"] = round(time.time() - t0, 2)
 

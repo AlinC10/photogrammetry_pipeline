@@ -390,6 +390,35 @@ def download_job_output(job_id: str, dest_dir: str, bucket: Optional[str] = None
     return dest
 
 
+def delete_stale_jobs(older_than_s: float, bucket: Optional[str] = None, client=None,
+                      keep: Iterable[str] = (), now: Optional[float] = None) -> list[str]:
+    """
+    Deletes the folders jobs/<id>/ whose NEWEST object is older than `older_than_s` (photos of failed jobs that
+    were kept for a retry, jobs interrupted on this machine). A running job writes started.json / status.json, and
+    a pod never runs longer than its runtime cap, so a job untouched for longer than that cannot be running.
+    Nothing outside jobs/ is touched. Returns the deleted job ids.
+    """
+    import time as _time
+    bucket = bucket or bucket_from_env()
+    cl = _client(client)
+    newest: Dict[str, float] = {}
+    try:
+        for page in cl.get_paginator('list_objects_v2').paginate(Bucket=bucket, Prefix=JOBS_ROOT + "/"):
+            for obj in page.get('Contents', []):
+                parts = obj['Key'].split("/")
+                if len(parts) < 3 or not parts[1]:
+                    continue
+                stamp = obj['LastModified'].timestamp()
+                newest[parts[1]] = max(newest.get(parts[1], 0.0), stamp)
+    except (ClientError, BotoCoreError) as e:
+        raise R2Error(f"Could not list bucket '{bucket}': {e}") from e
+    limit = (now if now is not None else _time.time()) - older_than_s
+    stale = sorted(j for j, t in newest.items() if t < limit and j not in set(keep))
+    for job_id in stale:
+        delete_prefix(job_prefix(job_id), bucket, client=cl)
+    return stale
+
+
 # ── Temporary, prefix-scoped credentials for the pod ───────────────────────────────────────────────────────────────
 
 @dataclass

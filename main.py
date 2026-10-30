@@ -133,7 +133,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             "tag_refine", "tag_scale", "intrinsics_in", "target_low_poly_faces", "target_high_poly_faces",
             "high_poly_ratio", "low_poly_ratio", "low_poly_max_faces", "title", "export_scale", "keep_depth_maps",
             "mesh_texture_masks", "colour_normalize", "resume", "mock_openmvs", "ram_margin", "visual_hull",
-            "visual_hull_refine", "visual_hull_voxel_mm", "densify_masks")},
+            "visual_hull_refine", "visual_hull_voxel_mm", "densify_masks", "glb_draco")},
     )
 
     logger.info("=" * 70)
@@ -209,10 +209,10 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         ),
         turntable=TurntableConfig(
             step_deg=job.get("step_deg", 18.0),
-            tag_scale=job.get("tag_scale", 1.0),
+            tag_scale=float(job.get("tag_scale", TurntableConfig.tag_scale)),
             default_focal_mm=job.get("focal_length_mm", 3.9),
-            lift_mm=float(job.get("lift_mm", 100.0)),
-            estimate_lift=bool(job.get("estimate_lift", False)),
+            lift_mm=float(job.get("lift_mm", TurntableConfig.lift_mm)),
+            estimate_lift=None if job.get("estimate_lift") in (None, "auto") else bool(job["estimate_lift"]),
             tag_refine=bool(job.get("tag_refine", True)),
             intrinsics_in=job.get("intrinsics_in"),
         ),
@@ -234,6 +234,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         ),
         export_scale=job.get("export_scale", 100.0),
         scale_stl_to_mm=job.get("scale_stl_to_mm", True),
+        glb_draco=bool(job.get("glb_draco", True)),
     )
 
     try:
@@ -250,7 +251,13 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
 
             camera_init_sfm = str(out_path / "cameraInit.sfm")
             generate_camera_init_sfm(views, intrinsics, camera_init_sfm)
-        telemetry.set_info(inputs=run_metrics.input_stats(camera_init_sfm, name_regex))
+        inputs = run_metrics.input_stats(camera_init_sfm, name_regex)
+        telemetry.set_info(inputs=inputs)
+        n_levels = int((inputs or {}).get("n_levels") or 1)
+        if config.turntable.estimate_lift is None:
+            config.turntable.estimate_lift = n_levels >= 2
+            logger.info(f"Lift per level: {'estimated from the photos' if n_levels >= 2 else 'not used'} "
+                        f"({n_levels} level(s)).")
 
         # ----------------------------------------------------------------------
         # STEP 2: Calibrate and Lock Poses via TurntablePoses
@@ -289,7 +296,9 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                     json.dump(mock_data, f)
 
         if not mock_openmvs and (out_path / "turntable_report.txt").is_file():
-            telemetry.set_info(pose_quality=run_metrics.pose_quality(str(out_path / "turntable_report.txt")))
+            pose_q = run_metrics.pose_quality(str(out_path / "turntable_report.txt"))
+            telemetry.set_info(pose_quality=pose_q)
+            _check_lift(pose_q, config.turntable, n_levels, telemetry)
 
         # ----------------------------------------------------------------------
         # STEP 2.5: Automated Hybrid Background Matting & Turntable Elimination
@@ -431,7 +440,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                 with telemetry.step("4.2 OpenMVS DensifyPointCloud"):
                     # densify_masks "blackout" (default): DensifyPointCloud IS masked, through the background
                     # pixels set to 0 in undistorted/ by bridge_sfm. "mask_path": unchanged images, and OpenMVS
-                    # reads <image stem>.mask.png from undistorted/ (A/B test, plans/AUDIT_RECONSTRUCTIE_GENERALA.md
+                    # reads <image stem>.mask.png from undistorted/ (A/B test, plans/implemented/AUDIT_RECONSTRUCTIE_GENERALA.md
                     # G7). The disc left in either case is sliced at Y = 3 mm by mesh_cleaner.py.
                     effective_densify_masks = (
                         undistorted_dir
@@ -738,6 +747,26 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         raise
 
 
+def _check_lift(pose_q: Optional[Dict[str, Any]], turntable: TurntableConfig, n_levels: int,
+                telemetry: SystemTelemetry) -> None:
+    """
+    Warns when the lift estimated from the photos is far from the commanded one (steps/mm of the Z axis, lead
+    screw, or a tag sheet printed at another scale: see tag_scale) or tilted from the turntable axis.
+    """
+    if not turntable.estimate_lift or n_levels < 2 or not pose_q or pose_q.get("lift_mm") is None:
+        return
+    est, cmd = float(pose_q["lift_mm"]), float(turntable.lift_mm)
+    angle = float(pose_q.get("lift_angle_deg") or 0.0)
+    rel = (est - cmd) / cmd if cmd else 0.0
+    telemetry.set_info(lift_check={"commanded_mm": cmd, "estimated_mm": est, "difference_pct": round(100 * rel, 1),
+                                   "angle_deg": angle, "tag_scale": turntable.tag_scale})
+    if abs(rel) > 0.10:
+        logger.warning(f"Estimated lift {est:.1f} mm/level differs by {100 * rel:+.0f} % from the commanded "
+                       f"{cmd:g} mm: check the Z axis steps/mm or the tag sheet scale (tag_scale {turntable.tag_scale}).")
+    if angle > 2.0:
+        logger.warning(f"Lift direction is {angle:.1f} deg off the turntable axis: is the Z axis or the disc tilted?")
+
+
 def _resolve_low_poly_target(config: PipelineConfig, clean_res: Dict[str, Any], telemetry: SystemTelemetry) -> None:
     """
     Low-poly face count: min(low_poly_ratio x sealed faces, low_poly_max_faces) unless a fixed target was given. Written back into
@@ -761,7 +790,7 @@ def _object_extra(job: Dict[str, Any], clean_res: Dict[str, Any], config: Pipeli
         "job_id": job.get("job_id"),
         "faces_high": clean_res.get("face_count"),
         "faces_low_target": config.cleaning.target_low_poly_faces,
-        "tag_scale": job.get("tag_scale", 1.0),
+        "tag_scale": job.get("tag_scale", TurntableConfig.tag_scale),
     }
 
 
@@ -884,6 +913,7 @@ def parse_args():
     parser.add_argument("--low_poly_max_faces", type=int, default=50000, help="... but at most this many faces (default 50,000; 0 = no cap)")
     parser.add_argument("--target_high_poly_faces", type=int, default=0, help="Fixed high-poly face count instead of --high_poly_ratio (0 = use the ratio)")
     parser.add_argument("--target_low_poly_faces", type=int, default=0, help="Fixed low-poly face count instead of --low_poly_ratio (0 = use the ratio)")
+    parser.add_argument("--no_draco", action="store_true", help="GLB without Draco geometry compression (for viewers without a Draco decoder)")
     parser.add_argument("--title", default=None, help="Object title written to object.json")
     parser.add_argument("--description", default=None, help="Object description written to object.json")
     parser.add_argument("--export_scale", type=float, default=100.0, help="Scale factor applied to exported assets (default: 100.0 for real-world scale: 2.2mm -> 22cm)")
@@ -899,11 +929,13 @@ def parse_args():
     parser.add_argument("--no_mesh_texture_masks", action="store_true", help="Texture from the bridge JPEGs + photometric masks instead of PNGs masked by the cleaned mesh")
     parser.add_argument("--texture_mask_margin_px", type=int, default=2, help="Dilation (px) of the mesh silhouette used as texturing mask (default: 2)")
     parser.add_argument("--no_colour_normalize", action="store_true", help="Disable per-camera colour gains measured on the turntable paper")
-    parser.add_argument("--lift_mm", type=float, default=100.0, help="Carriage lift per level in mm passed to turntable_poses --liftMm (default: 100, scanner z_axis.distance_mm)")
-    parser.add_argument("--estimate_lift", action="store_true", help="Let turntable_poses estimate the real lift per level")
+    parser.add_argument("--lift_mm", type=float, default=TurntableConfig.lift_mm, help="Carriage lift per level the scanner commands, mm (default: 80); used as is with --no_estimate_lift, otherwise only to warn when the estimate differs by > 10 %%")
+    lift = parser.add_mutually_exclusive_group()
+    lift.add_argument("--estimate_lift", dest="estimate_lift", action="store_const", const=True, default=None, help="Always estimate the lift per level from the photos (default: automatic, when there are >= 2 levels)")
+    lift.add_argument("--no_estimate_lift", dest="estimate_lift", action="store_const", const=False, help="Trust --lift_mm instead of estimating the lift")
     parser.add_argument("--no_tag_refine", action="store_true", help="Disable turntable_poses --tagRefine (per-tag paper unevenness)")
     parser.add_argument("--intrinsics_in", default=None, help="Chessboard intrinsics JSON from calibrate_intrinsics.py, passed to turntable_poses --intrinsicsIn")
-    parser.add_argument("--tag_scale", type=float, default=1.0, help="Print scale of the tag sheet: measured / designed distance (e.g. 0-6 centres: measured mm / 200), passed to turntable_poses --tagScale")
+    parser.add_argument("--tag_scale", type=float, default=TurntableConfig.tag_scale, help="Print scale of the tag sheet: measured / designed distance (e.g. 0-6 centres: measured mm / 200), passed to turntable_poses --tagScale (default 0.98: this rig's sheet; 1.0 for a sheet printed at actual size)")
     parser.add_argument("--workers", type=int, default=0, help="Parallel workers for masks, undistortion and texturing images (0 = automatic from CPUs and free RAM; env TURNTABLE_WORKERS)")
     parser.add_argument("--work_dir", default=None, help="Fast directory for undistorted images and OpenMVS files (default: output_dir; env TURNTABLE_WORK_DIR)")
     parser.add_argument("--keep_depth_maps", action="store_true", help="Keep OpenMVS depth*.dmap after fusion (~74 MB per image at level 1)")
@@ -958,6 +990,7 @@ def main():
         "high_poly_ratio": args.high_poly_ratio,
         "low_poly_ratio": args.low_poly_ratio,
         "low_poly_max_faces": args.low_poly_max_faces,
+        "glb_draco": not args.no_draco,
         "title": args.title,
         "description": args.description,
         "min_point_distance": args.min_point_distance,

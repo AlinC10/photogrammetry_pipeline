@@ -4,5 +4,5 @@
 
 -r requirements-runtime.txt
 
-# .env loading for tools/cloud_test_run.py and the Pi (the pod gets plain environment variables)
+# .env loading for tools/cloud_scan.py and the Pi (the pod gets plain environment variables)
 python-dotenv>=1.0.0

@@ -282,18 +282,62 @@ class TestExporter(unittest.TestCase):
         js, binc = _read_glb(glb_path)
         self.assertEqual(len(js["materials"]), 3)
         self.assertEqual(len(js["images"]), 3)
+        # One object in Blender / viewers: one node, one mesh, one primitive per material
+        self.assertEqual(js["nodes"], [{"name": "model", "mesh": 0}])
+        self.assertEqual(len(js["meshes"]), 1)
+        self.assertEqual(len(js["meshes"][0]["primitives"]), 3)
         seen = {}
-        for mesh in js["meshes"]:
-            for prim in mesh["primitives"]:
-                mat = js["materials"][prim["material"]]
-                tex = mat["pbrMetallicRoughness"]["baseColorTexture"]["index"]
-                img = js["images"][js["textures"][tex]["source"]]
-                bv = js["bufferViews"][img["bufferView"]]
-                raw = binc[bv.get("byteOffset", 0): bv.get("byteOffset", 0) + bv["byteLength"]]
-                pixel = Image.open(io.BytesIO(raw)).convert("RGB").getpixel((32, 32))
-                seen[mesh["name"]] = pixel
+        names = list(colours)
+        for prim in js["meshes"][0]["primitives"]:
+            mat = js["materials"][prim["material"]]
+            tex = mat["pbrMetallicRoughness"]["baseColorTexture"]["index"]
+            img = js["images"][js["textures"][tex]["source"]]
+            bv = js["bufferViews"][img["bufferView"]]
+            raw = binc[bv.get("byteOffset", 0): bv.get("byteOffset", 0) + bv["byteLength"]]
+            pixel = Image.open(io.BytesIO(raw)).convert("RGB").getpixel((32, 32))
+            triangle = int(round(js["accessors"][prim["attributes"]["POSITION"]]["min"][0]))   # triangle i starts at x = i
+            seen[names[triangle]] = pixel
         self.assertEqual(seen, colours)
         self.assertIn("KHR_materials_unlit", js.get("extensionsUsed", []))
+
+    def test_draco_compressed_glb(self):
+        """Draco keeps one object, the textures and the geometry (to the quantization step) and shrinks the GLB."""
+        try:
+            import DracoPy
+        except ImportError:
+            self.skipTest("DracoPy not installed")
+        from pipeline.exporter import draco_compress_glb
+        folder = Path(self.test_dir) / "draco"
+        folder.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (64, 64), color=(200, 40, 40)).save(str(folder / "model_material0000_map_Kd.png"))
+        (folder / "model.mtl").write_text("newmtl material0000\nKd 1 1 1\nmap_Kd model_material0000_map_Kd.png\n")
+        sphere = trimesh.creation.icosphere(subdivisions=5, radius=0.05)
+        uv = (sphere.vertices[:, :2] / 0.1 + 0.5)
+        lines = ["mtllib model.mtl\n"] + [f"v {x:.6f} {y:.6f} {z:.6f}\n" for x, y, z in sphere.vertices]
+        lines += [f"vt {u:.6f} {v:.6f}\n" for u, v in uv] + ["usemtl material0000\n"]
+        lines += [f"f {a + 1}/{a + 1} {b + 1}/{b + 1} {c + 1}/{c + 1}\n" for a, b, c in sphere.faces]
+        (folder / "model.obj").write_text("".join(lines))
+        plain = folder / "plain.glb"
+        convert_obj_to_glb(folder / "model.obj", plain, compress_textures=False)
+        packed = folder / "packed.glb"
+        convert_obj_to_glb(folder / "model.obj", packed, compress_textures=False, draco=True)
+
+        self.assertLess(packed.stat().st_size, 0.5 * plain.stat().st_size)
+        js, binc = _read_glb(packed)
+        self.assertIn("KHR_draco_mesh_compression", js["extensionsRequired"])
+        self.assertEqual(len(js["nodes"]), 1)
+        prim = js["meshes"][0]["primitives"][0]
+        ext = prim["extensions"]["KHR_draco_mesh_compression"]
+        bv = js["bufferViews"][ext["bufferView"]]
+        dec = DracoPy.decode(binc[bv.get("byteOffset", 0): bv.get("byteOffset", 0) + bv["byteLength"]])
+        self.assertEqual(len(dec.faces), len(sphere.faces))
+        pos = {a["unique_id"]: np.asarray(a["data"]) for a in dec.attributes}[ext["attributes"]["POSITION"]]
+        self.assertLess(np.abs(np.sort(pos, axis=0) - np.sort(sphere.vertices, axis=0)).max(), 1e-4)
+        self.assertEqual(js["accessors"][prim["attributes"]["POSITION"]]["count"], len(pos))
+        img = js["images"][0]
+        ibv = js["bufferViews"][img["bufferView"]]
+        raw = binc[ibv.get("byteOffset", 0): ibv.get("byteOffset", 0) + ibv["byteLength"]]
+        self.assertEqual(Image.open(io.BytesIO(raw)).convert("RGB").getpixel((5, 5)), (200, 40, 40))
 
     def test_textures_fallback_does_not_mix_lods(self):
         """Without map_Kd in the MTL, model_textured.obj must not pick model_textured_low_* atlases."""

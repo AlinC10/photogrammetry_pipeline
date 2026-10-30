@@ -6,6 +6,7 @@ scipy>=1.10.0
 opencv-python-headless>=4.7.0.72
 pillow>=10.0.0
 pymeshlab>=2023.12
+DracoPy>=1.4.0          # Draco compression of the GLB geometry (KHR_draco_mesh_compression)
 trimesh>=4.0.0
 networkx>=3.0          # trimesh graph operations (connected components)
 lxml>=4.9.0            # trimesh 3MF export

@@ -6,6 +6,7 @@ and packaging into output.zip matching Cloudflare R2 specifications.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -104,6 +105,188 @@ def decimate_mesh(
     shutil.copy2(in_p, out_p)
 
 
+_GLTF_COMPONENT = {5120: np.int8, 5121: np.uint8, 5122: np.int16, 5123: np.uint16, 5125: np.uint32, 5126: np.float32}
+_GLTF_WIDTH = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4}
+DRACO_EXT = "KHR_draco_mesh_compression"
+
+
+def _read_glb(path: Path) -> Tuple[dict, bytes]:
+    data = path.read_bytes()
+    import struct
+    magic, _, total = struct.unpack("<III", data[:12])
+    if magic != 0x46546C67:
+        raise ValueError(f"{path.name} is not a GLB")
+    off, js, binc = 12, None, b""
+    while off < total:
+        length, kind = struct.unpack("<II", data[off:off + 8])
+        chunk = data[off + 8:off + 8 + length]
+        if kind == 0x4E4F534A:
+            js = json.loads(chunk.decode("utf-8"))
+        elif kind == 0x004E4942:
+            binc = chunk
+        off += 8 + length
+    return js, binc
+
+
+def _write_glb(path: Path, js: dict, binc: bytes) -> None:
+    import struct
+    jb = json.dumps(js, separators=(",", ":")).encode("utf-8")
+    jb += b" " * (-len(jb) % 4)
+    binc += b"\0" * (-len(binc) % 4)
+    total = 12 + 8 + len(jb) + 8 + len(binc)
+    with open(path, "wb") as f:
+        f.write(struct.pack("<III", 0x46546C67, 2, total))
+        f.write(struct.pack("<II", len(jb), 0x4E4F534A) + jb)
+        f.write(struct.pack("<II", len(binc), 0x004E4942) + binc)
+
+
+def draco_compress_glb(glb_path: Union[str, Path], position_bits: int = 14, texcoord_bits: int = 14,
+                       normal_bits: int = 10, level: int = 7) -> Optional[Dict[str, float]]:
+    """
+    Compresses the geometry of every triangle primitive of a GLB with Draco (KHR_draco_mesh_compression), in place.
+    Geometry is ~95 % of the GLB (positions, normals, UVs, indices); textures are untouched.
+    Position quantization of 14 bits over a ~0.25 m object is ~0.015 mm; UVs at 14 bits are 1/4 texel on a
+    4096 atlas. Viewers need a Draco decoder (Blender, three.js DRACOLoader, model-viewer, Babylon have one).
+    Returns {"before_mb", "after_mb"} or None when DracoPy is missing or the GLB has nothing to compress.
+    """
+    try:
+        import DracoPy
+    except ImportError:
+        logger.warning("[GLB] DracoPy not installed: GLB left without Draco compression.")
+        return None
+    path = Path(glb_path)
+    js, binc = _read_glb(path)
+    before = path.stat().st_size
+    views = js.get("bufferViews", [])
+    accessors = js.get("accessors", [])
+
+    def read(acc_idx: int) -> np.ndarray:
+        acc = accessors[acc_idx]
+        bv = views[acc["bufferView"]]
+        dtype = _GLTF_COMPONENT[acc["componentType"]]
+        width = _GLTF_WIDTH[acc["type"]]
+        start = bv.get("byteOffset", 0) + acc.get("byteOffset", 0)
+        stride = bv.get("byteStride")
+        if stride and stride != np.dtype(dtype).itemsize * width:
+            raise ValueError("interleaved GLB attributes are not supported")
+        return np.frombuffer(binc, dtype, acc["count"] * width, start).reshape(acc["count"], width)
+
+    draco_blobs: List[bytes] = []
+    geometry_views = set()
+    for mesh in js.get("meshes", []):
+        for prim in mesh.get("primitives", []):
+            attrs = prim.get("attributes", {})
+            if prim.get("mode", 4) != 4 or "indices" not in prim or "POSITION" not in attrs:
+                continue
+            if DRACO_EXT in prim.get("extensions", {}):
+                continue
+            pos = read(attrs["POSITION"]).astype(np.float64)
+            faces = read(prim["indices"]).reshape(-1, 3).astype(np.int64)
+            kwargs = {}
+            if "TEXCOORD_0" in attrs:
+                kwargs["tex_coord"] = read(attrs["TEXCOORD_0"]).astype(np.float64)
+                kwargs["tex_coord_quantization_bits"] = texcoord_bits
+            if "NORMAL" in attrs:
+                kwargs["normals"] = read(attrs["NORMAL"]).astype(np.float64)
+                kwargs["normal_quantization_bits"] = normal_bits
+            blob = DracoPy.encode(pos, faces, quantization_bits=position_bits, compression_level=level,
+                                  preserve_order=False, **kwargs)
+            # Attribute ids and counts as the decoder will see them
+            dec = DracoPy.decode(blob)
+            ids = {a["attribute_type"]: a["unique_id"] for a in dec.attributes}
+            draco_attrs = {"POSITION": ids[0]}
+            if "NORMAL" in attrs:
+                draco_attrs["NORMAL"] = ids[1]
+            if "TEXCOORD_0" in attrs:
+                draco_attrs["TEXCOORD_0"] = ids[3]
+            n_points = len(dec.points)
+            for key, acc_idx in [(k, attrs[k]) for k in draco_attrs] + [("indices", prim["indices"])]:
+                acc = accessors[acc_idx]
+                geometry_views.add(acc.pop("bufferView", None))
+                acc.pop("byteOffset", None)
+                acc["count"] = int(len(dec.faces) * 3 if key == "indices" else n_points)
+                if key == "POSITION":
+                    pts = np.asarray(dec.points, dtype=np.float64)
+                    acc["min"], acc["max"] = pts.min(axis=0).tolist(), pts.max(axis=0).tolist()
+                if key == "indices":
+                    acc["componentType"] = 5125
+            prim.setdefault("extensions", {})[DRACO_EXT] = {"bufferView": None, "attributes": draco_attrs}
+            draco_blobs.append(blob)
+            prim["_draco_index"] = len(draco_blobs) - 1
+    if not draco_blobs:
+        return None
+
+    # New binary chunk: the views still in use (textures) + one view per Draco blob, re-indexed
+    keep = [i for i in range(len(views)) if i not in geometry_views]
+    remap, new_views, chunks, offset = {}, [], [], 0
+    for i in keep:
+        bv = views[i]
+        data = binc[bv.get("byteOffset", 0):bv.get("byteOffset", 0) + bv["byteLength"]]
+        pad = -offset % 4
+        chunks.append(b"\0" * pad)
+        offset += pad
+        remap[i] = len(new_views)
+        new_views.append({k: v for k, v in bv.items() if k not in ("byteOffset", "byteStride", "target")} |
+                         {"buffer": 0, "byteOffset": offset, "byteLength": len(data)})
+        chunks.append(data)
+        offset += len(data)
+    blob_view = []
+    for blob in draco_blobs:
+        pad = -offset % 4
+        chunks.append(b"\0" * pad)
+        offset += pad
+        blob_view.append(len(new_views))
+        new_views.append({"buffer": 0, "byteOffset": offset, "byteLength": len(blob)})
+        chunks.append(blob)
+        offset += len(blob)
+    for img in js.get("images", []):
+        if "bufferView" in img:
+            img["bufferView"] = remap[img["bufferView"]]
+    for acc in accessors:
+        if "bufferView" in acc:
+            acc["bufferView"] = remap[acc["bufferView"]]
+    for mesh in js.get("meshes", []):
+        for prim in mesh.get("primitives", []):
+            if "_draco_index" in prim:
+                prim["extensions"][DRACO_EXT]["bufferView"] = blob_view[prim.pop("_draco_index")]
+    js["bufferViews"] = new_views
+    js["buffers"] = [{"byteLength": offset}]
+    for key in ("extensionsUsed", "extensionsRequired"):
+        if DRACO_EXT not in js.setdefault(key, []):
+            js[key].append(DRACO_EXT)
+    _write_glb(path, js, b"".join(chunks))
+    after = path.stat().st_size
+    logger.info(f"[GLB] Draco: {path.name} {before / 1e6:.1f} MB -> {after / 1e6:.1f} MB")
+    return {"before_mb": round(before / 1e6, 2), "after_mb": round(after / 1e6, 2)}
+
+
+def merge_into_one_object(tree: dict, name: str) -> bool:
+    """
+    trimesh exports one glTF node + mesh per OBJ material, so a high poly textured on 8 atlases opened in Blender
+    as 8 objects ("material0000" ...) that had to be selected together to move the model. Rewrites the tree into
+    ONE node and ONE mesh holding one primitive per material (one object with several material slots); the
+    textures keep their resolution. Skipped when a node carries a transform (not the case for an OBJ).
+    Returns True when the tree was changed.
+    """
+    nodes = tree.get("nodes") or []
+    meshes = tree.get("meshes") or []
+    if not meshes:
+        return False
+    identity = [1.0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 1.0]
+    for node in nodes:
+        m = node.get("matrix")
+        if (m is not None and any(abs(a - b) > 1e-9 for a, b in zip(m, identity))) or any(
+                k in node for k in ("translation", "rotation", "scale", "children")):
+            return False
+    primitives = [prim for mesh in meshes for prim in mesh.get("primitives", [])]
+    primitives.sort(key=lambda prim: prim.get("material", 0))
+    tree["meshes"] = [{"name": name, "primitives": primitives}]
+    tree["nodes"] = [{"name": name, "mesh": 0}]
+    tree["scenes"] = [{"nodes": [0]}]
+    tree["scene"] = 0
+    return True
+
+
 def convert_obj_to_glb(
     obj_folder_or_path: Union[str, Path],
     glb_path: Union[str, Path],
@@ -125,7 +308,7 @@ def convert_obj_to_glb(
     :param glb_path: Path where the output GLB file will be saved.
     :param compress_textures: Whether to compress textures to JPEG.
     :param jpeg_quality: Quality for JPEG texture compression (default 85).
-    :param draco: Whether to apply Draco compression (reserved for future extensions).
+    :param draco: Whether to compress the geometry with Draco (KHR_draco_mesh_compression, needs DracoPy).
     """
     p = Path(obj_folder_or_path).resolve()
     if p.is_dir():
@@ -181,6 +364,7 @@ def convert_obj_to_glb(
             for mat in tree.get('materials', []):
                 mat['doubleSided'] = True
                 mat.setdefault('extensions', {})['KHR_materials_unlit'] = {}
+            merge_into_one_object(tree, out_glb_p.stem)
 
         try:
             glb_data = trimesh.exchange.gltf.export_glb(scene, tree_postprocessor=gltf_unlit_postproc)
@@ -190,6 +374,14 @@ def convert_obj_to_glb(
 
         with open(str(out_glb_p), "wb") as gf:
             gf.write(glb_data)
+        if draco:
+            try:
+                draco_compress_glb(out_glb_p, position_bits=draco_bits, level=draco_level)
+            except Exception as de:
+                # The uncompressed GLB is still valid: rewrite it rather than leave a half-converted file
+                logger.warning(f"[GLB] Draco compression failed ({de}); keeping the uncompressed GLB.")
+                with open(str(out_glb_p), "wb") as gf:
+                    gf.write(glb_data)
 
         logger.info(f"[GLB] Successfully exported {out_glb_p.name} ({len(glb_data) / 1024 / 1024:.2f} MB)")
 
@@ -631,6 +823,7 @@ def export_multi_lod_bundle(
                 obj_folder_or_path=high_obj,
                 glb_path=high_glb,
                 compress_textures=False,  # High-poly retains lossless PNG texture
+                draco=getattr(config, "glb_draco", True),
             )
             telemetry.record_mesh(str(high_glb))
         except Exception as ge:
@@ -645,6 +838,7 @@ def export_multi_lod_bundle(
                 glb_path=low_glb,
                 compress_textures=True,  # Low-poly compresses textures to web-optimized JPEG
                 jpeg_quality=85,
+                draco=getattr(config, "glb_draco", True),
             )
             telemetry.record_mesh(str(low_glb))
         except Exception as ge:

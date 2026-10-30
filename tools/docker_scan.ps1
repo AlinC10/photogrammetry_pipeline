@@ -21,7 +21,7 @@ New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 if (-not $Title) { $Title = $Name }
 
 $args_main = @("--input_dir", "/workspace/input_images", "--output_dir", "/workspace/output", "--rig_mode",
-               "--estimate_lift", "--title", $Title) + $Extra
+               "--title", $Title) + $Extra
 Write-Host "Scan $Name : $InputDir -> $OutputDir ($Image) $($Extra -join ' ')"
 $t0 = Get-Date
 docker run --rm --gpus all `

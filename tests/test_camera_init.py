@@ -22,10 +22,13 @@ class TestTurntablePosesCommand(unittest.TestCase):
     def test_lift_and_tag_refine_are_passed(self):
         cfg = TurntableConfig()
         cmd = build_turntable_poses_cmd(Path("turntable_poses.py"), "cameraInit.sfm", "cameras_known.sfm", cfg)
-        # the script's own default is 80 mm, the scanner raises 100 mm per level
-        self.assertEqual(float(self._opt(cmd, "--liftMm")), 100.0)
+        # the scanner commands 80 mm per level; estimate_lift None (automatic, decided by main.py from the level
+        # count) is passed as False when the config is used directly
+        self.assertEqual(float(self._opt(cmd, "--liftMm")), 80.0)
         self.assertEqual(self._opt(cmd, "--estimateLift"), "False")
         self.assertEqual(self._opt(cmd, "--tagRefine"), "True")
+        # the rig's tag sheet was printed at ~98 %
+        self.assertAlmostEqual(float(self._opt(cmd, "--tagScale")), 0.98)
         self.assertNotIn("--intrinsicsIn", cmd)
 
     def test_custom_options(self):

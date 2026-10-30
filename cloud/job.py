@@ -100,12 +100,16 @@ def run_cloud_job(
     skip_upload: bool = False,
     keep_remote: bool = False,
     min_vcpu: int = DEFAULT_MIN_VCPU,
+    delete_stale_after_s: Optional[float] = None,
     cancel_event=None,
     on_progress: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """
     Runs one scan in the cloud. pipeline_options go to run_pipeline() in the pod (e.g. {"rig_mode": True,
     "estimate_lift": True}). Returns a report with timings, the pod used, the cost estimate and the result folder.
+    delete_stale_after_s: first delete the jobs/<id>/ folders left in R2 by older jobs untouched for that long
+    (r2.delete_stale_jobs; 0 = every older job, None = keep them). This job and anything outside jobs/ (e.g. the
+    scanner's own folder) are never touched.
     """
     say = on_progress or logger.info
     options = dict(pipeline_options or {})
@@ -127,6 +131,15 @@ def run_cloud_job(
     r2.preflight(bucket, client=client, prefix=r2.job_prefix(job_id) + "_preflight/")
     t["preflight"] = round(time.time() - t0, 2)
     say(f"R2 preflight ok ({t['preflight']} s)")
+
+    if delete_stale_after_s is not None and not dry_run:
+        try:
+            stale = r2.delete_stale_jobs(delete_stale_after_s, bucket, client=client, keep=[job_id])
+            report["deleted_stale_jobs"] = stale
+            if stale:
+                say(f"Deleted {len(stale)} old job folder(s) from R2: {', '.join(stale)}")
+        except r2.R2Error as e:
+            say(f"Could not clean old jobs from R2 (continuing): {e}")
 
     expected = [r2.input_key(job_id, rel) for rel in files]
     if not skip_upload and not dry_run:

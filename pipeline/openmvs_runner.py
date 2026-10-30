@@ -6,10 +6,13 @@ InterfaceCOLMAP, DensifyPointCloud, ReconstructMesh, RefineMesh, TextureMesh.
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 import time
 from pathlib import Path
 from typing import List, Optional, Tuple
+
+import numpy as np
 
 from .config import OpenMVSConfig
 
@@ -19,6 +22,89 @@ logger = logging.getLogger("TurntableStudio.OpenMVS")
 class OpenMVSError(RuntimeError):
     """Raised when an OpenMVS executable returns a non-zero exit code."""
     pass
+
+
+_PLY_TYPES = {"int8": "i1", "char": "i1", "uint8": "u1", "uchar": "u1", "int16": "<i2", "short": "<i2",
+              "uint16": "<u2", "ushort": "<u2", "int32": "<i4", "int": "<i4", "uint32": "<u4", "uint": "<u4",
+              "float32": "<f4", "float": "<f4", "float64": "<f8", "double": "<f8"}
+
+
+def textured_ply_to_obj(ply_path: str, obj_path: str) -> str:
+    """
+    Converts the textured PLY TextureMesh writes (vertex x/y/z; face vertex_indices + texcoord, texnumber with
+    several atlases; "comment TextureFile <png>" per atlas) into OBJ + MTL next to it, referencing the same PNGs.
+    TextureMesh v2.3.0 crashes (SIGSEGV) while writing OBJ after texturing, so it exports PLY and this converts.
+    The texcoords are already in the OBJ convention (v up): written unchanged.
+    """
+    ply_p, obj_p = Path(ply_path), Path(obj_path)
+    data = ply_p.read_bytes()
+    end = data.index(b"end_header\n") + len(b"end_header\n")
+    header = data[:end].decode("ascii", errors="replace").splitlines()
+    if "format binary_little_endian 1.0" not in header:
+        raise OpenMVSError(f"{ply_p.name}: expected a binary little-endian PLY")
+    textures = [ln.split(maxsplit=2)[2] for ln in header if ln.startswith("comment TextureFile ")]
+
+    elements, current = [], None
+    for ln in header:
+        parts = ln.split()
+        if parts[:1] == ["element"]:
+            current = {"name": parts[1], "count": int(parts[2]), "props": []}
+            elements.append(current)
+        elif parts[:1] == ["property"] and current is not None:
+            current["props"].append(parts[1:])
+    offset = end
+    arrays = {}
+    for el in elements:
+        if el["name"] == "vertex":
+            fields = [(pr[-1], _PLY_TYPES[pr[0]]) for pr in el["props"]]
+            arr = np.frombuffer(data, np.dtype(fields), el["count"], offset)
+        elif el["name"] == "face":
+            # Triangles with 3 indices and 6 texcoords: fixed-size records (checked below)
+            fields = []
+            for pr in el["props"]:
+                if pr[0] == "list":
+                    n = 3 if pr[-1] == "vertex_indices" else 6
+                    fields += [(pr[-1] + "_n", _PLY_TYPES[pr[1]]), (pr[-1], _PLY_TYPES[pr[2]], n)]
+                else:
+                    fields.append((pr[-1], _PLY_TYPES[pr[0]]))
+            arr = np.frombuffer(data, np.dtype(fields), el["count"], offset)
+            if not (np.all(arr["vertex_indices_n"] == 3) and np.all(arr["texcoord_n"] == 6)):
+                raise OpenMVSError(f"{ply_p.name}: only triangles with 3 texcoords are supported")
+        else:
+            raise OpenMVSError(f"{ply_p.name}: unexpected element {el['name']}")
+        arrays[el["name"]] = arr
+        offset += arr.nbytes
+    if "face" not in arrays or "texcoord" not in arrays["face"].dtype.names:
+        raise OpenMVSError(f"{ply_p.name}: no texture coordinates")
+
+    v = arrays["vertex"]
+    f = arrays["face"]
+    faces = f["vertex_indices"].astype(np.int64) + 1
+    uv = f["texcoord"].reshape(-1, 2)
+    tex_index = f["texnumber"].astype(np.int64) if "texnumber" in f.dtype.names else np.zeros(len(f), np.int64)
+    corner = np.arange(1, 3 * len(f) + 1).reshape(-1, 3)
+
+    mtl_p = obj_p.with_suffix(".mtl")
+    with open(mtl_p, "w", encoding="utf-8") as m:
+        for i, tex in enumerate(textures or [""]):
+            m.write(f"newmtl material_{i}\nKa 1 1 1\nKd 1 1 1\nKs 0 0 0\nillum 1\n")
+            if tex:
+                m.write(f"map_Kd {tex}\n")
+            m.write("\n")
+    with open(obj_p, "w", encoding="utf-8") as o:
+        o.write(f"mtllib {mtl_p.name}\n")
+        np.savetxt(o, np.stack([v["x"], v["y"], v["z"]], 1), fmt="v %.6f %.6f %.6f")
+        np.savetxt(o, uv, fmt="vt %.6f %.6f")
+        for i in range(max(1, len(textures))):
+            sel = tex_index == i
+            if not sel.any():
+                continue
+            o.write(f"usemtl material_{i}\n")
+            rows = np.stack([faces[sel, 0], corner[sel, 0], faces[sel, 1], corner[sel, 1],
+                             faces[sel, 2], corner[sel, 2]], 1)
+            np.savetxt(o, rows, fmt="f %d/%d %d/%d %d/%d")
+    logger.info(f"Converted {ply_p.name} -> {obj_p.name} ({len(f):,d} faces, {len(textures)} texture(s))")
+    return str(obj_p)
 
 
 class OpenMVSRunner:
@@ -244,12 +330,18 @@ class OpenMVSRunner:
 
         out_file = self.work_dir / output_mvs
         expected_obj = self.work_dir / f"{out_file.stem}.obj"
+        expected_ply = self.work_dir / f"{out_file.stem}.ply"
+        for stale in (expected_obj, expected_ply):
+            if stale.is_file():
+                stale.unlink()
 
+        # --export-type ply: TextureMesh v2.3.0 finishes texturing, then dies with SIGSEGV (-11) while writing OBJ
+        # (reproduced with the v4 image on the fixativ, any mesh); the PLY export works and is converted below.
         cmd = [
             bin_path,
             str(in_file),
             "-o", str(out_file),
-            "--export-type", "obj",
+            "--export-type", "ply",
             "--resolution-level", "0",
             "--empty-color", str(self.config.empty_color),
             "--cost-smoothness-ratio", str(self.config.cost_smoothness_ratio),
@@ -268,6 +360,8 @@ class OpenMVSRunner:
 
         self._execute_cmd(cmd, "TextureMesh")
 
+        if expected_ply.is_file():
+            textured_ply_to_obj(str(expected_ply), str(expected_obj))
         if not expected_obj.is_file():
             # Check if obj was exported with another name
             candidate_objs = list(self.work_dir.glob("*.obj"))

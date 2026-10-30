@@ -54,7 +54,7 @@ The system replaces the slow and noisy components of Meshroom (DepthMap, Meshing
 The pipeline must always produce the following asset structure in `output/`:
 - **High-Poly OBJ (`output/obj/high/`):** `model_high.obj`, `model_high.mtl`, and lossless `model_high_texture.png`.
 - **Low-Poly OBJ (`output/obj/low/`):** `model_low.obj`, `model_low.mtl`, and web-optimized `model_low_texture.jpg` (downscaled, max 2048px). **Must contain valid UV texture coordinates (`vt`)**.
-- **GLB Models (`output/glb/`):** `high_model.glb` (embedded PNG texture) and `low_model.glb` (embedded JPG texture).
+- **GLB Models (`output/glb/`):** `high_model.glb` (embedded PNG texture) and `low_model.glb` (embedded JPG texture), each ONE object (one primitive per atlas), geometry Draco-compressed (`--no_draco` to disable).
 - **3D Printing Assets:** Watertight `high_model.stl`, `low_model.stl`, `high_model.3mf`, `low_model.3mf`.
 - **Object Card (`output/object.json`):** title, description, length × width × height (mm) and volume (cm³) of the cleaned mesh.
 - **Package Archive:** `output.zip` containing all multi-LOD deliverables for Cloudflare R2 / S3.
@@ -67,7 +67,7 @@ To prevent dark patches, Poisson bleeding, and micro-confetti texture atlases:
 - `--empty-color 0`: Fills unobserved faces (e.g. flat cut bottom) and empty atlas areas with clean black (`RGB 0,0,0`), not neon orange.
 
 ### RULE 9: Testing & Documentation Integrity
-- All unit tests in `tests/` (101 at the time of writing) must pass before any commit.
+- All unit tests in `tests/` (104 at the time of writing) must pass before any commit.
 - Preserve existing docstrings, comments, and structure.
 
 ---
@@ -116,6 +116,7 @@ turntable_studio/
     ├── test_object_info.py     # object.json measurements independent of the turn on the disc
     ├── test_visual_hull.py     # Hull carving, proxy bounds, dense PLY I/O, prune + fill on a synthetic cylinder
     ├── test_mesh_cleaner.py    # 2D Ear-clipping and watertight base tests
+    ├── test_openmvs_runner.py  # TextureMesh PLY (texcoord, texnumber) -> OBJ + MTL conversion
     ├── test_exporter.py        # Multi-LOD OBJ, MTL, JPG/PNG, and GLB bundle tests (incl. multi-material GLB)
     ├── test_texrecon_runner.py # .cam export, scene/ rebuilt per run, unseen-face patch
     ├── test_texture_prep.py    # Mesh rasterizer, PNG background exactly 0, colour gains
@@ -157,7 +158,7 @@ When modifying code in `turntable_studio`:
 ```bash
 # 1. Run full unit test suite
 cd turntable_studio
-uv run --with numpy --with opencv-python-headless --with scipy --with trimesh --with shapely --with mapbox-earcut --with psutil --with pillow --with networkx --with pymeshlab --with boto3 --with requests --with lxml python -m unittest discover -v -s tests
+uv run --with numpy --with opencv-python-headless --with scipy --with trimesh --with shapely --with mapbox-earcut --with psutil --with pillow --with networkx --with pymeshlab --with boto3 --with requests --with lxml --with DracoPy python -m unittest discover -v -s tests
 
 # 2. Test CLI argument parser
 uv run --with pillow --with opencv-python-headless --with scipy --with trimesh --with shapely --with mapbox-earcut --with psutil python main.py --help

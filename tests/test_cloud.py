@@ -4,6 +4,7 @@ with an in-memory S3 and a fake RunPod API (no network).
 """
 
 import io
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import shutil
@@ -25,6 +26,7 @@ class FakeS3:
 
     def __init__(self):
         self.objects = {}
+        self.mtimes = {}          # (bucket, key) -> LastModified; objects without one count as written "now"
 
     def upload_file(self, file_name, bucket, key):
         self.objects[(bucket, key)] = Path(file_name).read_bytes()
@@ -58,9 +60,13 @@ class FakeS3:
     def get_paginator(self, _name):
         store = self.objects
 
+        mtimes = self.mtimes
+
         class Pager:
             def paginate(self, Bucket, Prefix=""):
-                yield {"Contents": [{"Key": k} for (b, k) in sorted(store) if b == Bucket and k.startswith(Prefix)]}
+                now = datetime.now(timezone.utc)
+                yield {"Contents": [{"Key": k, "LastModified": mtimes.get((b, k), now)}
+                                    for (b, k) in sorted(store) if b == Bucket and k.startswith(Prefix)]}
         return Pager()
 
 
@@ -103,6 +109,34 @@ class TestR2Layout(unittest.TestCase):
         self.s3 = FakeS3()
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp)
+
+    def test_delete_stale_jobs_only_touches_old_job_folders(self):
+        """Old failed jobs go; a job written recently (may be running), the current job and other prefixes stay."""
+        old = datetime.now(timezone.utc) - timedelta(hours=5)
+        for key in ("jobs/old/input/rig/0/f_1000.jpg", "jobs/old/output/status.json"):
+            self.s3.put_object(Bucket=BUCKET, Key=key, Body=b"x")
+            self.s3.mtimes[(BUCKET, key)] = old
+        # old photos but a fresh started.json: still running
+        self.s3.put_object(Bucket=BUCKET, Key="jobs/running/input/f.jpg", Body=b"x")
+        self.s3.mtimes[(BUCKET, "jobs/running/input/f.jpg")] = old
+        self.s3.put_object(Bucket=BUCKET, Key="jobs/running/output/started.json", Body=b"{}")
+        self.s3.put_object(Bucket=BUCKET, Key="jobs/mine/input/f.jpg", Body=b"x")
+        self.s3.mtimes[(BUCKET, "jobs/mine/input/f.jpg")] = old
+        self.s3.put_object(Bucket=BUCKET, Key="scans/f.jpg", Body=b"x")      # the scanner's own folder
+        self.s3.mtimes[(BUCKET, "scans/f.jpg")] = old
+
+        deleted = r2.delete_stale_jobs(2 * 3600, BUCKET, client=self.s3, keep=["mine"])
+        self.assertEqual(deleted, ["old"])
+        keys = {k for (_, k) in self.s3.objects}
+        self.assertFalse(any(k.startswith("jobs/old/") for k in keys))
+        self.assertIn("jobs/running/input/f.jpg", keys)
+        self.assertIn("jobs/mine/input/f.jpg", keys)
+        self.assertIn("scans/f.jpg", keys)
+
+        # cloud_scan's default: every earlier job goes, the current one and other prefixes stay
+        self.assertEqual(r2.delete_stale_jobs(0, BUCKET, client=self.s3, keep=["mine"], now=1e12), ["running"])
+        keys = {k for (_, k) in self.s3.objects}
+        self.assertEqual(keys, {"jobs/mine/input/f.jpg", "scans/f.jpg"})
 
     def test_keys(self):
         self.assertEqual(r2.input_key("j1", "rig\\0/f_1000.jpg"), "jobs/j1/input/rig/0/f_1000.jpg")

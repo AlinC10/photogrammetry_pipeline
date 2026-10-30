@@ -75,6 +75,7 @@ cp .env.example .env       # fill in the keys and TURNTABLE_IMAGE
 python tools/cloud_scan.py --dry_run    # preflight + estimate + the pod request (secrets redacted); no pod
 python tools/cloud_scan.py              # full flow; prints timings, the pod used and the cost estimate
 python tools/cloud_scan.py --keep_remote                 # leave jobs/<id>/ in R2
+python tools/cloud_scan.py --keep_old_jobs               # keep earlier jobs in R2 (default: all jobs/ folders deleted first)
 python tools/cloud_scan.py --job_id <id> --skip_upload   # retry with the photos already in R2
 ```
 

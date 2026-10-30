@@ -341,31 +341,55 @@ class TestTexReconRunner(unittest.TestCase):
                          ["model_textured_low.obj", "model_textured_low_material0000_map_Kd.png"])
 
     def test_fill_unseen_face_texels(self):
-        """--keep_unseen_faces maps all unseen faces to one black 3x3 patch: it is repainted with the neighbours' colour."""
+        """
+        --keep_unseen_faces maps all unseen faces to one black 3x3 patch: each unseen face now takes the colour of
+        the textured faces around it (black next to black, green next to green), in its own small atlas.
+        """
         out = self.work_p / "unseen"
         out.mkdir(parents=True, exist_ok=True)
         size = 256
         padding = size >> 7
         atlas = np.zeros((size, size, 3), np.uint8)
-        atlas[:128, :] = (40, 160, 60)                       # textured faces, RGB
+        atlas[:128, :128] = (40, 160, 60)                    # green region, RGB
+        atlas[:128, 128:] = (10, 10, 10)                     # black region
         Image.fromarray(atlas).save(str(out / "m_material0000_map_Kd.png"))
         (out / "m.mtl").write_text("newmtl material0000\nKd 1 1 1\nmap_Kd m_material0000_map_Kd.png\n")
         ox, oy = 200 + padding, 200 + padding                 # unseen patch rect origin + padding
         rel = [(2.0, 1.0), (1.0, 1.0), (1.0, 2.0)]
         vts = [((ox + x) / size, 1.0 - (oy + y) / size) for x, y in rel]
-        vts += [(0.2, 0.9), (0.5, 0.9), (0.2, 0.7)]          # a textured face in the green half
+        vts += [(0.2, 0.9), (0.3, 0.9), (0.2, 0.8)]          # a face in the green region
+        vts += [(0.7, 0.9), (0.8, 0.9), (0.7, 0.8)]          # a face in the black region
+        # Strip of vertices: green face 1-2-3, unseen 2-3-4, 3-4-5 | far away: black face 10-11-12, unseen 11-12-13
         lines = ["mtllib m.mtl\n"]
-        lines += [f"v {i} {i % 2} 0\n" for i in range(6)]
+        lines += [f"v {i} {i % 2} 0\n" for i in range(6)] + [f"v {i + 100} {i % 2} 0\n" for i in range(4)]
         lines += [f"vt {u:.6f} {v:.6f}\n" for u, v in vts]
-        lines += ["usemtl material0000\n", "f 1/4 2/5 3/6\n", "f 2/1 3/2 4/3\n", "f 4/1 5/2 6/3\n", "f 5/1 6/2 1/3\n"]
+        lines += ["usemtl material0000\n", "f 1/4 2/5 3/6\n", "f 2/1 3/2 4/3\n", "f 3/1 4/2 5/3\n",
+                  "f 7/7 8/8 9/9\n", "f 8/1 9/2 10/3\n"]
         (out / "m.obj").write_text("".join(lines))
 
-        colour = fill_unseen_face_texels(str(out / "m.obj"))
-        self.assertEqual(colour, (40, 160, 60))
-        res = np.array(Image.open(out / "m_material0000_map_Kd.png"))
-        self.assertEqual(tuple(res[oy + 1, ox + 1]), (40, 160, 60))
-        self.assertEqual(tuple(res[oy - padding, ox - padding]), (40, 160, 60))
-        self.assertEqual(tuple(res[140, 20]), (0, 0, 0))     # rest of the atlas untouched
+        res = fill_unseen_face_texels(str(out / "m.obj"))
+        self.assertEqual(res["faces"], 3)
+        self.assertEqual(res["texture"], "m_unseen.png")
+        mtl = (out / "m.mtl").read_text()
+        self.assertIn("newmtl material_unseen", mtl)
+        self.assertIn("map_Kd m_unseen.png", mtl)
+        self.assertEqual(tuple(np.array(Image.open(out / "m_material0000_map_Kd.png"))[10, 10]), (40, 160, 60))
+
+        import trimesh
+        vt_lines = [l for l in (out / "m.obj").read_text().splitlines() if l.startswith("vt ")]
+        face_lines = (out / "m.obj").read_text().split("usemtl material_unseen\n")[1].splitlines()
+        self.assertEqual(len(vt_lines), 9 + 3)
+        unseen_png = np.array(Image.open(out / "m_unseen.png"))
+
+        def colour_of(face_line):
+            t = int(face_line.split()[1].split("/")[1]) - 1
+            u, v = map(float, vt_lines[t].split()[1:3])
+            h, w = unseen_png.shape[:2]
+            return tuple(unseen_png[int((1 - v) * h), int(u * w)])
+
+        colours = [colour_of(l) for l in face_lines]
+        self.assertEqual(colours[:2], [(40, 160, 60), (40, 160, 60)])   # next to green
+        self.assertEqual(colours[2], (10, 10, 10))                        # next to black
 
 
 if __name__ == "__main__":

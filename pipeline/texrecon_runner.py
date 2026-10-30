@@ -361,7 +361,11 @@ def remove_texrecon_outputs(out_prefix: Path) -> int:
 
 
 def _read_obj_faces(obj_path: Path):
-    """Minimal OBJ reader for texrecon output: (vt [N,2], face v [F,3], face vt [F,3], face material, names, mtllib)."""
+    """
+    Minimal OBJ reader for texrecon output: (v [V,3], vt [N,2], face v [F,3], face vt [F,3], face material, names,
+    mtllib). Only triangles with texture coordinates count as faces (texrecon writes nothing else).
+    """
+    v: List[Tuple[float, float, float]] = []
     vt: List[Tuple[float, float]] = []
     fv: List[Tuple[int, int, int]] = []
     ft: List[Tuple[int, int, int]] = []
@@ -372,7 +376,10 @@ def _read_obj_faces(obj_path: Path):
     mtllib = None
     with open(obj_path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
-            if line.startswith("vt "):
+            if line.startswith("v "):
+                p = line.split()
+                v.append((float(p[1]), float(p[2]), float(p[3])))
+            elif line.startswith("vt "):
                 p = line.split()
                 vt.append((float(p[1]), float(p[2])))
             elif line.startswith("f "):
@@ -389,26 +396,31 @@ def _read_obj_faces(obj_path: Path):
                 cur = index[n]
             elif line.startswith("mtllib "):
                 mtllib = line.split(maxsplit=1)[1].strip()
-    return (np.array(vt, dtype=np.float64).reshape(-1, 2), np.array(fv, dtype=np.int64).reshape(-1, 3) - 1,
-            np.array(ft, dtype=np.int64).reshape(-1, 3) - 1, np.array(fm, dtype=np.int64), names, mtllib)
+    return (np.array(v, dtype=np.float64).reshape(-1, 3), np.array(vt, dtype=np.float64).reshape(-1, 2),
+            np.array(fv, dtype=np.int64).reshape(-1, 3) - 1, np.array(ft, dtype=np.int64).reshape(-1, 3) - 1,
+            np.array(fm, dtype=np.int64), names, mtllib)
+
+
+UNSEEN_MATERIAL = "material_unseen"
 
 
 def fill_unseen_face_texels(
     obj_path: str,
     min_faces: int = 3,
     fallback_rgb: Tuple[int, int, int] = (25, 25, 25),
-    max_samples: int = 20000,
-) -> Optional[Tuple[int, int, int]]:
+    cell_px: int = 4,
+) -> Optional[Dict[str, Any]]:
     """
-    With --keep_unseen_faces texrecon maps every face no view could see onto one 3x3 black patch
-    (generate_texture_patches.cpp) inside one atlas, surrounded by `atlas_size >> 7` px of padding.
-    All those faces therefore share the same three texture coordinates. This repaints that patch
-    with the median colour of the textured faces touching the unseen ones, so undersides and the
-    flat base read as the surrounding plastic instead of black holes.
-    Returns the RGB colour used, or None if the OBJ has no unseen-face patch.
+    With --keep_unseen_faces texrecon maps every face no view could see (the cut base, recesses, the top seen only at
+    grazing angles) onto one 3x3 black patch, so they all share three texture coordinates. Painting that patch with
+    one colour (the old approach: a median of all neighbours) put a grey-green blob on black plastic.
+    Instead every unseen face gets the colour of the textured faces around it, spread inwards ring by ring over
+    shared vertices (large unseen areas such as the base take the colours of their rim). The colours go into a
+    small extra atlas <stem>_unseen.png (one flat cell of cell_px x cell_px per face) with its own material, and the
+    unseen faces are moved to it. Returns {"faces", "rings", "median_rgb", "texture"} or None if nothing is unseen.
     """
     obj_p = Path(obj_path)
-    vt, fv, ft, fm, names, mtllib = _read_obj_faces(obj_p)
+    v, vt, fv, ft, fm, names, mtllib = _read_obj_faces(obj_p)
     if len(ft) == 0:
         return None
     _, inverse, counts = np.unique(np.sort(ft, axis=1), axis=0, return_inverse=True, return_counts=True)
@@ -419,64 +431,101 @@ def fill_unseen_face_texels(
     unseen = inverse == best
 
     maps: Dict[str, str] = {}
-    if mtllib and (obj_p.parent / mtllib).is_file():
+    mtl_p = obj_p.parent / mtllib if mtllib else None
+    if mtl_p and mtl_p.is_file():
         cur = None
-        for line in (obj_p.parent / mtllib).read_text(encoding="utf-8", errors="ignore").splitlines():
+        for line in mtl_p.read_text(encoding="utf-8", errors="ignore").splitlines():
             line = line.strip()
             if line.startswith("newmtl "):
                 cur = line.split(maxsplit=1)[1].strip()
             elif line.startswith("map_Kd") and cur:
                 maps[cur] = line.split(maxsplit=1)[1].strip()
+    if mtl_p is None or not mtl_p.is_file():
+        return None
 
-    def atlas_path(mat_idx: int) -> Optional[Path]:
+    # Colour of every textured face: its atlas at the UV centroid (BGR)
+    colour = np.zeros((len(fv), 3))
+    known = ~unseen
+    for mat_idx in np.unique(fm[known]):
         if mat_idx < 0 or mat_idx >= len(names) or names[mat_idx] not in maps:
-            return None
-        p = obj_p.parent / maps[names[mat_idx]]
-        return p if p.is_file() else None
-
-    # Median colour of textured faces sharing a vertex with an unseen face
-    seen_v = np.zeros(int(fv.max()) + 1, dtype=bool)
-    seen_v[fv[unseen].ravel()] = True
-    neigh = np.nonzero(~unseen & seen_v[fv].any(axis=1))[0]
-    if len(neigh) == 0:
-        neigh = np.nonzero(~unseen)[0]
-    if len(neigh) > max_samples:
-        neigh = np.random.default_rng(0).choice(neigh, max_samples, replace=False)
-    samples = []
-    for mat_idx in np.unique(fm[neigh]):
-        ap = atlas_path(int(mat_idx))
-        if ap is None:
             continue
-        img = cv2.imread(str(ap), cv2.IMREAD_COLOR)
+        img = cv2.imread(str(obj_p.parent / maps[names[mat_idx]]), cv2.IMREAD_COLOR)
         if img is None:
             continue
-        sel = neigh[fm[neigh] == mat_idx]
+        sel = np.nonzero(known & (fm == mat_idx))[0]
         uv = vt[ft[sel]].mean(axis=1)
         x = np.clip((uv[:, 0] * img.shape[1]).astype(int), 0, img.shape[1] - 1)
         y = np.clip(((1.0 - uv[:, 1]) * img.shape[0]).astype(int), 0, img.shape[0] - 1)
-        samples.append(img[y, x])
-    if samples:
-        bgr = np.median(np.concatenate(samples), axis=0).round().astype(int)
-        colour = (int(bgr[2]), int(bgr[1]), int(bgr[0]))
-    else:
-        colour = tuple(int(c) for c in fallback_rgb)
+        colour[sel] = img[y, x]
 
-    mat_idx = int(fm[unseen][0])
-    ap = atlas_path(mat_idx)
-    if ap is None:
-        return None
-    img = cv2.imread(str(ap), cv2.IMREAD_COLOR)
-    size = img.shape[1]
-    padding = size >> 7
-    tri = vt[ft[unseen][0]]
-    # patch-relative texcoords are (2,1), (1,1), (1,2): the 3x3 patch starts one texel before the minimum
-    x0 = int(round(tri[:, 0].min() * size)) - 1 - padding
-    y0 = int(round((1.0 - tri[:, 1].max()) * img.shape[0])) - 1 - padding
-    x1, y1 = x0 + 3 + 2 * padding, y0 + 3 + 2 * padding
-    img[max(0, y0):min(img.shape[0], y1), max(0, x0):min(size, x1)] = (colour[2], colour[1], colour[0])
-    cv2.imwrite(str(ap), img)
-    logger.info(f"Recoloured {int(unseen.sum()):,d} unseen faces in {ap.name} (patch at x={x0}, y={y0}).")
-    return colour
+    # Spread over shared vertices; vertices are merged by position (texrecon may split them along chart seams)
+    _, vid = np.unique(np.round(v, 6), axis=0, return_inverse=True)
+    fvid = vid.reshape(-1)[fv]
+    n_v = int(fvid.max()) + 1
+    assigned = known.copy()
+    rings = 0
+    while not assigned.all():
+        vsum = np.zeros((n_v, 3))
+        vcnt = np.zeros(n_v)
+        for k in range(3):
+            np.add.at(vsum, fvid[assigned, k], colour[assigned])
+            np.add.at(vcnt, fvid[assigned, k], 1)
+        todo = np.nonzero(~assigned)[0]
+        cnt = vcnt[fvid[todo]].sum(axis=1)
+        ready = todo[cnt > 0]
+        if len(ready) == 0:            # unseen faces not connected to anything textured
+            colour[todo] = np.array(fallback_rgb[::-1], dtype=float)
+            assigned[todo] = True
+            break
+        colour[ready] = vsum[fvid[ready]].sum(axis=1) / vcnt[fvid[ready]].sum(axis=1)[:, None]
+        assigned[ready] = True
+        rings += 1
+
+    # Small atlas: one flat cell per unseen face, sampled at the cell centre
+    idx = np.nonzero(unseen)[0]
+    side = int(np.ceil(np.sqrt(len(idx))))
+    size = side * cell_px
+    atlas = np.zeros((size, size, 3), np.uint8)
+    cells = np.arange(len(idx))
+    cx, cy = cells % side, cells // side
+    for i, (x, y) in enumerate(zip(cx, cy)):
+        atlas[y * cell_px:(y + 1) * cell_px, x * cell_px:(x + 1) * cell_px] = np.clip(colour[idx[i]], 0, 255)
+    tex_name = f"{obj_p.stem}_unseen.png"
+    cv2.imwrite(str(obj_p.parent / tex_name), atlas)
+    new_vt = np.stack([(cx + 0.5) * cell_px / size, 1.0 - (cy + 0.5) * cell_px / size], axis=1)
+
+    # Rewrite the OBJ: new vt after the existing ones, unseen faces moved into their own material at the end
+    n_vt = len(vt)
+    face_line = {}
+    for k, fi in enumerate(idx):
+        face_line[fi] = k
+    lines = obj_p.read_text(encoding="utf-8", errors="ignore").splitlines(keepends=True)
+    last_vt = max((i for i, ln in enumerate(lines) if ln.startswith("vt ")), default=-1)
+    out, moved, face_no = [], [], 0
+    for i, ln in enumerate(lines):
+        if ln.startswith("f "):
+            parts = [c.split("/") for c in ln.split()[1:4]]
+            if len(parts) == 3 and all(len(c) > 1 and c[1] for c in parts):
+                k = face_line.get(face_no)
+                face_no += 1
+                if k is not None:
+                    t = n_vt + 1 + k
+                    moved.append("f " + " ".join("/".join([c[0], str(t)] + c[2:]) for c in parts) + "\n")
+                    continue
+        out.append(ln)
+        if i == last_vt:
+            out.extend(f"vt {u:.6f} {w:.6f}\n" for u, w in new_vt)
+    out.append(f"usemtl {UNSEEN_MATERIAL}\n")
+    out.extend(moved)
+    obj_p.write_text("".join(out), encoding="utf-8")
+    with open(mtl_p, "a", encoding="utf-8") as m:
+        m.write(f"\nnewmtl {UNSEEN_MATERIAL}\nKa 1.000000 1.000000 1.000000\nKd 1.000000 1.000000 1.000000\n"
+                f"Ks 0.000000 0.000000 0.000000\nmap_Kd {tex_name}\n")
+
+    med = np.median(colour[idx], axis=0).round().astype(int)
+    logger.info(f"Coloured {len(idx):,d} unseen faces from their neighbours ({rings} rings) -> {tex_name}.")
+    return {"faces": int(len(idx)), "rings": rings, "median_rgb": (int(med[2]), int(med[1]), int(med[0])),
+            "texture": tex_name}
 
 
 class TexReconRunner:
@@ -629,9 +678,10 @@ class TexReconRunner:
 
         if self.config.keep_unseen_faces:
             try:
-                colour = fill_unseen_face_texels(final_obj)
-                if colour is not None:
-                    logger.info(f"Unseen faces kept and coloured with neighbour median RGB {colour}")
+                filled = fill_unseen_face_texels(final_obj)
+                if filled is not None:
+                    logger.info(f"Unseen faces kept: {filled['faces']:,d}, coloured locally "
+                                f"(median RGB {filled['median_rgb']})")
             except Exception as fill_err:
                 logger.warning(f"Could not recolour unseen faces ({fill_err}); they stay black.")
 

@@ -30,11 +30,11 @@ REST_URL = "https://rest.runpod.io/v1"
 # Cheap CUDA GPUs first: GPU speed barely matters (2.3 of 30 min are GPU compute), host RAM and vCPUs do.
 # Exact ids are RunPod's gpuTypeIds enum (some contain double spaces there): check with --dry_run.
 DEFAULT_GPU_TYPES = (
+    "NVIDIA GeForce RTX 3090",
+    "NVIDIA GeForce RTX 4090",
     "NVIDIA RTX A4000",
     "NVIDIA RTX A4500",
-    "NVIDIA GeForce RTX 3090",
     "NVIDIA RTX A5000",
-    "NVIDIA GeForce RTX 4090",
     "NVIDIA L4",
     "NVIDIA A40",
 )

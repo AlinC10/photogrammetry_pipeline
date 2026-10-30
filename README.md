@@ -75,9 +75,9 @@ input_images/
 
 ### Good scans
 * The disc must stay **in frame** on every level (at least ~4 tags per photo; the report shows `tag-uri pe poză: min`).
-* The real carriage lift was measured at ~85 mm, not the nominal 80/100 mm: use **`--estimate_lift`**.
+* The real carriage lift was measured at ~85 mm for a commanded 80 mm: it is estimated from the photos automatically (≥ 2 levels). The tag sheet was printed at ~98 % (`--tag_scale 0.98`, default).
 * Plain, glossy surfaces (a cap of one colour) give no depth (nothing to match between photos): side lighting or
-  matte scanning spray help. Open issues and their fixes: `plans/AUDIT_RECONSTRUCTIE_GENERALA.md`.
+  matte scanning spray help. Open issues and their fixes: `plans/implemented/AUDIT_RECONSTRUCTIE_GENERALA.md`.
 
 ---
 
@@ -90,7 +90,7 @@ input_images/
 GIT_COMMIT=$(git rev-parse --short HEAD) docker compose build
 
 # a scan: photos in ./input_images, results in ./output
-docker compose run --rm turntable-studio --input_dir /workspace/input_images --output_dir /workspace/output --rig_mode --estimate_lift
+docker compose run --rm turntable-studio --input_dir /workspace/input_images --output_dir /workspace/output --rig_mode
 ```
 
 PowerShell: `docker compose build`, then the same `docker compose run ...` line. No `| tee` is needed:
@@ -120,7 +120,7 @@ still works. To keep everything in `./output` (e.g. for `tools/debug_texturing.p
 
 Re-texture / re-export without recomputing the geometry:
 ```bash
-docker compose run --rm turntable-studio --input_dir /workspace/input_images --output_dir /workspace/output --rig_mode --estimate_lift --resume
+docker compose run --rm turntable-studio --input_dir /workspace/input_images --output_dir /workspace/output --rig_mode --resume
 ```
 `--resume` reuses `cameras_known.sfm` and the OpenMVS mesh. Run **without** it after changing photos, poses or
 intrinsics.
@@ -134,7 +134,7 @@ Needs OpenMVS (with CUDA) and `texrecon` on the machine; Python 3.10 or 3.11 (no
 ```bash
 uv venv .venv --python 3.11 && source .venv/bin/activate     # Windows: .venv\Scripts\activate
 uv pip install -r requirements.txt
-python main.py --input_dir ./input_images --output_dir ./output --rig_mode --estimate_lift \
+python main.py --input_dir ./input_images --output_dir ./output --rig_mode \
     --openmvs_bin_dir /path/to/OpenMVS --texrecon_bin /path/to/texrecon
 ```
 OpenMVS is also searched in `OPENMVS_BIN_DIR`, `PATH`, `/usr/local/bin/OpenMVS`, `C:\OpenMVS\...`; texrecon in
@@ -212,9 +212,9 @@ Run `python main.py --help` for all of them. The ones that matter:
 | Option | Default | Meaning |
 |---|---|---|
 | `--rig_mode` | off | photos in `rig/0`, `rig/1` |
-| `--estimate_lift` | off | estimate the carriage lift (recommended; the real lift is ~85 mm) |
-| `--lift_mm` | 100 | fixed lift per level when not estimated |
-| `--tag_scale` | 1.0 | printed / designed size of the tag sheet (measure tag 0–6 centres: designed 200 mm) |
+| `--estimate_lift` / `--no_estimate_lift` | automatic | the lift per level is estimated from the photos when there are ≥ 2 levels; a warning when it differs by > 10 % from `--lift_mm` |
+| `--lift_mm` | 80 | lift the scanner commands per level (used as is with `--no_estimate_lift`) |
+| `--tag_scale` | 0.98 | printed / designed size of the tag sheet (this rig's sheet came out at ~98 %: disc 255 mm, tags 0–6 196 mm; 1.0 for a sheet printed at actual size) |
 | `--intrinsics_in` | – | chessboard calibration from `pipeline/calibrate_intrinsics.py` |
 | `--no_tag_refine` | off | disable the per-tag paper-height correction |
 | `--resolution_level` | 1 | DensifyPointCloud at 1/2 resolution (0 = full: ~4× GPU time and much more RAM) |
@@ -224,6 +224,7 @@ Run `python main.py --help` for all of them. The ones that matter:
 | `--high_poly_ratio` / `--low_poly_ratio` | 0.75 / 0.2 | share of the sealed mesh's faces kept in the high / low poly (every object is decimated a little) |
 | `--low_poly_max_faces` | 50000 | cap of the low poly (web model): it gets min(ratio × faces, cap) |
 | `--target_high_poly_faces` / `--target_low_poly_faces` | 0 | fixed face counts instead of the ratios (0 = use the ratios) |
+| `--no_draco` | off | GLB without Draco geometry compression (Draco: high GLB ~22 → ~6 MB; viewers need a Draco decoder: Blender, three.js, model-viewer, Babylon) |
 | `--title` / `--description` | – | written to `object.json` with the measured size and volume (`tools/cloud_scan.py --title`; default: `--name`) |
 | `--workers` | 0 = auto | parallel images for masks / undistortion / texturing images: `min(CPUs − 1, free RAM / 0.5 GB)` from the container limits |
 | `--work_dir` | output dir (Docker: `/tmp/turntable_work`) | where the large intermediate files go |
@@ -292,7 +293,7 @@ cloud/                   cloudflare_r2.py, runpod.py, job.py, README.md
 tools/                   local only: cloud_scan.py, collect_stats.py, fit_ram_model.py,
                          debug_texturing.py (texture diagnostics), debug_blender_compare.py (headless Blender)
 tests/                   unit tests (no GPU, no network)
-plans/                   open plans (AUDIT_RECONSTRUCTIE_GENERALA.md = next fixes); plans/implemented/ = done
+plans/                   open plans (RAMAS_DE_FACUT.md = what is left); plans/implemented/ = done
 docs/                    architecture description, competition documentation
 deprecated/              code no longer used (AliceVision texturing, inspect_rig_poses.py)
 to_delete/               superseded files, kept until reviewed
@@ -316,7 +317,7 @@ uv run --with numpy --with opencv-python-headless --with scipy --with trimesh --
 * **DensifyPointCloud killed without a message (exit 137)** → out of memory (WSL limit); same fixes.
 * **Black model in Blender** → *Material Preview*; after `--resume` with changed poses run without `--resume`.
 * **Holes in the middle of the object, flattened plain caps** → masks and plain surfaces: see
-  `plans/AUDIT_RECONSTRUCTIE_GENERALA.md` (G1–G3) and the debugging images it lists.
+  `plans/implemented/AUDIT_RECONSTRUCTIE_GENERALA.md` (G1–G3) and the debugging images it lists.
 * **Red `NativeCommandError` in PowerShell** → only docker writing a warning to stderr; not an error of the run.
 * **Texture debugging** → `python tools/debug_texturing.py all --output_dir output --input_dir input_images`
   (needs `undistorted/` in `output/`: run with `--work_dir /workspace/output`).

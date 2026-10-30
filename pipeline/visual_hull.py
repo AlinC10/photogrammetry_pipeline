@@ -1,7 +1,7 @@
 """
 visual_hull.py — Volume carved from the silhouette masks of all locked views (shape from silhouette).
 
-Two uses (plans/AUDIT_RECONSTRUCTIE_GENERALA.md, G6 and G2):
+Two uses (plans/implemented/AUDIT_RECONSTRUCTIE_GENERALA.md, G6 and G2):
 1. Bounds of the object for the proxy 3D points of bridge_sfm: DensifyPointCloud derives its ROI and the depth range
    of every view from them, and the old fixed 220 mm volume was lower than tall objects (fixativ: 231-244 mm).
 2. Correcting the dense cloud where PatchMatch fails: on uniform, untextured plastic (a single-colour cap) it fuses
