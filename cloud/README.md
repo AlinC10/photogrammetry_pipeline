@@ -50,11 +50,16 @@ stops itself; the client terminates it.
 ## Choosing the pod
 
 `POST https://rest.runpod.io/v1/pods` with:
-- `gpuTypeIds`: acceptable GPUs, cheapest first (`RUNPOD_GPU_TYPES`, default list in `runpod.py`), and
-  `gpuTypePriority: "custom"`, so RunPod takes the first one with capacity in our order. GPU speed barely matters
-  (2.3 of 30 minutes are GPU compute); host RAM, vCPUs and disk do.
+- `gpuTypeIds`: acceptable GPUs, fastest first, only those up to `RUNPOD_MAX_GPU_PRICE` $/h (default 1.10:
+  RTX 4090, L40S, RTX 6000 Ada, L40, RTX 3090, ... A4000; the RTX 5090 costs 1.19 on Secure Cloud and runs our
+  CUDA 12.2 build only through the driver's PTX JIT, untested). `RUNPOD_GPU_TYPES` replaces the list. With
+  `gpuTypePriority: "custom"` RunPod takes the first one with capacity in our order. The GPU speeds up only
+  DensifyPointCloud; host RAM, vCPUs and disk matter more. A pod above the cap (prices changed) is logged.
 - `minRAMPerGPU` = `ceil(estimate_ram_gb × 1.3)` from `pipeline/resources.py` (photos × resolution),
   `minVCPUPerGPU` (default 8), `containerDiskInGb` from the photo count.
+- Asked for first: at least `RUNPOD_PREFERRED_VCPU` (16) and `RUNPOD_PREFERRED_RAM_GB` (48 GB). The price is per
+  GPU, yet the same RTX 3090 came with 8 vCPU (6 usable: the 4-level stand timed out) or 32 vCPU. Only when no
+  host has them is the same create attempt repeated at once with the minimums above.
 - No data center filter (more capacity), no ports, no volume.
 
 Retries are bounded: a create request rejected for lack of capacity is retried `RUNPOD_MAX_CREATE_ATTEMPTS` times

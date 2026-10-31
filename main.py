@@ -10,8 +10,11 @@ import argparse
 import json
 import logging
 import os
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -70,7 +73,14 @@ from pipeline.config import (
     TurntableConfig,
     VisualHullConfig,
 )
-from pipeline.exporter import collect_log_files, decimate_mesh, export_multi_lod_bundle, package_output_zip
+from pipeline.exporter import (
+    collect_log_files,
+    decimate_mesh,
+    export_multi_lod_bundle,
+    export_print_assets,
+    package_output_zip,
+)
+from pipeline.parallel import LoggingProcessPool
 from pipeline.mesh_cleaner import clean_and_repair_mesh, face_target
 from pipeline.object_info import write_object_info
 from pipeline.mesh_masks import load_sfm_cameras
@@ -248,6 +258,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         glb_draco=bool(job.get("glb_draco", True)),
     )
 
+    bg: Optional[LoggingProcessPool] = None
     try:
         # ----------------------------------------------------------------------
         # STEP 1: Scan Images and Generate CameraInit SFM
@@ -324,6 +335,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         # ----------------------------------------------------------------------
         masks_out_dir = str(out_path / "masks")
         mask_hull: Optional[Dict[str, Any]] = None
+        ai_cache_dir = str(work_path / "ai_masks_cache")
         masks_src: Optional[str] = config.masks_dir or str(Path(input_dir) / "masks")
         if not Path(masks_src).is_dir():
             masks_src = None
@@ -337,7 +349,10 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                 if stale:
                     logger.info(f"Removed {len(stale)} mask file(s) of a previous run from {masks_out_dir}.")
                 if not mock_openmvs:
-                    n_masks, mask_hull = _generate_masks(cameras_known_sfm, masks_out_dir, config, workers, telemetry)
+                    # Model outputs of this scan only: the cache serves the second masking (wider cylinder)
+                    shutil.rmtree(ai_cache_dir, ignore_errors=True)
+                    n_masks, mask_hull = _generate_masks(cameras_known_sfm, masks_out_dir, config, workers, telemetry,
+                                                         ai_cache_dir)
                     masks_src = masks_out_dir
                     logger.info(f"Generated {n_masks} foreground masks in {masks_out_dir}.")
                 else:
@@ -364,7 +379,8 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                 with telemetry.step("2.5b Masks Again (Wide Cylinder)"):
                     for old_mask in Path(masks_out_dir).rglob("*.mask.png"):
                         old_mask.unlink()
-                    _, mask_hull = _generate_masks(cameras_known_sfm, masks_out_dir, config, workers, telemetry)
+                    _, mask_hull = _generate_masks(cameras_known_sfm, masks_out_dir, config, workers, telemetry,
+                                                   ai_cache_dir)
                 hull = _carve_visual_hull(cameras_known_sfm, masks_src, config, str(hull_path), telemetry, mask_hull)
             proxy_bounds = visual_hull.proxy_bounds_from_hull(
                 hull, config.masking.cylinder_radius_m, config.masking.cylinder_y_max_m,
@@ -390,7 +406,10 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             )
         telemetry.set_info(bridge={"masks_applied": bridge.get("masks_applied"), "proxy_bounds": proxy_bounds,
                                    "densify_masks": config.masking.densify_masks})
-        telemetry.set_info(object_images=run_metrics.object_image_stats(undistorted_dir))
+        # Metrics for stats.json, the object card, the low-poly decimation and the print exports run in worker
+        # processes beside the main steps (results collected before the export / the final stats.json)
+        bg = LoggingProcessPool(max(1, min(3, int(resources["cpus"]) - 1)))
+        bg.submit("object_images", run_metrics.object_image_stats, undistorted_dir)
 
         # ----------------------------------------------------------------------
         # STEP 4: OpenMVS Dense Reconstruction
@@ -489,10 +508,8 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                 else:
                     raw_reconstructed_mesh = str(openmvs_dir / "scene_mesh.ply")
 
-            telemetry.set_info(
-                openmvs=run_metrics.openmvs_log_stats(str(openmvs_dir)),
-                raw_mesh=run_metrics.mesh_quality(raw_reconstructed_mesh, "raw"),
-            )
+            bg.submit("openmvs", run_metrics.openmvs_log_stats, str(openmvs_dir))
+            bg.submit("raw_mesh", run_metrics.mesh_quality, raw_reconstructed_mesh, "raw")
 
             # ----------------------------------------------------------------------
             # STEP 5: Watertight Base Slicing & Mesh Cleaning (BEFORE Texturing!)
@@ -504,22 +521,21 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                     config=config.cleaning,
                 )
 
-            telemetry.set_info(cleaned_mesh=run_metrics.mesh_quality(cleaned_obj_path, "cleaned"))
             _resolve_low_poly_target(config, clean_res, telemetry)
-            write_object_info(cleaned_obj_path, str(out_path), job.get("title"), job.get("description"),
-                              _object_extra(job, clean_res, config))
-
-            # Generate dedicated low-poly geometry for branching texturing (eliminates white untextured low-poly!)
+            # Dedicated low-poly geometry for branching texturing (eliminates white untextured low-poly!), the print
+            # exports of the high poly, its metrics and object.json: in the workers, while the texturing images are made
             cleaned_low_path = out_path / "cleaned_mesh_low.obj"
-            try:
-                decimate_mesh(
-                    input_mesh_path=cleaned_obj_path,
-                    output_mesh_path=str(cleaned_low_path),
-                    target_faces=config.cleaning.target_low_poly_faces,
-                )
-            except Exception as dec_err:
-                logger.warning(f"Pre-texturing low-poly decimation failed ({dec_err}). Will fall back to standard decimation.")
-                cleaned_low_path = None
+            if cleaned_low_path.is_file():
+                cleaned_low_path.unlink()
+            bg.submit("decimate_low", decimate_mesh, cleaned_obj_path, str(cleaned_low_path),
+                      config.cleaning.target_low_poly_faces)
+            print_tmp = work_path / "print_high"
+            print_tmp.mkdir(parents=True, exist_ok=True)
+            bg.submit("print_high", export_print_assets, cleaned_obj_path, str(print_tmp / "high_model.stl"),
+                      str(print_tmp / "high_model.3mf"), float(config.export_scale))
+            bg.submit("cleaned_mesh", run_metrics.mesh_quality, cleaned_obj_path, "cleaned")
+            bg.submit("object_info", write_object_info, cleaned_obj_path, str(out_path), job.get("title"),
+                      job.get("description"), _object_extra(job, clean_res, config))
 
             # Determine appropriate MVS project file for TextureMesh
             mvs_project = "scene_mesh.mvs"
@@ -558,35 +574,22 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                         f"texrecon will use the bridge images in {undistorted_dir}."
                     )
 
+            try:
+                bg.result("decimate_low", raise_errors=True)
+            except Exception as dec_err:
+                logger.warning(f"Pre-texturing low-poly decimation failed ({dec_err}). Will fall back to standard decimation.")
+            if not cleaned_low_path.is_file():
+                cleaned_low_path = None
+
             # ----------------------------------------------------------------------
             # STEP 4.4: Texture Mesh on Watertight Sealed Geometry
             # ----------------------------------------------------------------------
             if config.texturing_engine == "texrecon":
                 try:
                     with telemetry.step("4.4 mvs-texturing (texrecon)"):
-                        tr_runner = TexReconRunner(
-                            config=config.texrecon,
-                            work_dir=str(out_path / "texrecon"),
-                        )
-                        textured_obj_path, _ = tr_runner.run_texturing(
-                            sfm_data_path=cameras_known_sfm,
-                            input_mesh_path=cleaned_obj_path,
-                            images_folder=texturing_images_dir,
-                            out_prefix=str(out_path / "texrecon" / "model_textured"),
-                            mock_mode=job.get("mock_openmvs", False),
-                        )
-                        if cleaned_low_path and cleaned_low_path.is_file():
-                            try:
-                                logger.info("Running branching texturing on low-poly mesh (texrecon)...")
-                                textured_low_obj_path, _ = tr_runner.run_texturing(
-                                    sfm_data_path=cameras_known_sfm,
-                                    input_mesh_path=str(cleaned_low_path),
-                                    images_folder=texturing_images_dir,
-                                    out_prefix=str(out_path / "texrecon" / "model_textured_low"),
-                                    mock_mode=job.get("mock_openmvs", False),
-                                )
-                            except Exception as tr_low_err:
-                                logger.warning(f"texrecon low-poly texturing failed ({tr_low_err}).")
+                        textured_obj_path, textured_low_obj_path = _run_texrecon(
+                            config, cameras_known_sfm, cleaned_obj_path, cleaned_low_path, texturing_images_dir,
+                            out_path, job.get("mock_openmvs", False), telemetry)
                 except Exception as tr_err:
                     logger.warning(
                         f"mvs-texturing failed ({tr_err}). Falling back to OpenMVS texturing."
@@ -690,6 +693,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         stats_file = telemetry.save_json()
 
         with telemetry.step("6. Multi-LOD Export & Compression"):
+            print_high = bg.result("print_high") if bg is not None and bg.has("print_high") else None
             bundle = export_multi_lod_bundle(
                 cleaned_mesh_path=cleaned_obj_path,
                 textured_obj_path=textured_obj_path,
@@ -698,7 +702,16 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                 config=config,
                 stats_json_path=stats_file,
                 textured_low_obj_path=textured_low_obj_path,
+                make_zip=False,                  # built once, at the very end, with the final stats.json and logs
+                pool=bg,
+                print_high=print_high,
             )
+        if bg is not None:
+            done = bg.results()
+            telemetry.set_info(**{k: done.get(k) for k in ("object_images", "openmvs", "raw_mesh", "cleaned_mesh")
+                                  if k in done})
+            bg.shutdown()
+            bg = None
 
         logger.info("=" * 70)
         logger.info("       PIPELINE COMPLETED SUCCESSFULLY!")
@@ -707,18 +720,21 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         # Stop telemetry sampling and finalize report
         telemetry.stop_sampling()
         run_log_handler.flush()
-        telemetry.set_info(log_counters=run_metrics.log_counters(str(out_path / "run_log.txt")),
-                           output_zip_mb=bundle.get("zip_size_mb"))
+        telemetry.set_info(log_counters=run_metrics.log_counters(str(out_path / "run_log.txt")))
         telemetry.set_outcome("ok")
         stats_file = telemetry.save_json()
         telemetry.print_table()
 
-        # Repack output.zip last, so it carries the final stats.json and the complete logs
+        # output.zip once, last, so it carries the final stats.json and the complete logs
         run_log_handler.flush()
-        bundle["zip_path"] = str(package_output_zip(
+        zip_path = package_output_zip(
             str(out_path), config.zip_name, stats_file,
             collect_log_files(str(out_path), extra_dirs=[str(openmvs_dir)] if work_path != out_path else None),
-        ))
+        )
+        bundle["zip_path"] = str(zip_path)
+        bundle["zip_size_mb"] = round(zip_path.stat().st_size / (1024 * 1024), 2)
+        telemetry.set_info(output_zip_mb=bundle["zip_size_mb"])
+        stats_file = telemetry.save_json()
         detach_run_log(run_log_handler)
 
         return {
@@ -730,6 +746,8 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
 
     except Exception as e:
         logger.exception(f"Pipeline failed: {e}")
+        if bg is not None:
+            bg.shutdown(cancel=True)
         telemetry.stop_sampling()
         telemetry.set_outcome("error", error_type=type(e).__name__, error=str(e)[:500],
                               failed_step=telemetry.current_step)
@@ -739,6 +757,51 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         telemetry.print_table()
         detach_run_log(run_log_handler)
         raise
+
+
+def _run_texrecon(config: PipelineConfig, cameras_known_sfm: str, cleaned_obj_path: str,
+                  cleaned_low_path: Optional[Path], images_dir: str, out_path: Path, mock: bool,
+                  telemetry: SystemTelemetry) -> Tuple[str, Optional[str]]:
+    """
+    Step 4.4: texrecon on the high- and the low-poly mesh. The .cam scene is written once and both run at the same
+    time (the low poly in texrecon/low/: texrecon refuses a "tmp" folder it did not make) when the RAM allows; the
+    low-poly run takes ~20-45 s that no longer add up. A failed high-poly run raises (TextureMesh fallback); a failed
+    low-poly run only warns. Returns (high OBJ, low OBJ or None).
+    """
+    tr_runner = TexReconRunner(config=config.texrecon, work_dir=str(out_path / "texrecon"))
+    tr_runner.prepare_scene(cameras_known_sfm, images_dir)
+
+    def high() -> str:
+        return tr_runner.run_texturing(
+            sfm_data_path=cameras_known_sfm, input_mesh_path=cleaned_obj_path, images_folder=images_dir,
+            out_prefix=str(out_path / "texrecon" / "model_textured"), mock_mode=mock, scene_ready=True)[0]
+
+    def low() -> str:
+        logger.info("Running branching texturing on low-poly mesh (texrecon)...")
+        return tr_runner.run_texturing(
+            sfm_data_path=cameras_known_sfm, input_mesh_path=str(cleaned_low_path), images_folder=images_dir,
+            out_prefix=str(out_path / "texrecon" / "low" / "model_textured_low"), mock_mode=mock, scene_ready=True)[0]
+
+    if not (cleaned_low_path and Path(cleaned_low_path).is_file()):
+        return high(), None
+    free_gb = float(describe_resources().get("ram_free_gb") or 0.0)
+    parallel = config.texrecon.parallel_low and free_gb >= config.texrecon.parallel_min_free_gb
+    telemetry.set_info(texrecon_parallel={"parallel": parallel, "free_ram_gb": round(free_gb, 1)})
+    if not parallel:
+        high_obj = high()
+        try:
+            return high_obj, low()
+        except Exception as tr_low_err:
+            logger.warning(f"texrecon low-poly texturing failed ({tr_low_err}).")
+            return high_obj, None
+    with ThreadPoolExecutor(max_workers=2) as ex:       # texrecon is a subprocess: threads are enough
+        f_high, f_low = ex.submit(high), ex.submit(low)
+        try:
+            low_obj = f_low.result()
+        except Exception as tr_low_err:
+            logger.warning(f"texrecon low-poly texturing failed ({tr_low_err}).")
+            low_obj = None
+        return f_high.result(), low_obj
 
 
 def _check_lift(pose_q: Optional[Dict[str, Any]], turntable: TurntableConfig, n_levels: int,
@@ -787,7 +850,8 @@ def _hull_touches_cylinder(hull: Dict[str, Any], config: PipelineConfig) -> bool
 
 
 def _generate_masks(cameras_known_sfm: str, masks_out_dir: str, config: PipelineConfig, workers: int,
-                    telemetry: Optional[SystemTelemetry] = None) -> Tuple[int, Optional[Dict[str, Any]]]:
+                    telemetry: Optional[SystemTelemetry] = None,
+                    ai_cache_dir: Optional[str] = None) -> Tuple[int, Optional[Dict[str, Any]]]:
     """
     Step 2.5: one foreground mask per photo (masking cylinder + foreground + tag blackout).
     AI foreground (masking.method "ai", model available): the model runs on 1 view in ai_view_stride, the visual hull is
@@ -852,6 +916,7 @@ def _generate_masks(cameras_known_sfm: str, masks_out_dir: str, config: Pipeline
             ai_threads=m.ai_threads,
             ai_min_area_ratio=m.ai_min_area_ratio,
             stats=stats,
+            ai_cache_dir=ai_cache_dir,
         )
         return out, stats
 
@@ -876,9 +941,12 @@ def _generate_masks(cameras_known_sfm: str, masks_out_dir: str, config: Pipeline
             min_bg_votes=vh.min_bg_votes, distorted=True, disc_radius_m=m.disc_radius_m)
         rest = [c for c in cams if c["view_id"] not in model_ids]
         if visual_hull.hull_stats(hull).get("voxels_total", 0) >= 100:
-            for c in rest:
+            def write_silhouette(c: Dict[str, Any]) -> None:
                 dst = Path(masks_out_dir) / f"{c['view_id']}_{Path(c['path']).stem}.mask.png"
                 cv2.imwrite(str(dst), visual_hull.hull_silhouette(hull, c, distorted=True))
+
+            with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:   # numpy / OpenCV release the GIL
+                list(ex.map(write_silhouette, rest))
             info["views_hull_silhouette"] = len(rest)
             written = dict(written, **{c["view_id"]: "hull" for c in rest})
             logger.info(f"AI masks on {len(model_ids)} views; the other {len(rest)} views get the silhouette of the "

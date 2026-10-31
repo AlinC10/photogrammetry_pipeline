@@ -8,6 +8,7 @@ fail the scan.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -29,15 +30,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _safe(fn):
-    """Decorator: metrics never raise."""
+    """Decorator: metrics never raise. functools.wraps keeps the qualified name, so the metrics pickle into the
+    background worker processes (parallel.LoggingProcessPool)."""
+    @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         try:
             return fn(*args, **kwargs)
         except Exception as e:  # noqa: BLE001 - a metric must not stop the pipeline
             logger.debug(f"Metric {fn.__name__} failed: {e}")
             return None
-    wrapper.__name__ = fn.__name__
-    wrapper.__doc__ = fn.__doc__
     return wrapper
 
 

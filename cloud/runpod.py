@@ -27,23 +27,43 @@ logger = logging.getLogger("TurntableStudio.RunPod")
 
 REST_URL = "https://rest.runpod.io/v1"
 
-# Cheap CUDA GPUs first: GPU speed barely matters (2.3 of 30 min are GPU compute), host RAM and vCPUs do.
-# Exact ids are RunPod's gpuTypeIds enum (some contain double spaces there): check with --dry_run.
-DEFAULT_GPU_TYPES = (
-    "NVIDIA GeForce RTX 3090",
-    "NVIDIA GeForce RTX 4090",
-    "NVIDIA RTX A4000",
-    "NVIDIA RTX A4500",
-    "NVIDIA RTX A5000",
-    "NVIDIA L4",
-    "NVIDIA A40",
+# Fastest first (DensifyPointCloud runs on CUDA), each with its Secure Cloud on-demand $/h (runpod.io/pricing,
+# 31.10.2026). Only GPUs up to RUNPOD_MAX_GPU_PRICE are asked for. Exact ids are RunPod's gpuTypeIds enum: check
+# with --dry_run.
+GPU_TYPES_BY_SPEED = (
+    ("NVIDIA GeForce RTX 5090", 1.19),           # sm_120: runs the compute_89 PTX through the driver's JIT (untested)
+    ("NVIDIA GeForce RTX 4090", 0.89),          # about as fast as the L40S (48 GB VRAM unused: ~1 GB needed)
+    ("NVIDIA L40S", 1.09),
+    ("NVIDIA RTX 6000 Ada Generation", 0.99),
+    ("NVIDIA L40", 0.82),
+    ("NVIDIA GeForce RTX 3090", 0.50),
+    ("NVIDIA RTX A6000", 0.59),
+    ("NVIDIA A40", 0.59),
+    ("NVIDIA RTX A5000", 0.27),
+    ("NVIDIA RTX A4500", 0.34),                  # no longer on the pricing page: last price seen
+    ("NVIDIA L4", 0.59),
+    ("NVIDIA RTX A4000", 0.25),
 )
+MAX_GPU_PRICE = float(os.environ.get("RUNPOD_MAX_GPU_PRICE", "1.10"))
+
+
+def gpu_types_up_to(max_price: float) -> List[str]:
+    """GPU ids of GPU_TYPES_BY_SPEED (fastest first) that cost at most max_price per hour."""
+    return [gpu for gpu, price in GPU_TYPES_BY_SPEED if price <= max_price]
+
+
+DEFAULT_GPU_TYPES = tuple(gpu_types_up_to(MAX_GPU_PRICE))
 
 # ── Limits (each one can be overridden by an environment variable) ─────────────────────────────────────────────────
 # A pod that runs longer than this is terminated. The pod's R2 credentials expire after the same time.
 POD_MAX_RUNTIME_S = float(os.environ.get("RUNPOD_POD_MAX_RUNTIME_S", str(60 * 60)))
 # Pods started for one job (a retry happens only for "ram_insufficient" or a pod that died without a status)
 MAX_POD_ATTEMPTS = int(os.environ.get("RUNPOD_MAX_POD_ATTEMPTS", "2"))
+# Asked for first: the price is per GPU, yet the same RTX 3090 came with 8 vCPU (6 usable, 27 min, timed out)
+# or 32 vCPU (31 usable, 18 min). Only when no host has them is the request lowered to the job's minimum.
+# 0 disables the preferred request.
+PREFERRED_VCPU = int(os.environ.get("RUNPOD_PREFERRED_VCPU", "16"))
+PREFERRED_RAM_GB = int(os.environ.get("RUNPOD_PREFERRED_RAM_GB", "48"))
 # Create requests rejected for lack of capacity cost nothing: retried this many times
 MAX_CREATE_ATTEMPTS = int(os.environ.get("RUNPOD_MAX_CREATE_ATTEMPTS", "5"))
 CREATE_RETRY_S = 30.0
@@ -200,16 +220,32 @@ def _pod_summary(pod: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def preferred_request(body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The same request with PREFERRED_VCPU / PREFERRED_RAM_GB (never below its own minimums); None when it would
+    ask for nothing more."""
+    vcpu = max(int(body["minVCPUPerGPU"]), PREFERRED_VCPU)
+    ram = max(int(body["minRAMPerGPU"]), PREFERRED_RAM_GB)
+    if (vcpu, ram) == (int(body["minVCPUPerGPU"]), int(body["minRAMPerGPU"])):
+        return None
+    return dict(body, minVCPUPerGPU=vcpu, minRAMPerGPU=ram)
+
+
 def create_pod_with_retries(client: RunPodClient, body: Dict[str, Any],
                             wait: Callable[[float], bool]) -> Optional[Dict[str, Any]]:
-    """Create requests rejected (no capacity with these filters) cost nothing: retry a few times, then give up."""
+    """
+    Create requests rejected (no capacity with these filters) cost nothing. Every attempt asks first for the
+    preferred vCPUs / RAM and, when no host has them, at once for the job's minimum; retry a few times, then give up.
+    """
+    tiers = [b for b in (preferred_request(body), body) if b is not None]
     for attempt in range(1, MAX_CREATE_ATTEMPTS + 1):
-        try:
-            return client.create_pod(body)
-        except Exception as e:
-            logger.warning(f"Pod creation failed (attempt {attempt} of {MAX_CREATE_ATTEMPTS}): {e}")
-            if attempt < MAX_CREATE_ATTEMPTS and wait(CREATE_RETRY_S):
-                return None
+        for b in tiers:
+            try:
+                return client.create_pod(b)
+            except Exception as e:
+                logger.warning(f"Pod creation failed with >= {b['minVCPUPerGPU']} vCPU, >= {b['minRAMPerGPU']} GB "
+                               f"(attempt {attempt} of {MAX_CREATE_ATTEMPTS}): {e}")
+        if attempt < MAX_CREATE_ATTEMPTS and wait(CREATE_RETRY_S):
+            return None
     return None
 
 
@@ -243,6 +279,9 @@ def run_pod(
         return None
     run = PodRun(pod_id=created["id"], started_at=time.time(), pod_info=_pod_summary(created))
     say(f"Created pod {run.pod_id}: {run.pod_info}")
+    if float(run.pod_info.get("costPerHr") or 0) > MAX_GPU_PRICE:
+        say(f"Warning: the pod costs {run.pod_info['costPerHr']} $/h, above RUNPOD_MAX_GPU_PRICE = {MAX_GPU_PRICE:g} "
+            "(RunPod prices changed? update GPU_TYPES_BY_SPEED in cloud/runpod.py).")
     try:
         errors = 0
         started = read_started is None

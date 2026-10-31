@@ -313,3 +313,18 @@ class TestAiMasks(unittest.TestCase):
         from pipeline.mask_processor import ai_model_available
         self.assertFalse(ai_model_available(None))
         self.assertFalse(ai_model_available("/no/such/model.onnx"))
+
+
+class TestAiCache(unittest.TestCase):
+    def test_cached_model_output_is_reused(self):
+        """Second masking of the same view (wider cylinder): the saved model output, no model run."""
+        from pipeline.mask_processor import ai_foreground_probability
+        with tempfile.TemporaryDirectory() as d:
+            cache = Path(d) / "1_f_1000.npy"
+            y = np.zeros((512, 512), np.float32)
+            y[100:400, 200:300] = 1.0
+            np.save(str(cache), y)
+            prob = ai_foreground_probability(np.zeros((300, 400, 3), np.uint8), "/no/such/model.onnx", cache_path=cache)
+            self.assertEqual(prob.shape, (300, 400))
+            self.assertGreater(prob[150, 200], 0.9)
+            self.assertLess(prob[10, 10], 0.1)

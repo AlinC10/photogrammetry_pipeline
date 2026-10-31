@@ -441,13 +441,21 @@ def ai_model_available(model_path: Optional[str]) -> bool:
         return False
 
 
-def ai_foreground_probability(rgb: np.ndarray, model_path: str, resolution: int = 512, threads: int = 2) -> np.ndarray:
+def ai_foreground_probability(rgb: np.ndarray, model_path: str, resolution: int = 512, threads: int = 2,
+                              cache_path: Optional[Union[str, Path]] = None) -> np.ndarray:
     """
     Foreground probability (float32, image size) of an RGB uint8 image from a dichotomous / salient-object model
     (BiRefNet_lite, 512 x 512 ONNX export). No class and no prompt: the "main thing" in the picture, which here is the
     object on the turntable together with the disc (the disc is removed by geometry: cylinder, tag blackout,
     slice at Y = 3 mm). Measured on the scans of 30.10.2026: complete white labels, white aluminium, black PLA.
+    `cache_path` (.npy): the model output at `resolution` is saved there and read back instead of running the model
+    again (masks redone with a wider cylinder: only the geometry changes, ~1.5 s per view saved).
     """
+    h, w = rgb.shape[:2]
+    if cache_path is not None and Path(cache_path).is_file():
+        y = np.load(str(cache_path))
+        return cv2.resize(y, (w, h), interpolation=cv2.INTER_LINEAR)
+
     import onnxruntime as ort
 
     if _AI_SESSION["session"] is None or _AI_SESSION["path"] != model_path:
@@ -457,12 +465,14 @@ def ai_foreground_probability(rgb: np.ndarray, model_path: str, resolution: int 
         _AI_SESSION["session"] = ort.InferenceSession(model_path, so, providers=["CPUExecutionProvider"])
         _AI_SESSION["path"] = model_path
     sess = _AI_SESSION["session"]
-    h, w = rgb.shape[:2]
     x = cv2.resize(rgb, (resolution, resolution), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
     x = ((x - _IMAGENET_MEAN) / _IMAGENET_STD).transpose(2, 0, 1)[None].astype(np.float32)
     y = sess.run(None, {sess.get_inputs()[0].name: x})[-1][0, 0].astype(np.float32)
     if y.min() < 0.0 or y.max() > 1.0:          # logits
         y = 1.0 / (1.0 + np.exp(-y))
+    if cache_path is not None:
+        Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+        np.save(str(cache_path), y)
     return cv2.resize(y, (w, h), interpolation=cv2.INTER_LINEAR)
 
 
@@ -506,7 +516,10 @@ def _mask_one_view(task: Dict[str, Any]) -> Optional[Tuple[str, str, str, str]]:
         rgb = cv2.cvtColor(cv2.imread(str(src_path), cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
         mask = generate_hybrid_mask(image=rgb, **common)
         try:
-            prob = ai_foreground_probability(rgb, task["ai_model"], task["ai_resolution"], task["ai_threads"])
+            cache = (Path(task["ai_cache_dir"]) / f"{v.get('viewId', task['index'])}_{src_path.stem}.npy"
+                     if task.get("ai_cache_dir") else None)
+            prob = ai_foreground_probability(rgb, task["ai_model"], task["ai_resolution"], task["ai_threads"],
+                                             cache_path=cache)
             ai_mask = generate_hybrid_mask(image=rgb, ai_probability=prob, **common)
             # The model can miss the object altogether on a view (seen at 384 px on the aluminium bottle): keep the
             # photometric mask when the AI one covers much less than it, inside the same working volume
@@ -564,12 +577,14 @@ def batch_generate_masks(
     ai_threads: int = 2,
     ai_min_area_ratio: float = 0.25,
     stats: Optional[Dict[str, Any]] = None,
+    ai_cache_dir: Optional[Union[str, Path]] = None,
 ) -> Dict[str, str]:
     """
     Generates automated binary masks for all views in the dataset, `workers` images at a time
     (separate processes; the result is identical to the serial run).
     `ai_model`: ONNX model of ai_foreground_probability (each worker loads it once, `ai_threads` threads);
-    None = photometric masks. `stats` (optional dict) receives the number of masks per method.
+    None = photometric masks. `stats` (optional dict) receives the number of masks per method. `ai_cache_dir`: model
+    outputs kept between two maskings of the same scan (ai_foreground_probability cache_path).
     Saves `<viewId>_<stem>.mask.png` in output_masks_dir.
     Returns mapping: {image_filename: mask_file_path}.
     """
@@ -601,6 +616,7 @@ def batch_generate_masks(
             "ai_resolution": ai_resolution,
             "ai_threads": ai_threads,
             "ai_min_area_ratio": ai_min_area_ratio,
+            "ai_cache_dir": str(ai_cache_dir) if ai_cache_dir else None,
         })
 
     mask_map: Dict[str, str] = {}

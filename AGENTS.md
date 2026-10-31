@@ -68,7 +68,7 @@ To prevent dark patches, Poisson bleeding, and micro-confetti texture atlases:
 - `--empty-color 0`: Fills unobserved faces (e.g. flat cut bottom) and empty atlas areas with clean black (`RGB 0,0,0`), not neon orange.
 
 ### RULE 9: Testing & Documentation Integrity
-- All unit tests in `tests/` (120 at the time of writing) must pass before any commit.
+- All unit tests in `tests/` (128 at the time of writing) must pass before any commit.
 - Preserve existing docstrings, comments, and structure.
 
 ---
@@ -85,7 +85,7 @@ turntable_studio/
 ├── .env.example                # Keys for the cloud flow (.env is ignored by git and Docker)
 ├── cloud/
 │   ├── cloudflare_r2.py        # R2 client, jobs/<id>/input|output layout, temporary prefix-scoped credentials
-│   ├── runpod.py               # RunPod REST pods: GPU list + min RAM/vCPU, guaranteed termination, bounded retries
+│   ├── runpod.py               # RunPod REST pods: GPUs fastest first under a price cap + preferred, then min RAM/vCPU, guaranteed termination, bounded retries
 │   └── job.py                  # Whole cloud flow for one scan (upload -> pod -> download -> cleanup)
 ├── tools/                      # Local only (not in the image): cloud_scan.py, docker_scan.ps1, fit_ram_model.py, collect_stats.py,
 │                               #   debug_texturing.py (texture diagnostics), debug_blender_compare.py (headless Blender)
@@ -97,6 +97,7 @@ turntable_studio/
 │   ├── config.py               # Dataclass configurations and OpenMVS binary locator
 │   ├── telemetry.py            # Hardware resource profiler (Peak RAM, VRAM, per-step timing, run_info)
 │   ├── resources.py            # cgroup-aware CPUs/RAM, DensifyPointCloud RAM estimate + check, worker count
+│   ├── parallel.py             # Spawned process pool whose workers log into run_log.txt (background metrics, exports)
 │   ├── run_metrics.py          # stats.json features for RAM/time/quality models (hardware, disk speed, object, logs)
 │   ├── camera_init.py          # Image discovery (flat or rig/0 + rig/1) and CameraInit SFM
 │   ├── turntable_poses.py      # AprilTag disc detection and rigid pose calculation (LOCKED)
@@ -122,6 +123,7 @@ turntable_studio/
     │                           #   ambiguous disc cone, hull silhouettes, refinement skipped on a too short hull
     ├── test_rig_refine.py      # Recovers a known carriage tilt / cam1 offset; guards keep the tag poses; sfm column-major
     ├── test_main_checks.py     # Tag-correction warning, masking cylinder widened when the hull reaches it
+    ├── test_parallel.py        # Worker logs forwarded, export with a pool = sequential export, texrecon scene once, zip
     ├── test_mesh_cleaner.py    # 2D Ear-clipping and watertight base tests
     ├── test_openmvs_runner.py  # TextureMesh PLY (texcoord, texnumber) -> OBJ + MTL conversion
     ├── test_exporter.py        # Multi-LOD OBJ, MTL, JPG/PNG, and GLB bundle tests (incl. multi-material GLB)
@@ -130,7 +132,7 @@ turntable_studio/
     ├── test_camera_init.py     # turntable_poses command line (--liftMm, --tagRefine)
     ├── test_resources.py       # cgroup limits, RAM estimate vs measured runs, worker count
     ├── test_run_metrics.py     # log parsers, object/mesh metrics, telemetry step fields, CSV collector
-    ├── test_cloud.py           # R2 layout, temporary credentials, pod lifecycle (in-memory S3, fake RunPod)
+    ├── test_cloud.py           # R2 layout, temporary credentials, pod lifecycle, preferred then minimum pod request (in-memory S3, fake RunPod)
     └── test_telemetry.py       # RAM/VRAM profiler and timer tests
 ```
 

@@ -261,6 +261,9 @@ class TexReconConfig:
     num_threads: Optional[int] = None   # None = auto-detect all available CPU cores
     write_timings: bool = True
     write_intermediate_results: bool = False
+    # High- and low-poly texrecon at the same time (one run peaked ~9 GB on a 120-photo scan): only with this much RAM free
+    parallel_low: bool = True
+    parallel_min_free_gb: float = 16.0
 
 
 @dataclass

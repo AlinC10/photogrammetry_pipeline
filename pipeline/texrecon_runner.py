@@ -540,6 +540,19 @@ class TexReconRunner:
         if not self.config.texrecon_bin:
             self.config.texrecon_bin = find_texrecon_binary(self.config.bin_dir)
 
+    def prepare_scene(self, sfm_data_path: str, images_folder: str) -> Path:
+        """
+        Writes the .cam scene once (it is rebuilt from scratch: export_sfm_to_cam_scene removes the folder), so the
+        high- and low-poly runs can share it and run at the same time (run_texturing(..., scene_ready=True)).
+        """
+        scene_dir = self.work_dir / "scene"
+        export_sfm_to_cam_scene(
+            sfm_data_path=sfm_data_path,
+            undistorted_images_dir=images_folder,
+            output_scene_dir=str(scene_dir),
+        )
+        return scene_dir
+
     def run_texturing(
         self,
         sfm_data_path: str,
@@ -547,6 +560,7 @@ class TexReconRunner:
         images_folder: str,
         out_prefix: Optional[str] = None,
         mock_mode: bool = False,
+        scene_ready: bool = False,
     ) -> Tuple[str, str]:
         """
         Executes texrecon on the input mesh and cameras.
@@ -557,6 +571,8 @@ class TexReconRunner:
             images_folder: Path to undistorted images directory
             out_prefix: Output path prefix for generated textured OBJ/MTL
             mock_mode: If True, simulates execution for testing without texrecon binary
+            scene_ready: the .cam scene was written by prepare_scene (concurrent runs must not rebuild it). Two runs
+                at the same time also need different output folders: texrecon refuses a "tmp" folder it did not make.
 
         Returns:
             Tuple of (textured_obj_path, textured_mtl_path)
@@ -571,11 +587,8 @@ class TexReconRunner:
 
         # 1. Prepare scene folder with .cam files and images
         scene_dir = self.work_dir / "scene"
-        export_sfm_to_cam_scene(
-            sfm_data_path=sfm_data_path,
-            undistorted_images_dir=images_folder,
-            output_scene_dir=str(scene_dir),
-        )
+        if not scene_ready:
+            self.prepare_scene(sfm_data_path, images_folder)
 
         # 2. texrecon expects input mesh in .ply format. Convert if OBJ.
         if in_mesh_p.suffix.lower() == ".ply":

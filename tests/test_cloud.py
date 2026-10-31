@@ -230,9 +230,10 @@ class TestTempCredentials(unittest.TestCase):
 
 class TestRunPod(unittest.TestCase):
     def setUp(self):
-        patcher = mock.patch.object(rp.time, "sleep", lambda s: None)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for patcher in (mock.patch.object(rp.time, "sleep", lambda s: None),
+                        mock.patch.object(rp, "PREFERRED_VCPU", 0), mock.patch.object(rp, "PREFERRED_RAM_GB", 0)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def body(self, ram=16):
         return rp.build_pod_request("ghcr.io/u/img:v1", {"JOB_ID": "j1", "R2_OUT_SECRET_ACCESS_KEY": "x"},
@@ -245,6 +246,14 @@ class TestRunPod(unittest.TestCase):
         self.assertEqual((b["minRAMPerGPU"], b["minVCPUPerGPU"], b["gpuCount"]), (16, 8, 1))
         self.assertEqual(rp.redact(b)["env"]["R2_OUT_SECRET_ACCESS_KEY"], "***")
         self.assertEqual(rp.disk_gb_for(120, 0.6, 1), 22)
+
+    def test_gpus_fastest_first_up_to_the_price_cap(self):
+        gpus = rp.gpu_types_up_to(1.10)
+        self.assertEqual(gpus[:2], ["NVIDIA GeForce RTX 4090", "NVIDIA L40S"])
+        self.assertNotIn("NVIDIA GeForce RTX 5090", gpus)
+        self.assertEqual(rp.gpu_types_up_to(1.20)[0], "NVIDIA GeForce RTX 5090")
+        self.assertLess(gpus.index("NVIDIA GeForce RTX 3090"), gpus.index("NVIDIA RTX A4000"))
+        self.assertEqual(len(set(gpus)), len(gpus))
 
     def test_pod_terminated_after_status(self):
         api = FakeRunPod()
@@ -282,6 +291,27 @@ class TestRunPod(unittest.TestCase):
         self.assertIsNone(rp.run_pod(api, self.body(), lambda: None, poll_s=0))
         self.assertEqual(len(api.bodies), rp.MAX_CREATE_ATTEMPTS)
         self.assertEqual(api.created, [])
+
+    def test_preferred_request_first_then_minimum(self):
+        with mock.patch.object(rp, "PREFERRED_VCPU", 16), mock.patch.object(rp, "PREFERRED_RAM_GB", 48):
+            api = FakeRunPod()
+            rp.run_pod(api, self.body(), lambda: {"state": "ok"}, poll_s=0)
+            self.assertEqual((api.bodies[0]["minVCPUPerGPU"], api.bodies[0]["minRAMPerGPU"]), (16, 48))
+
+            api = FakeRunPod(fail_creates=1)      # no host with 16 vCPU / 48 GB: the minimum at once, no wait
+            with mock.patch.object(rp.time, "sleep") as sleep:
+                run = rp.run_pod(api, self.body(), lambda: {"state": "ok"}, poll_s=0)
+            self.assertNotIn(mock.call(rp.CREATE_RETRY_S), sleep.call_args_list)
+            self.assertEqual([(b["minVCPUPerGPU"], b["minRAMPerGPU"]) for b in api.bodies], [(16, 48), (8, 16)])
+            self.assertEqual(run.pod_info["vcpuCount"], 8)
+
+            api = FakeRunPod(fail_creates=99)
+            self.assertIsNone(rp.run_pod(api, self.body(), lambda: None, poll_s=0))
+            self.assertEqual(len(api.bodies), 2 * rp.MAX_CREATE_ATTEMPTS)
+
+            # A job that already needs more than the preferred RAM keeps its own minimum
+            self.assertEqual(rp.preferred_request(self.body(ram=60))["minRAMPerGPU"], 60)
+            self.assertIsNone(rp.preferred_request(rp.build_pod_request("i", {}, 64, 32, 30)))
 
     def test_ram_insufficient_retries_with_more_ram(self):
         api = FakeRunPod()

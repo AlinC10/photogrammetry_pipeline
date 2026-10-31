@@ -19,7 +19,7 @@ import trimesh
 from PIL import Image
 
 from .config import MeshCleaningConfig, PipelineConfig
-from .telemetry import SystemTelemetry
+from .telemetry import SystemTelemetry, mesh_file_metrics
 
 logger = logging.getLogger("TurntableStudio.Exporter")
 
@@ -638,6 +638,13 @@ def package_textured_model(
 DELIVERABLE_DIRS = (("obj", "high"), ("obj", "low"), ("stl",), ("3mf",), ("glb",))
 # Reports packed next to the deliverables (pose quality: RMS, lift, rig correction; poses for re-use)
 REPORT_FILES = ("object.json", "turntable_report.txt", "turntable_calib.json", "rig_refine.json")
+# Already compressed: stored as they are (deflating them again costs seconds and saves nothing)
+STORED_SUFFIXES = {".png", ".jpg", ".jpeg", ".glb", ".3mf", ".zip", ".gz"}
+
+
+def _zip_write(zipf: zipfile.ZipFile, path: Path, arcname: str) -> None:
+    method = zipfile.ZIP_STORED if Path(path).suffix.lower() in STORED_SUFFIXES else zipfile.ZIP_DEFLATED
+    zipf.write(path, arcname=arcname, compress_type=method)
 
 
 def collect_log_files(output_dir: str, extra_dirs: Optional[List[str]] = None) -> Dict[str, str]:
@@ -655,7 +662,7 @@ def collect_log_files(output_dir: str, extra_dirs: Optional[List[str]] = None) -
         for f in sorted(d.glob("*.log")) if d.is_dir() else []:
             logs[f"logs/openmvs/{f.name}"] = str(f)
     tr_dir = out_base / "texrecon"
-    for f in sorted(tr_dir.glob("*.log")) if tr_dir.is_dir() else []:
+    for f in sorted(tr_dir.rglob("*.log")) if tr_dir.is_dir() else []:   # low-poly run: texrecon/low/
         logs[f"logs/texrecon/{f.name}"] = str(f)
     return logs
 
@@ -668,7 +675,7 @@ def package_output_zip(
 ) -> Path:
     """
     Builds output.zip: obj/, stl/, 3mf/, glb/, stats.json, turntable_report.txt,
-    turntable_calib.json and logs/ (log_files = {arcname: path}).
+    turntable_calib.json and logs/ (log_files = {arcname: path}). PNG/JPG/GLB/3MF are stored, the rest deflated.
     """
     out_base = Path(output_dir).resolve()
     zip_path = out_base / zip_name
@@ -676,22 +683,137 @@ def package_output_zip(
 
     with zipfile.ZipFile(str(zip_path), "w", compression=zipfile.ZIP_DEFLATED) as zipf:
         if stats_json_path and Path(stats_json_path).is_file():
-            zipf.write(stats_json_path, arcname="stats.json")
+            _zip_write(zipf, Path(stats_json_path), "stats.json")
         for name in REPORT_FILES:
             if (out_base / name).is_file():
-                zipf.write(out_base / name, arcname=name)
+                _zip_write(zipf, out_base / name, name)
         for parts in DELIVERABLE_DIRS:
             folder = out_base.joinpath(*parts)
             for root, _, files in os.walk(folder):
                 for f in sorted(files):
                     file_p = Path(root) / f
-                    zipf.write(file_p, arcname=str(file_p.relative_to(out_base)))
+                    _zip_write(zipf, file_p, str(file_p.relative_to(out_base)))
         for arcname, path in sorted((log_files or {}).items()):
             if Path(path).is_file():
-                zipf.write(path, arcname=arcname)
+                _zip_write(zipf, Path(path), arcname)
 
     logger.info(f"Created {zip_path.name} ({zip_path.stat().st_size / (1024 * 1024):.2f} MB)")
     return zip_path
+
+
+def export_print_assets(mesh_path: str, stl_path: str, mf_path: str, scale: float) -> List[str]:
+    """
+    Watertight STL and 3MF at real-world scale, standing upright (Z-up) from the cleaned mesh. Module level: main.py
+    runs it in a worker right after mesh cleaning, beside the texturing. Returns the files written.
+    """
+    mesh = trimesh.load(mesh_path, process=False)
+    if scale != 1.0:
+        mesh = mesh.copy()
+        mesh.apply_scale(scale)
+    mesh = to_print_frame(mesh)
+    mesh.export(str(stl_path), file_type="stl")
+    written = [str(stl_path)]
+    try:
+        mesh.export(str(mf_path), file_type="3mf")
+        written.append(str(mf_path))
+    except Exception as e:
+        logger.warning(f"3MF export warning: {e}")
+    return written
+
+
+def _export_textured_high(tex_p: str, high_obj: str, high_mtl: str, high_glb: str, exp_scale: float, draco: bool,
+                          cleaned_mesh_path: str) -> None:
+    """High-poly OBJ with lossless PNG atlases, then its GLB (embedded PNG)."""
+    src_mtl, src_tex_imgs = find_source_mtl_and_textures(Path(tex_p))
+    package_textured_model(
+        src_obj_path=Path(tex_p),
+        dst_obj_path=Path(high_obj),
+        dst_mtl_path=Path(high_mtl),
+        src_mtl_path=src_mtl,
+        src_texture_images=src_tex_imgs,
+        target_format="png",
+        downscale_max_dim=None,
+        scale=exp_scale,
+    )
+    try:
+        convert_obj_to_glb(
+            obj_folder_or_path=Path(high_obj),
+            glb_path=Path(high_glb),
+            compress_textures=False,  # High-poly retains lossless PNG texture
+            draco=draco,
+        )
+    except Exception as ge:
+        logger.warning(f"High GLB export warning: {ge}. Using standard GLB export.")
+        trimesh.load(cleaned_mesh_path, process=False).export(str(high_glb), file_type="glb")
+
+
+def _export_textured_low(low_src: str, low_obj: str, low_mtl: str, low_glb: str, exp_scale: float, draco: bool,
+                         cleaned_mesh_path: str, fallback_mtl: Optional[str] = None,
+                         fallback_images: Optional[List[str]] = None) -> None:
+    """Low-poly OBJ from the dedicated low-poly texturing (native UVs, JPG ≤ 2048 px), then its GLB."""
+    low_src_p = Path(low_src)
+    low_src_mtl, low_src_tex_imgs = find_source_mtl_and_textures(low_src_p)
+    package_textured_model(
+        src_obj_path=low_src_p,
+        dst_obj_path=Path(low_obj),
+        dst_mtl_path=Path(low_mtl),
+        src_mtl_path=low_src_mtl or (Path(fallback_mtl) if fallback_mtl else None),
+        src_texture_images=low_src_tex_imgs or [Path(x) for x in (fallback_images or [])],
+        target_format="jpg",
+        downscale_max_dim=2048,
+        jpg_quality=85,
+        scale=exp_scale,
+    )
+    logger.info("Successfully packaged Low-Poly OBJ from dedicated branching texturing!")
+    try:
+        convert_obj_to_glb(
+            obj_folder_or_path=Path(low_obj),
+            glb_path=Path(low_glb),
+            compress_textures=True,  # Low-poly compresses textures to web-optimized JPEG
+            jpeg_quality=85,
+            draco=draco,
+        )
+    except Exception as ge:
+        logger.warning(f"Low GLB export warning: {ge}. Using standard GLB export.")
+        trimesh.load(cleaned_mesh_path, process=False).export(str(low_glb), file_type="glb")
+
+
+def _export_low_print(low_obj: str, low_stl: str, low_3mf: str, cleaned_mesh_path: str) -> None:
+    """Low-poly STL and 3MF from model_low.obj (already at real-world scale), Z-up."""
+    loaded_low = trimesh.load(str(low_obj), process=False)
+    if isinstance(loaded_low, trimesh.Scene):
+        geoms = [g for g in loaded_low.geometry.values() if isinstance(g, trimesh.Trimesh)]
+        low_trimesh = trimesh.util.concatenate(geoms) if geoms else trimesh.load(cleaned_mesh_path, process=False)
+    else:
+        low_trimesh = loaded_low.copy()
+    low_trimesh = to_print_frame(low_trimesh)   # STL / 3MF are Z-up
+    low_trimesh.export(str(low_stl), file_type="stl")
+    try:
+        low_trimesh.export(str(low_3mf), file_type="3mf")
+    except Exception as e:
+        logger.warning(f"Low-poly 3MF export warning: {e}")
+
+
+def _export_low_chain(low_src: str, low_obj: str, low_mtl: str, low_glb: str, low_stl: str, low_3mf: str,
+                      exp_scale: float, draco: bool, cleaned_mesh_path: str) -> None:
+    _export_textured_low(low_src, low_obj, low_mtl, low_glb, exp_scale, draco, cleaned_mesh_path)
+    _export_low_print(low_obj, low_stl, low_3mf, cleaned_mesh_path)
+
+
+class _Done:
+    """Result of a job run in this process (no pool): same interface as a Future."""
+
+    def __init__(self, fn, *args):
+        self._value, self._error = None, None
+        try:
+            self._value = fn(*args)
+        except Exception as e:
+            self._error = e
+
+    def result(self):
+        if self._error is not None:
+            raise self._error
+        return self._value
 
 
 def export_multi_lod_bundle(
@@ -702,6 +824,9 @@ def export_multi_lod_bundle(
     config: PipelineConfig,
     stats_json_path: Optional[str] = None,
     textured_low_obj_path: Optional[str] = None,
+    make_zip: bool = True,
+    pool: Optional[Any] = None,
+    print_high: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Generates all deliverables matching Cloudflare R2 and RunPod specifications:
@@ -713,7 +838,10 @@ def export_multi_lod_bundle(
       output_dir/3mf/low_model.3mf
       output_dir/glb/high_model.glb (embedded PNG texture)
       output_dir/glb/low_model.glb (embedded JPG texture)
-      output_dir/output.zip
+      output_dir/output.zip (make_zip; main.py builds it once at the very end instead)
+    `pool` (parallel.LoggingProcessPool): the high-poly chain (OBJ + PNG -> GLB), the low-poly chain (OBJ + JPG -> GLB
+    -> STL/3MF), the high STL/3MF and the mesh metrics of telemetry run in its workers; the files are the same as
+    without a pool. `print_high`: high STL / 3MF already written (export_print_assets after mesh cleaning), moved in.
     """
     out_base = Path(output_dir).resolve()
     obj_high_dir = out_base / "obj" / "high"
@@ -736,26 +864,6 @@ def export_multi_lod_bundle(
     high_3mf = mf_dir / "high_model.3mf"
     high_glb = glb_dir / "high_model.glb"
 
-    # Base geometry for 3D printing (watertight from mesh_cleaner)
-    cleaned_trimesh = trimesh.load(cleaned_mesh_path, process=False)
-    exp_scale = float(getattr(config, "export_scale", 100.0))
-    if exp_scale != 1.0:
-        high_print_mesh = cleaned_trimesh.copy()
-        high_print_mesh.apply_scale(exp_scale)
-    else:
-        high_print_mesh = cleaned_trimesh
-
-    # Export watertight STL and 3MF at real-world scale, standing upright (Z-up)
-    high_print_mesh = to_print_frame(high_print_mesh)
-    high_print_mesh.export(str(high_stl), file_type="stl")
-    telemetry.record_mesh(str(high_stl))
-
-    try:
-        high_print_mesh.export(str(high_3mf), file_type="3mf")
-        telemetry.record_mesh(str(high_3mf))
-    except Exception as e:
-        logger.warning(f"3MF export warning: {e}")
-
     # Low-Poly Assets paths
     low_obj = obj_low_dir / "model_low.obj"
     low_mtl = obj_low_dir / "model_low.mtl"
@@ -763,99 +871,71 @@ def export_multi_lod_bundle(
     low_3mf = mf_dir / "low_model.3mf"
     low_glb = glb_dir / "low_model.glb"
 
+    exp_scale = float(getattr(config, "export_scale", 100.0))
+    draco = getattr(config, "glb_draco", True)
+    run = (lambda name, fn, *a: pool.submit(name, fn, *a)) if pool is not None else (lambda name, fn, *a: _Done(fn, *a))
+
+    # Base geometry for 3D printing (watertight from mesh_cleaner): written beside the texturing, or now
+    pending = []
+    if print_high and Path(print_high[0]).is_file():
+        shutil.move(print_high[0], str(high_stl))
+        if len(print_high) > 1 and Path(print_high[1]).is_file():
+            shutil.move(print_high[1], str(high_3mf))
+    else:
+        pending.append(run("export_high_print", export_print_assets, cleaned_mesh_path, str(high_stl),
+                           str(high_3mf), exp_scale))
+
     has_textures = bool(textured_obj_path and Path(textured_obj_path).is_file())
 
     if has_textures:
         tex_p = Path(textured_obj_path)
-        src_mtl, src_tex_imgs = find_source_mtl_and_textures(tex_p)
-
-        # 1. Package High-Poly OBJ with PNG textures (lossless)
-        package_textured_model(
-            src_obj_path=tex_p,
-            dst_obj_path=high_obj,
-            dst_mtl_path=high_mtl,
-            src_mtl_path=src_mtl,
-            src_texture_images=src_tex_imgs,
-            target_format="png",
-            downscale_max_dim=None,
-            scale=exp_scale,
-        )
-
-        # 2. Package Low-Poly OBJ:
-        # If textured_low_obj_path is provided from branching pipeline, package it directly (native UVs!).
-        # Otherwise, fall back to geometry decimation of high_obj.
-        if textured_low_obj_path and Path(textured_low_obj_path).is_file():
-            low_src_p = Path(textured_low_obj_path)
-            low_src_mtl, low_src_tex_imgs = find_source_mtl_and_textures(low_src_p)
-            package_textured_model(
-                src_obj_path=low_src_p,
-                dst_obj_path=low_obj,
-                dst_mtl_path=low_mtl,
-                src_mtl_path=low_src_mtl or high_mtl,
-                src_texture_images=low_src_tex_imgs or src_tex_imgs,
-                target_format="jpg",
-                downscale_max_dim=2048,
-                jpg_quality=85,
-                scale=exp_scale,
-            )
-            logger.info("Successfully packaged Low-Poly OBJ from dedicated branching texturing!")
+        low_src = Path(textured_low_obj_path) if textured_low_obj_path else None
+        # The two chains are independent when the low-poly texturing brought its own material and atlases
+        low_independent = bool(low_src and low_src.is_file() and all(find_source_mtl_and_textures(low_src)))
+        high_job = run("export_high", _export_textured_high, str(tex_p), str(high_obj), str(high_mtl),
+                       str(high_glb), exp_scale, draco, cleaned_mesh_path)
+        if low_independent:
+            pending.append(run("export_low", _export_low_chain, str(low_src), str(low_obj), str(low_mtl),
+                               str(low_glb), str(low_stl), str(low_3mf), exp_scale, draco, cleaned_mesh_path))
+            high_job.result()
         else:
-            decimate_mesh(
-                input_mesh_path=str(high_obj),
-                output_mesh_path=str(low_obj),
-                target_faces=config.cleaning.target_low_poly_faces,
-            )
-            package_textured_model(
-                src_obj_path=low_obj,
-                dst_obj_path=low_obj,
-                dst_mtl_path=low_mtl,
-                src_mtl_path=high_mtl,
-                src_texture_images=src_tex_imgs,
-                target_format="jpg",
-                downscale_max_dim=2048,
-                jpg_quality=85,
-                scale=1.0,  # high_obj is already scaled by exp_scale, so avoid double-scaling
-            )
-
-        # 4. Generate High-Poly GLB from model_high.obj (contains embedded PNG texture)
-        try:
-            convert_obj_to_glb(
-                obj_folder_or_path=high_obj,
-                glb_path=high_glb,
-                compress_textures=False,  # High-poly retains lossless PNG texture
-                draco=getattr(config, "glb_draco", True),
-            )
-            telemetry.record_mesh(str(high_glb))
-        except Exception as ge:
-            logger.warning(f"High GLB export warning: {ge}. Using standard GLB export.")
-            cleaned_trimesh.export(str(high_glb), file_type="glb")
-            telemetry.record_mesh(str(high_glb))
-
-        # 5. Generate Low-Poly GLB from model_low.obj (contains embedded downscaled JPG texture)
-        try:
-            convert_obj_to_glb(
-                obj_folder_or_path=low_obj,
-                glb_path=low_glb,
-                compress_textures=True,  # Low-poly compresses textures to web-optimized JPEG
-                jpeg_quality=85,
-                draco=getattr(config, "glb_draco", True),
-            )
-            telemetry.record_mesh(str(low_glb))
-        except Exception as ge:
-            logger.warning(f"Low GLB export warning: {ge}. Using standard GLB export.")
-            cleaned_trimesh.export(str(low_glb), file_type="glb")
-            telemetry.record_mesh(str(low_glb))
-
-        telemetry.record_mesh(str(high_obj))
-        telemetry.record_mesh(str(low_obj))
-
+            high_job.result()
+            if low_src and low_src.is_file():
+                _src_mtl, src_imgs = find_source_mtl_and_textures(tex_p)
+                _export_textured_low(str(low_src), str(low_obj), str(low_mtl), str(low_glb), exp_scale, draco,
+                                     cleaned_mesh_path, fallback_mtl=str(high_mtl),
+                                     fallback_images=[str(x) for x in src_imgs])
+            else:
+                # 2. Package Low-Poly OBJ by geometry decimation of high_obj
+                _src_mtl, src_tex_imgs = find_source_mtl_and_textures(tex_p)
+                decimate_mesh(
+                    input_mesh_path=str(high_obj),
+                    output_mesh_path=str(low_obj),
+                    target_faces=config.cleaning.target_low_poly_faces,
+                )
+                package_textured_model(
+                    src_obj_path=low_obj,
+                    dst_obj_path=low_obj,
+                    dst_mtl_path=low_mtl,
+                    src_mtl_path=high_mtl,
+                    src_texture_images=src_tex_imgs,
+                    target_format="jpg",
+                    downscale_max_dim=2048,
+                    jpg_quality=85,
+                    scale=1.0,  # high_obj is already scaled by exp_scale, so avoid double-scaling
+                )
+                try:
+                    convert_obj_to_glb(obj_folder_or_path=low_obj, glb_path=low_glb, compress_textures=True,
+                                       jpeg_quality=85, draco=draco)
+                except Exception as ge:
+                    logger.warning(f"Low GLB export warning: {ge}. Using standard GLB export.")
+                    trimesh.load(cleaned_mesh_path, process=False).export(str(low_glb), file_type="glb")
+            _export_low_print(str(low_obj), str(low_stl), str(low_3mf), cleaned_mesh_path)
     else:
         # Fallback to untextured mesh
+        cleaned_trimesh = trimesh.load(cleaned_mesh_path, process=False)
         cleaned_trimesh.export(str(high_obj), file_type="obj")
         cleaned_trimesh.export(str(high_glb), file_type="glb")
-        telemetry.record_mesh(str(high_obj))
-        telemetry.record_mesh(str(high_glb))
-
         decimate_mesh(
             input_mesh_path=cleaned_mesh_path,
             output_mesh_path=str(low_obj),
@@ -863,38 +943,31 @@ def export_multi_lod_bundle(
         )
         loaded_low = trimesh.load(str(low_obj), process=False)
         loaded_low.export(str(low_glb), file_type="glb")
-        telemetry.record_mesh(str(low_obj))
-        telemetry.record_mesh(str(low_glb))
+        _export_low_print(str(low_obj), str(low_stl), str(low_3mf), cleaned_mesh_path)
 
-    # Low-poly STL and 3MF (loaded from low_obj, which is already scaled to real-world scale exp_scale)
-    loaded_low = trimesh.load(str(low_obj), process=False)
-    if isinstance(loaded_low, trimesh.Scene):
-        geoms = [g for g in loaded_low.geometry.values() if isinstance(g, trimesh.Trimesh)]
-        low_trimesh = trimesh.util.concatenate(geoms) if geoms else cleaned_trimesh.copy()
-    else:
-        low_trimesh = loaded_low.copy()
-    low_trimesh = to_print_frame(low_trimesh)   # STL / 3MF are Z-up
+    for job in pending:
+        job.result()
 
-    low_trimesh.export(str(low_stl), file_type="stl")
-    telemetry.record_mesh(str(low_stl))
+    # Mesh metrics of the deliverables for stats.json (each parse of a 1-2 M face OBJ/STL takes seconds: in parallel)
+    order = [high_stl, high_3mf, high_glb, low_glb, high_obj, low_obj, low_stl, low_3mf]
+    metric_jobs = [run(f"metrics_{p.name}", mesh_file_metrics, str(p)) for p in order]
+    for p, job in zip(order, metric_jobs):
+        try:
+            metrics = job.result() or {}
+        except Exception:
+            metrics = {}
+        telemetry.record_mesh(str(p), **metrics)
 
-    try:
-        low_trimesh.export(str(low_3mf), file_type="3mf")
-        telemetry.record_mesh(str(low_3mf))
-    except Exception as e:
-        logger.warning(f"Low-poly 3MF export warning: {e}")
-
-    # 3. Create output.zip containing the entire tree (main.py repackages it at the very end with the logs)
-    zip_path = package_output_zip(str(out_base), config.zip_name, stats_json_path)
-    zip_size_mb = zip_path.stat().st_size / (1024 * 1024)
-
-    return {
-        "zip_path": str(zip_path),
+    result = {
         "high_obj": str(high_obj),
         "low_obj": str(low_obj),
         "high_stl": str(high_stl),
         "low_stl": str(low_stl),
         "high_glb": str(high_glb),
         "low_glb": str(low_glb),
-        "zip_size_mb": round(zip_size_mb, 2),
     }
+    if make_zip:
+        # 3. Create output.zip containing the entire tree
+        zip_path = package_output_zip(str(out_base), config.zip_name, stats_json_path)
+        result.update(zip_path=str(zip_path), zip_size_mb=round(zip_path.stat().st_size / (1024 * 1024), 2))
+    return result

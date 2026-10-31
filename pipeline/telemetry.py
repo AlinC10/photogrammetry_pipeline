@@ -145,6 +145,32 @@ class MeshMetrics:
     bbox_dimensions_mm: Optional[List[float]] = None
 
 
+def mesh_file_metrics(file_path: str) -> Dict[str, Any]:
+    """
+    Vertex / face counts, watertightness, volume and bbox of an OBJ / STL / PLY file, for record_mesh. Module level, so
+    the exporter can measure several deliverables in worker processes; {} for other formats or on error.
+    """
+    p = Path(file_path)
+    if p.suffix.lower().lstrip(".") not in ("obj", "stl", "ply") or not p.is_file():
+        return {}
+    try:
+        import trimesh
+        mesh = trimesh.load(str(p), process=False)
+        if not hasattr(mesh, "vertices"):
+            return {}
+        out: Dict[str, Any] = {"v_count": len(mesh.vertices), "f_count": len(mesh.faces),
+                               "is_watertight": bool(mesh.is_watertight)}
+        if mesh.is_watertight:
+            # trimesh volume is in mesh units (meters^3 -> cm^3 is * 1e6)
+            out["volume_cm3"] = round(float(mesh.volume) * 1e6, 2)
+        if hasattr(mesh, "extents"):
+            out["bbox_mm"] = [round(float(x) * 1000.0, 1) for x in mesh.extents]
+        return out
+    except Exception as e:
+        logger.debug(f"Could not inspect mesh {file_path}: {e}")
+        return {}
+
+
 class SystemTelemetry:
     """
     Continuous telemetry monitor capturing peak RAM, VRAM, and per-step benchmarks.
@@ -313,23 +339,17 @@ class SystemTelemetry:
         vertex_count = v_count or 0
         face_count = f_count or 0
 
-        # Quick parse if not passed
-        if vertex_count == 0 and ext in ["obj", "stl", "ply"]:
-            try:
-                import trimesh
-                mesh = trimesh.load(str(p), process=False)
-                if hasattr(mesh, "vertices"):
-                    vertex_count = len(mesh.vertices)
-                    face_count = len(mesh.faces)
-                    if is_watertight is None:
-                        is_watertight = bool(mesh.is_watertight)
-                    if volume_cm3 is None and mesh.is_watertight:
-                        # trimesh volume is in mesh units (meters^3 -> cm^3 is * 1e6)
-                        volume_cm3 = round(float(mesh.volume) * 1e6, 2)
-                    if bbox_mm is None and hasattr(mesh, "extents"):
-                        bbox_mm = [round(float(x) * 1000.0, 1) for x in mesh.extents]
-            except Exception as e:
-                logger.debug(f"Could not inspect mesh {file_path}: {e}")
+        # Quick parse if not passed (mesh_file_metrics can also run in a worker: record_mesh(path, **metrics))
+        if vertex_count == 0:
+            parsed = mesh_file_metrics(str(p))
+            vertex_count = parsed.get("v_count", 0)
+            face_count = parsed.get("f_count", 0)
+            if is_watertight is None:
+                is_watertight = parsed.get("is_watertight")
+            if volume_cm3 is None:
+                volume_cm3 = parsed.get("volume_cm3")
+            if bbox_mm is None:
+                bbox_mm = parsed.get("bbox_mm")
 
         m = MeshMetrics(
             file_path=str(p.name),

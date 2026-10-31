@@ -44,7 +44,7 @@ flowchart TD
 | 4.2b Hull correction | Before ReconstructMesh: drops dense points > 5 mm inside the hull fused from ≤ 3 views (wrong depths on uniform plastic, e.g. a single-colour cap) and adds hull-surface points where nothing is left. Skipped when the hull is much shorter than the cloud (wrong masks). The plain cloud stays as `scene_dense_mvs.ply`; ReconstructMesh falls back to it if it fails | `pipeline/visual_hull.py` |
 | 5. Cleaning | Keeps the largest part, cuts at Y = 3 mm (removes the disc), keeps the largest part again (disc rim pieces), closes the base flat, repairs, decimates the high poly to 75 % of its faces + a low-poly copy with min(20 %, 50 000) faces (`--high_poly_ratio`, `--low_poly_ratio`, `--low_poly_max_faces`). Writes `object.json`: title, description, length × width × height in mm, volume | `pipeline/mesh_cleaner.py`, `pipeline/exporter.py` |
 | 5.5 Texturing images | Lossless PNGs where everything outside the mesh silhouette is exactly black, per-camera colour gains from the white paper | `pipeline/texture_prep.py`, `pipeline/mesh_masks.py` |
-| 4.4 Texturing | `texrecon` picks the best photo per face and builds the atlases; unseen faces are coloured like their neighbours | `pipeline/texrecon_runner.py` |
+| 4.4 Texturing | `texrecon` picks the best photo per face and builds the atlases; unseen faces are coloured like their neighbours. High and low poly run at the same time (one `.cam` scene, low in `texrecon/low/`) when ≥ 16 GB RAM is free. Low-poly decimation, print exports, metrics and `object.json` run in background workers; export chains in parallel; `output.zip` once, at the end | `pipeline/texrecon_runner.py`, `pipeline/parallel.py` |
 | 6. Export | OBJ + MTL + PNG/JPG, GLB with embedded textures, watertight STL / 3MF at real scale, `output.zip` | `pipeline/exporter.py` |
 
 Everything the run measured (time, RAM, VRAM, CPU, disk per step, hardware, object, mesh quality) goes into
@@ -156,8 +156,9 @@ laptop / Pi ──upload photos──▶ R2 jobs/<id>/input/ ──▶ pod: down
 ```
 * The pod gets **temporary R2 keys** (1 hour, read-only on its photos, write-only on its output), never your keys,
   never the RunPod key.
-* GPU: the first available from a list ordered by price, with a minimum host RAM computed from the photos and a
-  minimum vCPU count. GPU speed barely matters; RAM, CPUs and disk do.
+* GPU: the first available from a list ordered by speed (up to 1.10 $/h), with a minimum host RAM computed from the photos and a
+  minimum vCPU count; 16 vCPU and 48 GB are asked for first, the minimum only when no host has them.
+  GPU speed barely matters; RAM, CPUs and disk do.
 * Every pod is terminated, also after errors, timeouts and cancels; one retry with more RAM if it ran out of memory.
 
 Once:
