@@ -13,6 +13,9 @@ lxml>=4.9.0            # trimesh 3MF export
 shapely>=2.0.0
 mapbox-earcut>=1.0.1
 psutil>=5.9.0
+# AI masks (pipeline/mask_processor.py): BiRefNet_lite 512 ONNX on the CPU. Python 3.10 gets onnxruntime 1.23.x: the
+# 512 export (opset 17) runs on it, the dynamic opset-19 export (DeformConv) does not.
+onnxruntime>=1.17.0
 
 # RunPod pod: Cloudflare R2 transfers (runpod_job.py, cloud/)
 boto3>=1.28.0

@@ -97,13 +97,22 @@ def carve_visual_hull(
     min_bg_votes: int = 2,
     min_seen_views: int = 3,
     distorted: bool = True,
+    disc_radius_m: Optional[float] = None,
+    disc_margin_m: float = 0.005,
+    min_informative_fraction: float = 0.3,
 ) -> Dict[str, Any]:
     """
     Carves a voxel grid inside the masking cylinder with the silhouette masks.
     A voxel is removed when at least `min_bg_votes` views see it as background (one bad mask cannot cut the
     object) or when fewer than `min_seen_views` views see it at all (nothing can reconstruct it).
     `distorted`: masks of the original photos (camera K + dist) or undistorted masks (K_new).
-    Returns {occupancy (nx, ny, nz bool), origin (3,), voxel_m, views_used, seconds}.
+    `disc_radius_m` (masks that keep the turntable, e.g. the AI ones): a view can only carve a voxel when the ray
+    through it, continued, lands beyond the disc (on the booth, `disc_margin_m` past the rim: the mask edge is soft);
+    above the disc it lands on the disc, which is foreground too. Voxels with fewer than `min_bg_votes` such views, or such views making less than
+    `min_informative_fraction` of the views that see them, are marked "ambiguous" (a cone over the disc; low next to
+    the object the only views landing beyond the rim look through the object itself):
+    still occupied, but left out of hull_stats and of the dense-cloud refinement.
+    Returns {occupancy (nx, ny, nz bool), ambiguous (same shape, or absent), origin (3,), voxel_m, views_used, seconds}.
     """
     t0 = time.time()
     xs = np.arange(-radius_m, radius_m + 1e-9, voxel_m)
@@ -117,6 +126,7 @@ def carve_visual_hull(
 
     bg_votes = np.zeros(len(P), np.uint8)
     seen = np.zeros(len(P), np.uint16)
+    informative = np.zeros(len(P), np.uint16)
     used = 0
     for cam, mpath in zip(cameras, mask_paths):
         if not mpath or not os.path.isfile(mpath):
@@ -133,6 +143,13 @@ def carve_visual_hull(
         vi = np.rint(uv[ok, 1]).astype(np.int64)
         seen[sel] += 1
         bg_votes[sel[mask[vi, ui] < 128]] += 1
+        if disc_radius_m is not None:
+            # Continue the ray camera -> voxel down to the disc plane (y = 0): beyond the rim it sees the booth
+            C = cam["C"]
+            Q = P[sel]
+            t = C[1] / np.maximum(C[1] - Q[:, 1], 1e-9)
+            land = C[[0, 2]] + t[:, None] * (Q[:, [0, 2]] - C[[0, 2]])
+            informative[sel[np.hypot(land[:, 0], land[:, 1]) > disc_radius_m + disc_margin_m]] += 1
 
     occ_flat = np.zeros(in_cyl.size, bool)
     occ_flat[idx] = (bg_votes < min_bg_votes) & (seen >= min(min_seen_views, max(1, used)))
@@ -144,6 +161,10 @@ def carve_visual_hull(
         "views_used": used,
         "seconds": round(time.time() - t0, 2),
     }
+    if disc_radius_m is not None:
+        amb_flat = np.zeros(in_cyl.size, bool)
+        amb_flat[idx] = (informative < min_bg_votes) | (informative < min_informative_fraction * seen)
+        hull["ambiguous"] = amb_flat.reshape(shape) & occupancy
     logger.info(
         f"Visual hull: {int(occupancy.sum()):,d} voxels of {voxel_m * 1000:.1f} mm from {used} masks "
         f"({hull['seconds']:.1f} s)."
@@ -151,11 +172,23 @@ def carve_visual_hull(
     return hull
 
 
-def hull_stats(hull: Dict[str, Any]) -> Dict[str, Any]:
-    """Volume, height range and maximum radius of the occupied voxels (None when empty)."""
-    occ = hull["occupancy"]
+def decided_occupancy(hull: Dict[str, Any]) -> np.ndarray:
+    """Occupied voxels the silhouettes could judge (the ambiguous cone over the disc left out)."""
+    amb = hull.get("ambiguous")
+    return hull["occupancy"] & ~amb if amb is not None else hull["occupancy"]
+
+
+def hull_stats(hull: Dict[str, Any], decided_only: bool = True) -> Dict[str, Any]:
+    """
+    Volume, height range and maximum radius of the occupied voxels the silhouettes could judge (voxels_total and
+    voxels_ambiguous count the cone over the disc of masks that keep the turntable); decided_only=False: all of them.
+    """
+    occ = decided_occupancy(hull) if decided_only else hull["occupancy"]
+    extra = {"voxels_total": int(hull["occupancy"].sum())}
+    if hull.get("ambiguous") is not None:
+        extra["voxels_ambiguous"] = int(hull["ambiguous"].sum())
     if not occ.any():
-        return {"voxels": 0}
+        return {"voxels": 0, **extra}
     ii, jj, kk = np.nonzero(occ)
     v = hull["voxel_m"]
     o = hull["origin"]
@@ -171,6 +204,7 @@ def hull_stats(hull: Dict[str, Any]) -> Dict[str, Any]:
         "radius_max_mm": round(float(np.hypot(x, z).max()) * 1000, 1),
         "views_used": hull.get("views_used"),
         "seconds": hull.get("seconds"),
+        **extra,
     }
 
 
@@ -184,7 +218,8 @@ def proxy_bounds_from_hull(
     Volume for bridge_sfm.generate_proxy_3d_points: the hull box plus a margin, never larger than the masking
     cylinder. Without a usable hull: the masking cylinder itself.
     """
-    stats = hull_stats(hull) if hull is not None else {"voxels": 0}
+    # All occupied voxels: the base of the object can be inside the ambiguous cone and must stay in the volume
+    stats = hull_stats(hull, decided_only=False) if hull is not None else {"voxels": 0}
     if stats.get("voxels", 0) < 100:
         return {"y_max": float(cylinder_y_max_m), "r_max": float(cylinder_radius_m)}
     return {
@@ -193,15 +228,50 @@ def proxy_bounds_from_hull(
     }
 
 
+def hull_silhouette(hull: Dict[str, Any], cam: Dict[str, Any], distorted: bool = True, scale: float = 0.25,
+                    margin_px: int = 2) -> np.ndarray:
+    """
+    Mask (uint8 0/255, image size) of the hull seen from `cam`: the occupied voxels splatted at `scale` with their
+    footprint, closed, upsampled. Slightly larger than the object (voxel size + margin): used as the mask of the
+    views the AI model skipped (masking.ai_view_stride).
+    """
+    occ = hull["occupancy"]
+    h, w = int(cam["h"]), int(cam["w"])
+    out = np.zeros((h, w), np.uint8)
+    if not occ.any():
+        return out
+    v = hull["voxel_m"]
+    P = hull["origin"] + np.argwhere(occ) * v
+    uv, z, ok = project_points(cam, P, distorted)
+    if not ok.any():
+        return out
+    sh, sw = int(np.ceil(h * scale)), int(np.ceil(w * scale))
+    small = np.zeros((sh, sw), np.uint8)
+    us = np.clip(np.rint(uv[ok, 0] * scale).astype(np.int64), 0, sw - 1)
+    vs = np.clip(np.rint(uv[ok, 1] * scale).astype(np.int64), 0, sh - 1)
+    small[vs, us] = 255
+    f = float(cam["K"][0, 0])
+    footprint = f * v / float(np.percentile(z[ok], 10)) * scale          # voxel size in small-image pixels
+    r = int(np.ceil(footprint / 2.0 + margin_px * scale)) + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+    small = cv2.morphologyEx(cv2.dilate(small, kernel), cv2.MORPH_CLOSE, kernel)
+    out = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+    return np.where(out > 127, 255, 0).astype(np.uint8)
+
+
 def save_hull(hull: Dict[str, Any], path: str) -> None:
+    extra = {"ambiguous": hull["ambiguous"]} if hull.get("ambiguous") is not None else {}
     np.savez_compressed(path, occupancy=hull["occupancy"], origin=hull["origin"], voxel_m=hull["voxel_m"],
-                        views_used=hull.get("views_used", 0), seconds=hull.get("seconds", 0.0))
+                        views_used=hull.get("views_used", 0), seconds=hull.get("seconds", 0.0), **extra)
 
 
 def load_hull(path: str) -> Dict[str, Any]:
     d = np.load(path)
-    return {"occupancy": d["occupancy"].astype(bool), "origin": d["origin"], "voxel_m": float(d["voxel_m"]),
+    hull = {"occupancy": d["occupancy"].astype(bool), "origin": d["origin"], "voxel_m": float(d["voxel_m"]),
             "views_used": int(d["views_used"]), "seconds": float(d["seconds"])}
+    if "ambiguous" in d.files:
+        hull["ambiguous"] = d["ambiguous"].astype(bool)
+    return hull
 
 
 def surface_points(hull: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
@@ -313,6 +383,18 @@ def write_dense_ply(path: str, dense: Dict[str, Any], pts: np.ndarray, rgb: np.n
     return total
 
 
+def _in_ambiguous(hull: Dict[str, Any], P: np.ndarray) -> np.ndarray:
+    """True for points in a voxel of the ambiguous cone (carve_visual_hull disc_radius_m); all False without one."""
+    amb = hull.get("ambiguous")
+    out = np.zeros(len(P), bool)
+    if amb is None or not len(P):
+        return out
+    ijk = np.rint((np.asarray(P, np.float64) - hull["origin"]) / hull["voxel_m"]).astype(np.int64)
+    ok = np.all((ijk >= 0) & (ijk < np.array(amb.shape)), axis=1)
+    out[ok] = amb[ijk[ok, 0], ijk[ok, 1], ijk[ok, 2]]
+    return out
+
+
 def depth_inside_hull(hull: Dict[str, Any], P: np.ndarray) -> np.ndarray:
     """Distance (m) of each point to the hull surface, measured inwards; 0 outside the hull or the grid."""
     from scipy.ndimage import distance_transform_edt
@@ -360,9 +442,11 @@ def refine_dense_cloud_with_hull(
     brightness_white_threshold: float = 135.0,
     chroma_threshold: float = 20.0,
     min_facing: float = 0.3,
+    min_height_ratio: float = 0.8,
 ) -> Dict[str, Any]:
     """
-    Corrects the dense cloud of DensifyPointCloud with the visual hull, before ReconstructMesh:
+    Corrects the dense cloud of DensifyPointCloud with the visual hull, before ReconstructMesh (skipped, cloud
+    untouched, when the hull is shorter than `min_height_ratio` of the cloud: wrong masks):
     1. Prune: points deeper than `prune_depth_m` inside the hull and fused from <= `prune_max_views` views are
        dropped. On uniform plastic PatchMatch converges to wrong depths inside the object (fixativ cap, 180-210 mm:
        61 % of the points >= 6 mm inside, 92 % of them from <= 3 views) and the mesh followed them (radius 8 mm
@@ -385,8 +469,36 @@ def refine_dense_cloud_with_hull(
     xyz = dense["xyz"].astype(np.float64)
     stats: Dict[str, Any] = {"mvs_points": dense["count"], "added": 0}
 
-    # 1. Prune wrong depths inside the object
+    # A hull much shorter than the cloud was carved from wrong masks (white body of a spray can taken for the white
+    # booth: hull 136-201 mm, can 0-200 mm): pruning and filling against it would cut real surfaces.
+    # (Masks that keep the turntable leave the bottom of the object in the ambiguous cone: the test is for masks
+    # that drop the disc, where a short hull can only come from wrong masks.)
+    occ_y = np.nonzero(decided_occupancy(hull).any(axis=(0, 2)))[0]
+    reliable = (dense["n_views"] >= 3) & (xyz[:, 1] >= min_y_m)
+    if not len(occ_y):
+        if source == original:
+            os.replace(original, ply)
+        stats.update(pruned_inside=0, skipped="no hull voxel the silhouettes could judge (object inside the "
+                                              "ambiguous cone over the disc)")
+        logger.info(f"Visual hull refinement skipped: {stats['skipped']}.")
+        return stats
+    if hull.get("ambiguous") is None and reliable.sum() > 1000:
+        hull_h = (occ_y.max() - occ_y.min() + 1) * hull["voxel_m"]
+        y_lo, y_hi = np.percentile(xyz[reliable, 1], [1, 99])
+        stats.update(hull_height_mm=round(hull_h * 1000, 1), cloud_height_mm=round((y_hi - y_lo) * 1000, 1))
+        if hull_h < min_height_ratio * (y_hi - y_lo):
+            if source == original:
+                os.replace(original, ply)
+            stats.update(pruned_inside=0, skipped=f"hull {hull_h * 1000:.0f} mm tall, dense cloud "
+                                                  f"{(y_hi - y_lo) * 1000:.0f} mm: masks probably wrong")
+            logger.warning(f"Visual hull refinement skipped: {stats['skipped']}.")
+            return stats
+
+    # 1. Prune wrong depths inside the object (not in the ambiguous cone over the disc: there the hull is not the
+    # object, real surface points would be "deep inside" it)
     depth = depth_inside_hull(hull, xyz)
+    in_amb = _in_ambiguous(hull, xyz)
+    depth[in_amb] = 0.0
     prune = (depth > prune_depth_m) & (dense["n_views"] <= prune_max_views) if prune_depth_m > 0 else \
         np.zeros(dense["count"], bool)
     keep = ~prune
@@ -403,6 +515,9 @@ def refine_dense_cloud_with_hull(
     weights: List[np.ndarray] = []
     rgb = np.zeros((0, 3), np.uint8)
     surf, normals = surface_points(hull) if fill else (np.zeros((0, 3)), np.zeros((0, 3)))
+    if len(surf):
+        decided = ~_in_ambiguous(hull, surf)
+        surf, normals = surf[decided], normals[decided]
     stats["hull_surface_points"] = int(len(surf))
     if len(surf):
         tree = cKDTree(xyz[keep])

@@ -34,6 +34,7 @@ input_images/
 # Rezultatele descărcate din cloud (tools/cloud_test_run.py)
 results/
 docs/
+rpi_results
 
 # Chei (R2, Cloudflare, RunPod): doar local. Modelul fără valori e .env.example
 .env

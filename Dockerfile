@@ -163,6 +163,16 @@ RUN printf 'v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n' > /tmp/check.obj && \
     python3 -c "import pymeshlab; ms = pymeshlab.MeshSet(); ms.load_new_mesh('/tmp/check.obj'); assert ms.current_mesh().face_number() == 1; print('PyMeshLab I/O ok')" && \
     rm /tmp/check.obj
 
+# AI mask model (pipeline/mask_processor.py, masking.method "ai"): BiRefNet_lite exported at 512 x 512 (MIT,
+# huggingface.co/studioludens/birefnet-lite-512, base ZhengPeng7/BiRefNet_lite), pinned revision + checksum. ~190 MB.
+ARG MASK_MODEL_URL=https://huggingface.co/studioludens/birefnet-lite-512/resolve/962e67969ec6acec9c19fab76acee4f5e22e990c/onnx/model.onnx
+ARG MASK_MODEL_SHA256=1cb0fb360dadd15af77c639085d77a9df67db0c64315560c3de005f676345ac2
+ENV TURNTABLE_MASK_MODEL=/opt/models/birefnet_lite_512.onnx
+RUN mkdir -p /opt/models && \
+    python3 -c "import urllib.request; urllib.request.urlretrieve('${MASK_MODEL_URL}', '${TURNTABLE_MASK_MODEL}')" && \
+    echo "${MASK_MODEL_SHA256}  ${TURNTABLE_MASK_MODEL}" | sha256sum -c - && \
+    python3 -c "import onnxruntime as ort; s = ort.InferenceSession('${TURNTABLE_MASK_MODEL}', providers=['CPUExecutionProvider']); print('Mask model ok:', s.get_inputs()[0].shape)"
+
 # Code version recorded in stats.json (.git is not copied into the image). After the pip layer, so a new
 # commit does not reinstall the Python packages:
 #   docker build --build-arg GIT_COMMIT=$(git rev-parse --short HEAD) ...

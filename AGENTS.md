@@ -21,6 +21,7 @@ The system replaces the slow and noisy components of Meshroom (DepthMap, Meshing
 ### RULE 2: Rigid Lock of Camera Poses (No BA Drift)
 - On dark, semi-gloss, or smooth technical plastics, standard Structure-from-Motion (SfM) bundle adjustment (BA) will drift due to specular reflections and sparse feature points.
 - Camera poses computed by `TurntablePoses` are **rigidly locked**. The pipeline feeds these locked poses directly to OpenMVS as ground truth.
+- The only correction allowed is `pipeline/rig_refine.py`: one rigid 6-DOF correction per (camera, level) from sparse object features (the carriage tilts ~0.9 deg on the first lift, cam1 sits ~0.4 deg off its tag pose). Disc model, intrinsics and scale stay those of the tags; never per-photo poses. It is applied only when it lowers the epipolar error on held-out view pairs and stays small; otherwise the tag poses are kept (`rig_refine.json`, `cameras_known_tags.sfm`).
 
 ### RULE 3: Coordinate System Conventions & Conversions
 - **AliceVision / TurntablePoses:** Rotation matrices $R$ are stored in **Column-Major (Fortran order, `order="F"`)** in `cameras_known.sfm`. $C$ is camera center in world coordinates.
@@ -67,7 +68,7 @@ To prevent dark patches, Poisson bleeding, and micro-confetti texture atlases:
 - `--empty-color 0`: Fills unobserved faces (e.g. flat cut bottom) and empty atlas areas with clean black (`RGB 0,0,0`), not neon orange.
 
 ### RULE 9: Testing & Documentation Integrity
-- All unit tests in `tests/` (104 at the time of writing) must pass before any commit.
+- All unit tests in `tests/` (120 at the time of writing) must pass before any commit.
 - Preserve existing docstrings, comments, and structure.
 
 ---
@@ -99,9 +100,11 @@ turntable_studio/
 │   ├── run_metrics.py          # stats.json features for RAM/time/quality models (hardware, disk speed, object, logs)
 │   ├── camera_init.py          # Image discovery (flat or rig/0 + rig/1) and CameraInit SFM
 │   ├── turntable_poses.py      # AprilTag disc detection and rigid pose calculation (LOCKED)
+│   ├── rig_refine.py           # Per-(camera, level) rigid correction from sparse SIFT features, hold-out guarded
 │   ├── platan_260mm_layout.json# 260mm disc tag layout coordinates
 │   ├── bridge_sfm.py           # SFM-to-COLMAP bridge, OpenCV undistortion, proxy 3D points
-│   ├── visual_hull.py          # Volume carved from the masks: proxy bounds, scene_dense.ply prune + fill before ReconstructMesh
+│   ├── visual_hull.py          # Volume carved from the masks: proxy bounds, scene_dense.ply prune + fill before ReconstructMesh,
+│   │                           #   ambiguous cone over the disc (AI masks keep it), hull silhouettes for skipped views
 │   ├── openmvs_runner.py       # Cross-platform CLI runner for OpenMVS binaries
 │   ├── mesh_cleaner.py         # Planar slicing, skirt extrusion, Ear-Clipping base capping
 │   ├── mesh_masks.py           # Vectorised rasterizer: mesh silhouette / face-id buffers from locked poses
@@ -109,12 +112,16 @@ turntable_studio/
 │   ├── texrecon_runner.py      # .cam scene export (rebuilt every run) and texrecon execution
 │   ├── exporter.py             # Multi-LOD decimation, texture conversion, GLB embedding
 │   ├── object_info.py          # object.json: title, description, real size (mm) and volume of the cleaned mesh
-│   ├── mask_processor.py       # Alpha mask utilities
+│   ├── mask_processor.py       # Masks: BiRefNet_lite 512 ONNX on the CPU (white parts, through-holes) or photometric
+│   │                           #   fallback; masking cylinder + tag blackout
 │   └── calibrate_intrinsics.py # Chessboard/Charuco camera matrix calibration
 └── tests/
     ├── test_bridge_sfm.py      # Camera matrix, quaternion, proxy track tests, generated masks found and applied
     ├── test_object_info.py     # object.json measurements independent of the turn on the disc
-    ├── test_visual_hull.py     # Hull carving, proxy bounds, dense PLY I/O, prune + fill on a synthetic cylinder
+    ├── test_visual_hull.py     # Hull carving, proxy bounds, dense PLY I/O, prune + fill on a synthetic cylinder,
+    │                           #   ambiguous disc cone, hull silhouettes, refinement skipped on a too short hull
+    ├── test_rig_refine.py      # Recovers a known carriage tilt / cam1 offset; guards keep the tag poses; sfm column-major
+    ├── test_main_checks.py     # Tag-correction warning, masking cylinder widened when the hull reaches it
     ├── test_mesh_cleaner.py    # 2D Ear-clipping and watertight base tests
     ├── test_openmvs_runner.py  # TextureMesh PLY (texcoord, texnumber) -> OBJ + MTL conversion
     ├── test_exporter.py        # Multi-LOD OBJ, MTL, JPG/PNG, and GLB bundle tests (incl. multi-material GLB)
@@ -133,9 +140,10 @@ turntable_studio/
 
 The following features are slated for upcoming agent implementations:
 
-### Priority 1: Automated Background Matting (BiRefNet / SAM)
-- Integrate a pre-processing step that automatically segments the foreground object and removes turntable background noise before `DensifyPointCloud`.
-- Generate `<image_name>.mask.png` in `output/masks/` and feed `--mask-path` and `--ignore-mask-label 0` into `DensifyPointCloud`.
+### Priority 1: Automated Background Matting (BiRefNet / SAM) — implemented (BiRefNet_lite, CPU)
+- `masking.method = "ai"`: BiRefNet_lite 512 ONNX (`/opt/models/birefnet_lite_512.onnx`, `TURNTABLE_MASK_MODEL`) on 1 view in `ai_view_stride`; the others get the visual hull silhouette. Photometric fallback per view and without the model.
+- The model keeps the turntable: the masking cylinder, tag blackout and the Y = 3 mm slice remove it; the visual hull marks the cone over the disc it cannot judge.
+- Pending: first measured pod run (time per image with the pod's vCPUs; ~4 GB RAM per worker).
 
 ### Priority 2: AI Surface Normal Refinement & High-Relief Guidance
 - For smooth plastics with fine relief (buttons, logos, engraved text), raw photogrammetry can suffer from high-frequency depth noise.

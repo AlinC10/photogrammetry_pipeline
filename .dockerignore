@@ -19,6 +19,7 @@ deprecated
 to_delete
 tools
 results
+rpi_results
 
 # Chei: nu intră niciodată în imagine (pod-ul primește doar credențiale temporare)
 .env

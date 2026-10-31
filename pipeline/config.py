@@ -219,6 +219,9 @@ class TurntableConfig:
     # to estimate). The commanded 80 mm measured ~85 mm in the photos (multimeter, fixativ), so it is estimated.
     estimate_lift: Optional[bool] = None
     tag_refine: bool = True           # Per-tag height/tilt (paper unevenness): RMS 4.09 -> 2.48 px on the Parkside set
+    # The sheet's own unevenness is +-1.5 mm (tag 6 ~ +1.3, tag 4 ~ -1.1 in every scan); beyond this a tag is covered
+    # by the object: warning in stats.json (the poses are kept, see main._check_tag_corrections)
+    max_tag_correction_mm: float = 3.0
     intrinsics_in: Optional[str] = None  # Optional chessboard calibration JSON from calibrate_intrinsics.py
 
 
@@ -266,6 +269,8 @@ class MaskingConfig:
     enabled: bool = True
     auto_generate: bool = True               # Automatically generate masks from 3D cylinder + chroma
     cylinder_radius_m: float = 0.080         # Radial bounding cylinder (80 mm); 35 mm cut the Parkside tool (max radius 38.7 mm)
+    # Used when the hull reaches cylinder_radius_m (object off centre or wider): out to the disc rim (127 mm)
+    wide_cylinder_radius_m: float = 0.125
     cylinder_y_min_m: float = 0.001          # Base cut 1.0 mm above turntable (matches slice_y_m = 1.0 mm)
     cylinder_y_max_m: float = 0.350          # Maximum object height 350 mm (the Parkside tool alone is 230 mm)
     chroma_threshold: float = 20.0           # Threshold for color vs neutral background
@@ -274,6 +279,20 @@ class MaskingConfig:
     tag_blackout: bool = True                # Blackout of the AprilTags the object cannot cover (camera ray misses the cylinder)
     tag_expansion_factor: float = 1.25       # Expand tag quad by 25% to guarantee full black border suppression
     apply_to_texturing_images: bool = True   # Set background to black RGB(0,0,0) for TextureMesh / texrecon
+    # Foreground: "ai" = BiRefNet_lite (ONNX, CPU; white labels and through-holes right), "photometric" = bright and
+    # colourless pixels are the booth (cuts white parts of objects). "ai" falls back to "photometric" without the model.
+    method: str = "ai"
+    ai_model_path: str = field(default_factory=lambda: os.environ.get("TURNTABLE_MASK_MODEL")
+                               or "/opt/models/birefnet_lite_512.onnx")
+    ai_resolution: int = 512                 # input of the 512 x 512 export; 384 px missed the aluminium bottle
+    ai_threads: int = 2                      # ONNX Runtime threads per worker (8 workers x 2 threads was the fastest)
+    ai_ram_per_worker_gb: float = 4.0        # measured peak ~3.8 GB per worker (ORT memory arena on, full-res arrays)
+    # The model runs on 1 view in ai_view_stride (alternating shots); the others get the silhouette of the visual
+    # hull carved from those: half the time, masks slightly larger than the object
+    ai_view_stride: int = 2
+    ai_min_area_ratio: float = 0.25          # AI mask < 25 % of the photometric one: model missed the object, keep the latter
+    ai_used: bool = False                    # set by the masking step: the masks keep the turntable (visual hull cone)
+    disc_radius_m: float = 0.127             # turntable top (260 mm design x 0.98 print): rays landing beyond see the booth
     # How DensifyPointCloud sees the masks: "blackout" = background pixels of undistorted/ set to 0 (default),
     # "mask_path" = images unchanged + --mask-path/--ignore-mask-label 0, "none" = images unchanged, no masks
     densify_masks: str = "blackout"
@@ -292,6 +311,33 @@ class VisualHullConfig:
     fill: bool = True                        # Append hull surface points where no MVS point is left
     support_dist_m: float = 0.003            # A hull point is "bare" with no MVS point within this distance
     max_normal_y: float = 0.8                # No fill on near-horizontal hull surfaces (the hull top is least reliable)
+
+
+@dataclass
+class RigRefineConfig:
+    """Settings of the rigid per-(camera, level) correction."""
+    enabled: bool = True
+    scale: float = 0.5                  # features on the half-resolution image (2028 px): 4x faster, same result
+    max_features: int = 1000            # SIFT keypoints per image; ~100-300 land on the object
+    ratio: float = 0.75                 # Lowe ratio test
+    max_axis_angle_deg: float = 40.0    # view pairs compared: optical axes closer than this
+    max_obs_per_pair: int = 300
+    static_px: float = 1.5              # booth point: same pixel (full resolution) in neighbouring shots ...
+    static_min_neighbours: int = 2      # ... of at least this many of the 4 neighbours (shots -2..+2)
+    max_sampson_px: float = 20.0        # gross outliers before the fit (measured: 2-4 px median, < 15 px between levels)
+    coarse_huber_px: float = 3.0        # first fit on everything below max_sampson_px ...
+    train_max_px: float = 6.0           # ... second fit on what agrees with the first one within this
+    holdout_fraction: float = 1.0 / 3.0
+    min_train_obs: int = 200            # fewer: nothing to fit
+    min_group_obs: int = 40             # a (camera, level) seen in fewer training observations stays as it is
+    min_improvement: float = 0.10       # hold-out median must drop at least 10 %
+    max_rotation_deg: float = 1.5       # a correction beyond these is not a carriage tilt: rejected
+    max_translation_mm: float = 15.0    # measured: up to ~8 mm (camera-local translation trades off with the tilt)
+    huber_px: float = 1.0
+    disc_radius_m: float = 0.135        # points kept over the disc ...
+    y_min_m: float = 0.006              # ... above the paper: repeated tag patterns give false matches
+    y_max_m: float = 0.40
+    seed: int = 0
 
 
 @dataclass
@@ -318,6 +364,7 @@ class PipelineConfig:
     texturing_engine: str = "texrecon" # "texrecon" (mvs-texturing) or "openmvs" (TextureMesh)
     masking: MaskingConfig = field(default_factory=MaskingConfig)
     visual_hull: VisualHullConfig = field(default_factory=VisualHullConfig)
+    rig_refine: RigRefineConfig = field(default_factory=RigRefineConfig)
     texturing_images: TexturingImagesConfig = field(default_factory=TexturingImagesConfig)
     texrecon: TexReconConfig = field(default_factory=TexReconConfig)
     openmvs: OpenMVSConfig = field(default_factory=OpenMVSConfig)

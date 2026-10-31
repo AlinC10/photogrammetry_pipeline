@@ -11,8 +11,9 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
 
 LOG_FORMAT = "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
@@ -52,7 +53,7 @@ def detach_run_log(handler: logging.Handler) -> None:
 
 from pipeline.texrecon_runner import TexReconRunner, find_texrecon_binary
 from pipeline.bridge_sfm import convert_sfm_to_colmap
-from pipeline.mask_processor import batch_generate_masks
+from pipeline.mask_processor import ai_model_available, batch_generate_masks
 from pipeline.camera_init import (
     generate_camera_init_sfm,
     run_turntable_poses,
@@ -65,6 +66,7 @@ from pipeline.config import (
     MeshCleaningConfig,
     OpenMVSConfig,
     PipelineConfig,
+    RigRefineConfig,
     TurntableConfig,
     VisualHullConfig,
 )
@@ -72,6 +74,7 @@ from pipeline.exporter import collect_log_files, decimate_mesh, export_multi_lod
 from pipeline.mesh_cleaner import clean_and_repair_mesh, face_target
 from pipeline.object_info import write_object_info
 from pipeline.mesh_masks import load_sfm_cameras
+from pipeline.rig_refine import refine_rig_poses, view_groups
 from pipeline import visual_hull
 from pipeline.openmvs_runner import OpenMVSRunner
 from pipeline import run_metrics
@@ -80,6 +83,10 @@ from pipeline.telemetry import SystemTelemetry
 from pipeline.texrecon_runner import TEXRECON_DATA_TERMS
 
 DENSIFY_MASK_MODES = ("blackout", "mask_path", "none")
+MASK_METHODS = ("ai", "photometric")
+# Job options with a server default the clients (tools/cloud_scan.py, the Pi) do not need to know or forward:
+# a new image changes the behaviour of every scan without touching the scripts that upload the photos
+SERVER_DEFAULT_OPTIONS = frozenset({"rig_refine", "mask_method", "ai_view_stride"})
 from pipeline.texture_prep import prepare_texturing_images
 
 
@@ -133,7 +140,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             "tag_refine", "tag_scale", "intrinsics_in", "target_low_poly_faces", "target_high_poly_faces",
             "high_poly_ratio", "low_poly_ratio", "low_poly_max_faces", "title", "export_scale", "keep_depth_maps",
             "mesh_texture_masks", "colour_normalize", "resume", "mock_openmvs", "ram_margin", "visual_hull",
-            "visual_hull_refine", "visual_hull_voxel_mm", "densify_masks", "glb_draco")},
+            "visual_hull_refine", "visual_hull_voxel_mm", "densify_masks", "glb_draco", "rig_refine", "mask_method", "ai_view_stride")},
     )
 
     logger.info("=" * 70)
@@ -161,6 +168,8 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         elif detected_tr:
             logger.info(f"Using mvs-texturing (texrecon): {detected_tr}")
 
+    if job.get("mask_method", "ai") not in MASK_METHODS:
+        raise ValueError(f"mask_method must be one of {MASK_METHODS}, got '{job.get('mask_method')}'")
     densify_masks = job.get("densify_masks", "blackout")
     if densify_masks not in DENSIFY_MASK_MODES:
         raise ValueError(f"densify_masks must be one of {DENSIFY_MASK_MODES}, got '{densify_masks}'")
@@ -226,7 +235,9 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             target_high_poly_faces=int(job.get("target_high_poly_faces") or 0),
             target_low_poly_faces=int(job.get("target_low_poly_faces") or 0),
         ),
-        masking=MaskingConfig(densify_masks=densify_masks),
+        masking=MaskingConfig(densify_masks=densify_masks, method=job.get("mask_method", "ai"),
+                              ai_view_stride=int(job.get("ai_view_stride", 2))),
+        rig_refine=RigRefineConfig(enabled=bool(job.get("rig_refine", True))),
         visual_hull=VisualHullConfig(
             enabled=bool(job.get("visual_hull", True)),
             refine_cloud=bool(job.get("visual_hull_refine", True)),
@@ -263,8 +274,9 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         # STEP 2: Calibrate and Lock Poses via TurntablePoses
         # ----------------------------------------------------------------------
         cameras_known_sfm = str(out_path / "cameras_known.sfm")
+        resume_poses = bool(job.get("resume", False)) and Path(cameras_known_sfm).is_file()
         with telemetry.step("2. Turntable Poses (Rigid Lock)"):
-            if not mock_openmvs and job.get("resume", False) and Path(cameras_known_sfm).is_file():
+            if not mock_openmvs and resume_poses:
                 # The resumed mesh was reconstructed with these exact poses: recomputing them with
                 # other options (e.g. tag_refine) would misalign texture and geometry.
                 logger.info(f"[RESUME] Reusing locked poses from {cameras_known_sfm}.")
@@ -298,12 +310,20 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         if not mock_openmvs and (out_path / "turntable_report.txt").is_file():
             pose_q = run_metrics.pose_quality(str(out_path / "turntable_report.txt"))
             telemetry.set_info(pose_quality=pose_q)
+            _check_tag_corrections(pose_q, config, telemetry)
             _check_lift(pose_q, config.turntable, n_levels, telemetry)
+
+        # ----------------------------------------------------------------------
+        # STEP 2.1: Rigid per-(camera, level) correction from sparse object features (rig_refine.py)
+        # ----------------------------------------------------------------------
+        if config.rig_refine.enabled and not mock_openmvs and not resume_poses:
+            _refine_rig(cameras_known_sfm, config, out_path, workers, telemetry)
 
         # ----------------------------------------------------------------------
         # STEP 2.5: Automated Hybrid Background Matting & Turntable Elimination
         # ----------------------------------------------------------------------
         masks_out_dir = str(out_path / "masks")
+        mask_hull: Optional[Dict[str, Any]] = None
         masks_src: Optional[str] = config.masks_dir or str(Path(input_dir) / "masks")
         if not Path(masks_src).is_dir():
             masks_src = None
@@ -317,49 +337,9 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                 if stale:
                     logger.info(f"Removed {len(stale)} mask file(s) of a previous run from {masks_out_dir}.")
                 if not mock_openmvs:
-                    with open(cameras_known_sfm, "r", encoding="utf-8") as f:
-                        sfm_data_mask = json.load(f)
-
-                    m_views = sfm_data_mask.get("views", [])
-                    m_intrinsics = {}
-                    for intr in sfm_data_mask.get("intrinsics", []):
-                        w_val = float(intr.get("width", 4056))
-                        h_val = float(intr.get("height", 3040))
-                        sensor_w = float(intr.get("sensorWidth", 6.287) or 6.287)
-                        focal_mm = float(intr.get("focalLength", 3.9) or 3.9)
-                        fx = focal_mm * (w_val / sensor_w)
-                        fy = fx * float(intr.get("pixelRatio", 1.0) or 1.0)
-                        pp = intr.get("principalPoint", [0.0, 0.0])
-                        cx = (w_val / 2.0) + float(pp[0]) if abs(float(pp[0])) < (w_val / 4.0) else float(pp[0])
-                        cy = (h_val / 2.0) + float(pp[1]) if abs(float(pp[1])) < (h_val / 4.0) else float(pp[1])
-                        m_intrinsics[str(intr["intrinsicId"])] = {
-                            "K": np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
-                        }
-
-                    m_poses = {}
-                    for p in sfm_data_mask.get("poses", []):
-                        m_poses[str(p["poseId"])] = {
-                            "R": np.array(p["pose"]["transform"]["rotation"], dtype=np.float64).reshape((3, 3), order="F"),
-                            "C": np.array(p["pose"]["transform"]["center"], dtype=np.float64),
-                        }
-
-                    auto_masks = batch_generate_masks(
-                        views=m_views,
-                        poses_dict=m_poses,
-                        intrinsics_dict=m_intrinsics,
-                        output_masks_dir=masks_out_dir,
-                        cylinder_radius_m=config.masking.cylinder_radius_m,
-                        cylinder_y_min_m=config.masking.cylinder_y_min_m,
-                        cylinder_y_max_m=config.masking.cylinder_y_max_m,
-                        chroma_threshold=config.masking.chroma_threshold,
-                        brightness_white_threshold=config.masking.brightness_white_threshold,
-                        safety_dilation_px=config.masking.safety_dilation_px,
-                        tag_blackout=config.masking.tag_blackout,
-                        tag_expansion_factor=config.masking.tag_expansion_factor,
-                        workers=workers,
-                    )
+                    n_masks, mask_hull = _generate_masks(cameras_known_sfm, masks_out_dir, config, workers, telemetry)
                     masks_src = masks_out_dir
-                    logger.info(f"Generated {len(auto_masks)} foreground masks in {masks_out_dir}.")
+                    logger.info(f"Generated {n_masks} foreground masks in {masks_out_dir}.")
                 else:
                     Path(masks_out_dir).mkdir(parents=True, exist_ok=True)
                     masks_src = masks_out_dir
@@ -371,7 +351,21 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         hull_path = work_path / "visual_hull.npz"
         proxy_bounds = None
         if config.visual_hull.enabled and not mock_openmvs and masks_src and Path(masks_src).is_dir():
-            hull = _carve_visual_hull(cameras_known_sfm, masks_src, config, str(hull_path), telemetry)
+            hull = _carve_visual_hull(cameras_known_sfm, masks_src, config, str(hull_path), telemetry, mask_hull)
+            if hull is not None and masks_src == masks_out_dir and _hull_touches_cylinder(hull, config):
+                # The object reaches the masking cylinder (off centre, or wider than it): masks and hull are cut.
+                # Once, with the cylinder out to the disc rim.
+                old_r = config.masking.cylinder_radius_m
+                config.masking.cylinder_radius_m = config.masking.wide_cylinder_radius_m
+                logger.warning(f"The object reaches the {old_r * 1000:.0f} mm masking cylinder (off centre or too "
+                               f"wide?): masks and visual hull again with {config.masking.cylinder_radius_m * 1000:.0f} mm.")
+                telemetry.set_info(masking_cylinder_widened={"from_mm": old_r * 1000,
+                                                             "to_mm": config.masking.cylinder_radius_m * 1000})
+                with telemetry.step("2.5b Masks Again (Wide Cylinder)"):
+                    for old_mask in Path(masks_out_dir).rglob("*.mask.png"):
+                        old_mask.unlink()
+                    _, mask_hull = _generate_masks(cameras_known_sfm, masks_out_dir, config, workers, telemetry)
+                hull = _carve_visual_hull(cameras_known_sfm, masks_src, config, str(hull_path), telemetry, mask_hull)
             proxy_bounds = visual_hull.proxy_bounds_from_hull(
                 hull, config.masking.cylinder_radius_m, config.masking.cylinder_y_max_m,
                 config.visual_hull.proxy_margin_m,
@@ -767,6 +761,157 @@ def _check_lift(pose_q: Optional[Dict[str, Any]], turntable: TurntableConfig, n_
         logger.warning(f"Lift direction is {angle:.1f} deg off the turntable axis: is the Z axis or the disc tilted?")
 
 
+def _check_tag_corrections(pose_q: Optional[Dict[str, Any]], config: PipelineConfig,
+                           telemetry: SystemTelemetry) -> None:
+    """
+    tagRefine fits the height of every tag; a glued sheet is flat to ~1.5 mm (same corrections scan after scan).
+    Several mm means the object covers or stands on that tag (orange bottle: -6.8 mm, axis tilted 2.1 deg). Only a
+    warning: computing the poses again without tagRefine made the object features agree less, not more (3.09 ->
+    3.63 px Sampson on that scan), and the rig refinement corrects what it can afterwards.
+    """
+    worst = (pose_q or {}).get("tag_correction_max_mm")
+    if not config.turntable.tag_refine or worst is None or worst <= config.turntable.max_tag_correction_mm:
+        return
+    logger.warning(f"tagRefine moved a tag by {worst:.1f} mm (the sheet itself is flat to ~1.5 mm): the object "
+                   f"probably covers or stands on it. Keep the object inside the tag ring for reliable poses.")
+    telemetry.set_info(tag_correction_warning={"worst_correction_mm": worst,
+                                               "limit_mm": config.turntable.max_tag_correction_mm})
+
+
+def _hull_touches_cylinder(hull: Dict[str, Any], config: PipelineConfig) -> bool:
+    """True when the carved hull reaches the masking cylinder and a wider one is still available."""
+    stats = visual_hull.hull_stats(hull)
+    r = config.masking.cylinder_radius_m * 1000
+    return (config.masking.wide_cylinder_radius_m > config.masking.cylinder_radius_m
+            and stats.get("radius_max_mm", 0) >= r - 2 * stats.get("voxel_mm", 1.5))
+
+
+def _generate_masks(cameras_known_sfm: str, masks_out_dir: str, config: PipelineConfig, workers: int,
+                    telemetry: Optional[SystemTelemetry] = None) -> Tuple[int, Optional[Dict[str, Any]]]:
+    """
+    Step 2.5: one foreground mask per photo (masking cylinder + foreground + tag blackout).
+    AI foreground (masking.method "ai", model available): the model runs on 1 view in ai_view_stride, the visual hull is
+    carved from those masks and the other views get its silhouette. Returns (masks written, that hull or None).
+    """
+    m = config.masking
+    with open(cameras_known_sfm, "r", encoding="utf-8") as f:
+        sfm_data_mask = json.load(f)
+
+    m_views = sfm_data_mask.get("views", [])
+    m_intrinsics = {}
+    for intr in sfm_data_mask.get("intrinsics", []):
+        w_val = float(intr.get("width", 4056))
+        h_val = float(intr.get("height", 3040))
+        sensor_w = float(intr.get("sensorWidth", 6.287) or 6.287)
+        focal_mm = float(intr.get("focalLength", 3.9) or 3.9)
+        fx = focal_mm * (w_val / sensor_w)
+        fy = fx * float(intr.get("pixelRatio", 1.0) or 1.0)
+        pp = intr.get("principalPoint", [0.0, 0.0])
+        cx = (w_val / 2.0) + float(pp[0]) if abs(float(pp[0])) < (w_val / 4.0) else float(pp[0])
+        cy = (h_val / 2.0) + float(pp[1]) if abs(float(pp[1])) < (h_val / 4.0) else float(pp[1])
+        m_intrinsics[str(intr["intrinsicId"])] = {
+            "K": np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+        }
+
+    m_poses = {}
+    for p in sfm_data_mask.get("poses", []):
+        m_poses[str(p["poseId"])] = {
+            "R": np.array(p["pose"]["transform"]["rotation"], dtype=np.float64).reshape((3, 3), order="F"),
+            "C": np.array(p["pose"]["transform"]["center"], dtype=np.float64),
+        }
+
+    use_ai = m.method == "ai" and ai_model_available(m.ai_model_path)
+    if m.method == "ai" and not use_ai:
+        logger.warning(f"AI mask model not available ({m.ai_model_path} or onnxruntime missing): photometric masks.")
+    ai_workers = workers
+    if use_ai:
+        # Each worker holds the model (~3 GB peak) and uses ai_threads threads
+        res = describe_resources()
+        by_cpu = max(1, int(res["cpus"]) // max(1, m.ai_threads))
+        by_ram = max(1, int((float(res["ram_free_gb"]) - 4.0) // m.ai_ram_per_worker_gb))
+        ai_workers = max(1, min(workers, by_cpu, by_ram))
+
+    def run(views: List[Dict[str, Any]]) -> Tuple[Dict[str, str], Dict[str, Any]]:
+        stats: Dict[str, Any] = {}
+        out = batch_generate_masks(
+            views=views,
+            poses_dict=m_poses,
+            intrinsics_dict=m_intrinsics,
+            output_masks_dir=masks_out_dir,
+            cylinder_radius_m=m.cylinder_radius_m,
+            cylinder_y_min_m=m.cylinder_y_min_m,
+            cylinder_y_max_m=m.cylinder_y_max_m,
+            chroma_threshold=m.chroma_threshold,
+            brightness_white_threshold=m.brightness_white_threshold,
+            safety_dilation_px=m.safety_dilation_px,
+            tag_blackout=m.tag_blackout,
+            tag_expansion_factor=m.tag_expansion_factor,
+            workers=ai_workers if use_ai else workers,
+            ai_model=m.ai_model_path if use_ai else None,
+            ai_resolution=m.ai_resolution,
+            ai_threads=m.ai_threads,
+            ai_min_area_ratio=m.ai_min_area_ratio,
+            stats=stats,
+        )
+        return out, stats
+
+    m.ai_used = use_ai
+    info: Dict[str, Any] = {"method": "ai" if use_ai else "photometric", "workers": ai_workers if use_ai else workers}
+    hull = None
+    stride = max(1, int(m.ai_view_stride)) if use_ai else 1
+    if stride == 1:
+        written, stats = run(m_views)
+        info.update(views_model=len(m_views), methods=stats.get("methods"))
+    else:
+        cams = load_sfm_cameras(cameras_known_sfm)
+        cam_i, lvl, shot = view_groups(cams, config.turntable.name_regex)
+        model_ids = {c["view_id"] for c, a, b, k in zip(cams, cam_i, lvl, shot) if (a + b + k) % stride == 0}
+        written, stats = run([v for v in m_views if str(v["viewId"]) in model_ids])
+        info.update(views_model=len(model_ids), methods=stats.get("methods"))
+        sub = [c for c in cams if c["view_id"] in model_ids]
+        vh = config.visual_hull
+        hull = visual_hull.carve_visual_hull(
+            sub, visual_hull.source_mask_paths(sub, masks_out_dir), radius_m=m.cylinder_radius_m,
+            y_min_m=config.cleaning.slice_y_m, y_max_m=m.cylinder_y_max_m, voxel_m=vh.voxel_m,
+            min_bg_votes=vh.min_bg_votes, distorted=True, disc_radius_m=m.disc_radius_m)
+        rest = [c for c in cams if c["view_id"] not in model_ids]
+        if visual_hull.hull_stats(hull).get("voxels_total", 0) >= 100:
+            for c in rest:
+                dst = Path(masks_out_dir) / f"{c['view_id']}_{Path(c['path']).stem}.mask.png"
+                cv2.imwrite(str(dst), visual_hull.hull_silhouette(hull, c, distorted=True))
+            info["views_hull_silhouette"] = len(rest)
+            written = dict(written, **{c["view_id"]: "hull" for c in rest})
+            logger.info(f"AI masks on {len(model_ids)} views; the other {len(rest)} views get the silhouette of the "
+                        f"visual hull carved from them.")
+        else:
+            logger.warning("Visual hull from the AI masks is empty: AI masks for the remaining views too.")
+            hull = None
+            more, stats2 = run([v for v in m_views if str(v["viewId"]) not in model_ids])
+            written = dict(written, **more)
+            info.update(views_model=len(m_views), methods_rest=stats2.get("methods"))
+    if telemetry is not None:
+        telemetry.set_info(masks=info)
+    return len(m_views), hull
+
+
+def _refine_rig(cameras_known_sfm: str, config: PipelineConfig, out_path: Path, workers: int,
+                telemetry: SystemTelemetry) -> None:
+    """Step 2.1: rewrites cameras_known.sfm when the correction is accepted (tag-only poses kept next to it)."""
+    try:
+        with telemetry.step("2.1 Rig Refinement (Sparse Features)"):
+            res = refine_rig_poses(
+                cameras_known_sfm, config.turntable.name_regex, config.rig_refine, workers=workers,
+                report_path=str(out_path / "rig_refine.json"),
+                backup_sfm=str(out_path / "cameras_known_tags.sfm"),
+            )
+        telemetry.set_info(rig_refine={k: res.get(k) for k in (
+            "accepted", "reason", "holdout_before", "holdout_after", "max_rotation_deg", "max_translation_mm",
+            "observations", "observations_per_image_median", "corrections", "timings_s")})
+    except Exception as e:
+        logger.warning(f"Rig refinement failed ({e}); continuing with the tag poses.")
+        telemetry.set_info(rig_refine={"accepted": False, "reason": f"error: {str(e)[:300]}"})
+
+
 def _resolve_low_poly_target(config: PipelineConfig, clean_res: Dict[str, Any], telemetry: SystemTelemetry) -> None:
     """
     Low-poly face count: min(low_poly_ratio x sealed faces, low_poly_max_faces) unless a fixed target was given. Written back into
@@ -795,36 +940,47 @@ def _object_extra(job: Dict[str, Any], clean_res: Dict[str, Any], config: Pipeli
 
 
 def _carve_visual_hull(cameras_known_sfm: str, masks_dir: str, config: PipelineConfig, hull_path: str,
-                       telemetry: SystemTelemetry) -> Optional[Dict[str, Any]]:
-    """Step 2.6: hull from the masks of the original photos; None (with a warning) when it cannot be built."""
+                       telemetry: SystemTelemetry, hull: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """
+    Step 2.6: hull from the masks of the original photos; None (with a warning) when it cannot be built.
+    `hull`: already carved by the AI masking step (from the views the model ran on): only checked and saved.
+    """
     try:
         with telemetry.step("2.6 Visual Hull"):
-            cams = load_sfm_cameras(cameras_known_sfm)
-            mask_paths = visual_hull.source_mask_paths(cams, masks_dir)
-            found = sum(1 for m in mask_paths if m)
-            if found < max(3, int(0.8 * len(cams))):
-                logger.warning(f"Visual hull skipped: masks found for only {found}/{len(cams)} views in {masks_dir}.")
-                return None
-            vh = config.visual_hull
-            hull = visual_hull.carve_visual_hull(
-                cams, mask_paths,
-                radius_m=config.masking.cylinder_radius_m,
-                y_min_m=config.cleaning.slice_y_m,
-                y_max_m=config.masking.cylinder_y_max_m,
-                voxel_m=vh.voxel_m,
-                min_bg_votes=vh.min_bg_votes,
-                distorted=True,
-            )
+            if hull is None:
+                cams = load_sfm_cameras(cameras_known_sfm)
+                mask_paths = visual_hull.source_mask_paths(cams, masks_dir)
+                found = sum(1 for m in mask_paths if m)
+                if found < max(3, int(0.8 * len(cams))):
+                    logger.warning(f"Visual hull skipped: masks found for only {found}/{len(cams)} views in {masks_dir}.")
+                    return None
+                vh = config.visual_hull
+                hull = visual_hull.carve_visual_hull(
+                    cams, mask_paths,
+                    radius_m=config.masking.cylinder_radius_m,
+                    y_min_m=config.cleaning.slice_y_m,
+                    y_max_m=config.masking.cylinder_y_max_m,
+                    voxel_m=vh.voxel_m,
+                    min_bg_votes=vh.min_bg_votes,
+                    distorted=True,
+                    disc_radius_m=config.masking.disc_radius_m if config.masking.ai_used else None,
+                )
             stats = visual_hull.hull_stats(hull)
             telemetry.set_info(visual_hull=stats)
-            if stats.get("voxels", 0) < 100:
+            if stats.get("voxels_total", stats.get("voxels", 0)) < 100:
                 logger.warning("Visual hull is empty (masks or poses wrong?); proxy points use the masking cylinder.")
                 return None
             visual_hull.save_hull(hull, hull_path)
-            logger.info(
-                f"Visual hull: {stats['volume_cm3']} cm3, height {stats['y_min_mm']}-{stats['y_max_mm']} mm, "
-                f"max radius {stats['radius_max_mm']} mm."
-            )
+            if stats.get("voxels", 0) < 100:
+                logger.info("Visual hull: the object lies inside the cone over the disc the silhouettes cannot judge; "
+                            "hull used for the proxy volume only.")
+            else:
+                amb = (f", {stats['voxels_ambiguous']:,d} voxels over the disc left undecided"
+                       if stats.get("voxels_ambiguous") else "")
+                logger.info(
+                    f"Visual hull: {stats['volume_cm3']} cm3, height {stats['y_min_mm']}-{stats['y_max_mm']} mm, "
+                    f"max radius {stats['radius_max_mm']} mm{amb}."
+                )
             return hull
     except Exception as e:
         logger.warning(f"Visual hull failed ({e}); continuing without it.")
@@ -940,6 +1096,9 @@ def parse_args():
     parser.add_argument("--work_dir", default=None, help="Fast directory for undistorted images and OpenMVS files (default: output_dir; env TURNTABLE_WORK_DIR)")
     parser.add_argument("--keep_depth_maps", action="store_true", help="Keep OpenMVS depth*.dmap after fusion (~74 MB per image at level 1)")
     parser.add_argument("--ram_margin", type=float, default=1.0, help="Safety factor on the DensifyPointCloud RAM estimate before starting (e.g. 1.3)")
+    parser.add_argument("--mask_method", choices=list(MASK_METHODS), default="ai", help="Foreground of the masks: 'ai' (BiRefNet_lite on the CPU, default; photometric when the model is missing) or 'photometric' (white = booth)")
+    parser.add_argument("--ai_view_stride", type=int, default=2, help="AI masks on 1 view in N; the others get the visual hull silhouette (1 = every view)")
+    parser.add_argument("--no_rig_refine", action="store_true", help="Keep the tag poses as they are (no per-camera, per-level correction from sparse object features)")
     parser.add_argument("--no_visual_hull", action="store_true", help="Do not carve the visual hull (proxy points use the fixed volume, no cloud refinement)")
     parser.add_argument("--no_visual_hull_refine", action="store_true", help="Keep the hull for the proxy volume, but feed ReconstructMesh the plain DensifyPointCloud output")
     parser.add_argument("--visual_hull_voxel_mm", type=float, default=1.5, help="Voxel size of the visual hull in mm (default: 1.5)")
@@ -994,6 +1153,9 @@ def main():
         "title": args.title,
         "description": args.description,
         "min_point_distance": args.min_point_distance,
+        "rig_refine": not args.no_rig_refine,
+        "mask_method": args.mask_method,
+        "ai_view_stride": args.ai_view_stride,
         "visual_hull": not args.no_visual_hull,
         "visual_hull_refine": not args.no_visual_hull_refine,
         "visual_hull_voxel_mm": args.visual_hull_voxel_mm,

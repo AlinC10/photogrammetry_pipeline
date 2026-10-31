@@ -18,7 +18,8 @@ Turns the photos of a turntable scanner (two Sony IMX477 cameras on a vertical c
 flowchart TD
     A["Photos<br/>input_images/rig/0 and rig/1"] --> B["1. CameraInit<br/>views + intrinsics (3.9 mm lens)"]
     B --> C["2. turntable_poses<br/>AprilTags -> locked camera poses"]
-    C --> D["2.5 Masks<br/>disc cylinder + colour (parallel)"]
+    C --> RR["2.1 Rig refinement<br/>per camera + level, sparse SIFT features"]
+    RR --> D["2.5 Masks<br/>BiRefNet_lite (CPU) + cylinder + tags"]
     D --> V["2.6 Visual hull<br/>volume carved from the masks"]
     V --> E["3. Bridge<br/>undistortion + COLMAP model (parallel)"]
     E --> R{"RAM check"}
@@ -34,12 +35,13 @@ flowchart TD
 |---|---|---|
 | 1. CameraInit | Finds the photos, reads the level / step from the file name (`f_2005.jpg` = level 2, step 5), writes `cameraInit.sfm` | `pipeline/camera_init.py` |
 | 2. Poses | Detects the 12 AprilTags in every photo and fits one rigid turntable model (step angle, rotation axis, lift per level, camera intrinsics). Writes `cameras_known.sfm`, `turntable_report.txt` (RMS, lift, per-photo errors) and `turntable_calib.json` | `pipeline/turntable_poses.py` (**never modified**, called as a subprocess) |
-| 2.5 Masks | Object vs background: inside an 80 mm × 350 mm cylinder around the axis, not white, not a tag the object cannot cover; holes enclosed by the object (white labels) are filled | `pipeline/mask_processor.py` |
-| 2.6 Visual hull | Voxels (1.5 mm) carved by the masks of all views; its box sets the volume of the synthetic tracking points | `pipeline/visual_hull.py` |
+| 2.1 Rig refinement | SIFT on half-resolution photos, booth points dropped (static within a level), neighbouring views matched; one rigid correction per (camera, level) from the epipolar error on the object (the carriage tilts ~0.9° on the first lift, cam1 is ~0.4° off). Applied only when it lowers the error on held-out view pairs and stays small (`rig_refine.json`; tag-only poses in `cameras_known_tags.sfm`). Box: between levels 2.9 → 1.0 px, spray can 1.9 → 0.3 px; 10–30 s | `pipeline/rig_refine.py` |
+| 2.5 Masks | Object vs background inside an 80 mm × 350 mm cylinder around the axis (125 mm when the object reaches it), minus the tags the object cannot cover. Foreground from BiRefNet_lite (512 px ONNX on the CPU: keeps white labels, leaves real through-holes open) on every 2nd view, the others get the visual hull silhouette; photometric (not white) per view when the model misses the object, and for the whole scan without the model | `pipeline/mask_processor.py` |
+| 2.6 Visual hull | Voxels (1.5 mm) carved by the masks; its box sets the volume of the synthetic tracking points. The AI masks keep the turntable, so the low cone over the disc no view can judge is marked ambiguous and left out of the 4.2b correction | `pipeline/visual_hull.py` |
 | 3. Bridge | Undistorts photos and masks, writes the COLMAP model OpenMVS imports (poses + 1500 synthetic tracking points inside the hull box: they set OpenMVS's ROI and depth range) | `pipeline/bridge_sfm.py` |
 | RAM check | Estimates DensifyPointCloud's RAM from photos × resolution and stops in seconds if the container cannot hold it | `pipeline/resources.py` |
 | 4. OpenMVS | Depth map per photo on the GPU, fusion into a dense point cloud, surface mesh. Depth maps are deleted after fusion | `pipeline/openmvs_runner.py` |
-| 4.2b Hull correction | Before ReconstructMesh: drops dense points > 5 mm inside the hull fused from ≤ 3 views (wrong depths on uniform plastic, e.g. a single-colour cap) and adds hull-surface points where nothing is left. The plain cloud stays as `scene_dense_mvs.ply`; ReconstructMesh falls back to it if it fails | `pipeline/visual_hull.py` |
+| 4.2b Hull correction | Before ReconstructMesh: drops dense points > 5 mm inside the hull fused from ≤ 3 views (wrong depths on uniform plastic, e.g. a single-colour cap) and adds hull-surface points where nothing is left. Skipped when the hull is much shorter than the cloud (wrong masks). The plain cloud stays as `scene_dense_mvs.ply`; ReconstructMesh falls back to it if it fails | `pipeline/visual_hull.py` |
 | 5. Cleaning | Keeps the largest part, cuts at Y = 3 mm (removes the disc), keeps the largest part again (disc rim pieces), closes the base flat, repairs, decimates the high poly to 75 % of its faces + a low-poly copy with min(20 %, 50 000) faces (`--high_poly_ratio`, `--low_poly_ratio`, `--low_poly_max_faces`). Writes `object.json`: title, description, length × width × height in mm, volume | `pipeline/mesh_cleaner.py`, `pipeline/exporter.py` |
 | 5.5 Texturing images | Lossless PNGs where everything outside the mesh silhouette is exactly black, per-camera colour gains from the white paper | `pipeline/texture_prep.py`, `pipeline/mesh_masks.py` |
 | 4.4 Texturing | `texrecon` picks the best photo per face and builds the atlases; unseen faces are coloured like their neighbours | `pipeline/texrecon_runner.py` |
@@ -202,6 +204,10 @@ the old texture from its cache: reload the images or restart Blender.
 * `Urcare: x mm/nivel, unghi față de axă y°`: lift per level. A large angle (> 2°) or a large free-pose difference on one
   level means the lift is wrong: use `--estimate_lift`.
 * `tag-uri pe poză: min n`: below ~4 the top level loses the disc.
+* `Corecția tag-urilor`: the sheet's own unevenness (±1.5 mm, the same in every scan). Several mm on one tag = the
+  object covers or stands on it: `stats.json` gets `tag_correction_warning`; keep the object inside the tag ring.
+* `rig_refine.json`: epipolar error on the object per pair type before / after the per-(camera, level) correction,
+  the corrections and whether they were applied.
 
 ---
 
@@ -217,6 +223,9 @@ Run `python main.py --help` for all of them. The ones that matter:
 | `--tag_scale` | 0.98 | printed / designed size of the tag sheet (this rig's sheet came out at ~98 %: disc 255 mm, tags 0–6 196 mm; 1.0 for a sheet printed at actual size) |
 | `--intrinsics_in` | – | chessboard calibration from `pipeline/calibrate_intrinsics.py` |
 | `--no_tag_refine` | off | disable the per-tag paper-height correction |
+| `--no_rig_refine` | off | keep the tag poses (no per-camera, per-level correction from sparse object features) |
+| `--mask_method` | ai | `ai` (BiRefNet_lite on the CPU; photometric when the model or onnxruntime is missing) or `photometric` |
+| `--ai_view_stride` | 2 | AI masks on 1 view in N, the others from the visual hull silhouette (1 = every view) |
 | `--resolution_level` | 1 | DensifyPointCloud at 1/2 resolution (0 = full: ~4× GPU time and much more RAM) |
 | `--resume` | off | reuse poses and the OpenMVS mesh |
 | `--texturing_engine` | texrecon | or `openmvs` (TextureMesh) |

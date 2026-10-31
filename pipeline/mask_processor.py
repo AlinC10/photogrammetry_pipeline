@@ -1,6 +1,7 @@
 """
 mask_processor.py — Automated background matting, silhouette masking, and turntable disc elimination.
-Combines 3D cylinder visual hull projection with photometric foreground segmentation.
+Combines 3D cylinder visual hull projection with foreground segmentation: BiRefNet_lite (ONNX, CPU) when the model
+is available, otherwise the photometric test (bright + colourless = white booth).
 """
 
 from __future__ import annotations
@@ -210,6 +211,7 @@ def generate_hybrid_mask(
     fill_holes: bool = True,
     tag_polygons: Optional[List[List[Tuple[float, float]]]] = None,
     tag_blackout: bool = True,
+    ai_probability: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Generates a high-precision binary silhouette mask (0 = background, 255 = foreground).
@@ -221,6 +223,8 @@ def generate_hybrid_mask(
     4. Connected component filtering (isolates largest component / tool, drops isolated tag fragments),
        then holes enclosed by the object are filled (fill_holes).
     5. Morphological safety boundary.
+    With `ai_probability` (ai_foreground_probability) the photometric test of step 3 is replaced by it, and no gap is
+    closed or filled: the model keeps white parts of the object and leaves real through-holes open.
     """
     # 1. Load image as RGB NumPy array
     if isinstance(image, (str, Path)):
@@ -302,6 +306,9 @@ def generate_hybrid_mask(
 
     # Foreground object: inside cylinder ROI, not white background, and strictly NOT on any AprilTag
     is_fg = (~is_white_bg) & roi_mask & (~tag_mask)
+    if ai_probability is not None:
+        is_fg = (ai_probability >= 0.5) & roi_mask & (~tag_mask)
+        fill_holes = False
 
     # 5. Morphological Cleaning & Connected Component Filtering
     scale_w = min(800, w)
@@ -413,10 +420,56 @@ def apply_mask_to_image(image_arr: np.ndarray, mask_arr: np.ndarray) -> np.ndarr
     return out_arr
 
 
-def _mask_one_view(task: Dict[str, Any]) -> Optional[Tuple[str, str, str]]:
+# -----------------------------------------------------------------------------
+# AI foreground (BiRefNet_lite, ONNX Runtime on the CPU)
+# -----------------------------------------------------------------------------
+
+# One session per worker process, created on its first image and reused for the next ones
+_AI_SESSION: Dict[str, Any] = {"path": None, "session": None}
+_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def ai_model_available(model_path: Optional[str]) -> bool:
+    """True when the ONNX model file exists and onnxruntime can be imported."""
+    if not model_path or not Path(model_path).is_file():
+        return False
+    try:
+        import onnxruntime  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def ai_foreground_probability(rgb: np.ndarray, model_path: str, resolution: int = 512, threads: int = 2) -> np.ndarray:
+    """
+    Foreground probability (float32, image size) of an RGB uint8 image from a dichotomous / salient-object model
+    (BiRefNet_lite, 512 x 512 ONNX export). No class and no prompt: the "main thing" in the picture, which here is the
+    object on the turntable together with the disc (the disc is removed by geometry: cylinder, tag blackout,
+    slice at Y = 3 mm). Measured on the scans of 30.10.2026: complete white labels, white aluminium, black PLA.
+    """
+    import onnxruntime as ort
+
+    if _AI_SESSION["session"] is None or _AI_SESSION["path"] != model_path:
+        so = ort.SessionOptions()
+        so.intra_op_num_threads = max(1, int(threads))
+        so.inter_op_num_threads = 1
+        _AI_SESSION["session"] = ort.InferenceSession(model_path, so, providers=["CPUExecutionProvider"])
+        _AI_SESSION["path"] = model_path
+    sess = _AI_SESSION["session"]
+    h, w = rgb.shape[:2]
+    x = cv2.resize(rgb, (resolution, resolution), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+    x = ((x - _IMAGENET_MEAN) / _IMAGENET_STD).transpose(2, 0, 1)[None].astype(np.float32)
+    y = sess.run(None, {sess.get_inputs()[0].name: x})[-1][0, 0].astype(np.float32)
+    if y.min() < 0.0 or y.max() > 1.0:          # logits
+        y = 1.0 / (1.0 + np.exp(-y))
+    return cv2.resize(y, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def _mask_one_view(task: Dict[str, Any]) -> Optional[Tuple[str, str, str, str]]:
     """
     Worker: one view -> mask files. Module level so ProcessPoolExecutor can pickle it.
-    Returns (source file name, view id, mask path) or None when the image is missing.
+    Returns (source file name, view id, mask path, method) or None when the image is missing.
     """
     v = task["view"]
     src_path = Path(v["path"])
@@ -437,8 +490,7 @@ def _mask_one_view(task: Dict[str, Any]) -> Optional[Tuple[str, str, str]]:
             expansion_factor=task["tag_expansion_factor"],
         )
 
-    mask = generate_hybrid_mask(
-        image=src_path,
+    common = dict(
         R=R, C=C, K=K,
         cylinder_radius_m=task["cylinder_radius_m"],
         cylinder_y_min_m=task["cylinder_y_min_m"],
@@ -449,6 +501,23 @@ def _mask_one_view(task: Dict[str, Any]) -> Optional[Tuple[str, str, str]]:
         tag_polygons=tag_polygons,
         tag_blackout=task["tag_blackout"],
     )
+    method = "photometric"
+    if task.get("ai_model") and HAS_CV2:
+        rgb = cv2.cvtColor(cv2.imread(str(src_path), cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+        mask = generate_hybrid_mask(image=rgb, **common)
+        try:
+            prob = ai_foreground_probability(rgb, task["ai_model"], task["ai_resolution"], task["ai_threads"])
+            ai_mask = generate_hybrid_mask(image=rgb, ai_probability=prob, **common)
+            # The model can miss the object altogether on a view (seen at 384 px on the aluminium bottle): keep the
+            # photometric mask when the AI one covers much less than it, inside the same working volume
+            if (ai_mask > 0).sum() >= task["ai_min_area_ratio"] * (mask > 0).sum():
+                mask, method = ai_mask, "ai"
+            else:
+                method = "photometric (ai mask too small)"
+        except Exception as e:  # one bad view must not stop the scan
+            method = f"photometric (ai error: {str(e)[:120]})"
+    else:
+        mask = generate_hybrid_mask(image=src_path, **common)
 
     out_dir = Path(task["out_dir"])
     view_id = str(v.get("viewId", task["index"]))
@@ -472,7 +541,7 @@ def _mask_one_view(task: Dict[str, Any]) -> Optional[Tuple[str, str, str]]:
         for t in targets:
             cv2.imwrite(str(t), mask)
 
-    return src_path.name, view_id, str(dst_mask_path)
+    return src_path.name, view_id, str(dst_mask_path), method
 
 
 def batch_generate_masks(
@@ -490,10 +559,17 @@ def batch_generate_masks(
     tag_expansion_factor: float = 1.25,
     tag_layout_path: Optional[Union[str, Path]] = None,
     workers: int = 1,
+    ai_model: Optional[str] = None,
+    ai_resolution: int = 512,
+    ai_threads: int = 2,
+    ai_min_area_ratio: float = 0.25,
+    stats: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, str]:
     """
     Generates automated binary masks for all views in the dataset, `workers` images at a time
     (separate processes; the result is identical to the serial run).
+    `ai_model`: ONNX model of ai_foreground_probability (each worker loads it once, `ai_threads` threads);
+    None = photometric masks. `stats` (optional dict) receives the number of masks per method.
     Saves `<viewId>_<stem>.mask.png` in output_masks_dir.
     Returns mapping: {image_filename: mask_file_path}.
     """
@@ -521,18 +597,25 @@ def batch_generate_masks(
             "safety_dilation_px": safety_dilation_px,
             "tag_blackout": tag_blackout,
             "tag_expansion_factor": tag_expansion_factor,
+            "ai_model": ai_model,
+            "ai_resolution": ai_resolution,
+            "ai_threads": ai_threads,
+            "ai_min_area_ratio": ai_min_area_ratio,
         })
 
     mask_map: Dict[str, str] = {}
+    methods: Dict[str, int] = {}
     total = len(tasks)
     workers = max(1, min(int(workers or 1), total or 1))
-    logger.info(f"Starting automated background matting for {total} images ({workers} worker(s))...")
+    logger.info(f"Starting automated background matting for {total} images ({workers} worker(s), "
+                f"{'AI model ' + Path(ai_model).name if ai_model else 'photometric'})...")
 
     def collect(done: int, result) -> None:
         if result is not None:
-            name, view_id, dst = result
+            name, view_id, dst, method = result
             mask_map[name] = dst
             mask_map[f"{view_id}_{name}"] = dst
+            methods[method] = methods.get(method, 0) + 1
         if done % 10 == 0 or done == total:
             logger.info(f"  Processed {done}/{total} masks ({done / total * 100:.0f}%)")
 
@@ -545,5 +628,8 @@ def batch_generate_masks(
             for i, result in enumerate(ex.map(_mask_one_view, tasks), 1):
                 collect(i, result)
 
-    logger.info(f"Completed automated masking: {len(mask_map)} masks saved in {out_dir}")
+    logger.info(f"Completed automated masking: {len(mask_map)} masks saved in {out_dir} "
+                f"({', '.join(f'{k}: {v}' for k, v in sorted(methods.items()))})")
+    if stats is not None:
+        stats["methods"] = methods
     return mask_map

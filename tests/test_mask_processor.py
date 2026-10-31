@@ -269,3 +269,47 @@ class TestMaskProcessor(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAiMasks(unittest.TestCase):
+    """AI foreground path of the masks, with a stand-in for the model (no ONNX file needed)."""
+
+    def setUp(self):
+        # White booth, white object with a real through-hole in the middle (booth visible through it)
+        self.img = np.full((200, 200, 3), 200, np.uint8)
+        self.obj = np.zeros((200, 200), bool)
+        self.obj[30:135, 60:140] = True               # inside the default working area (no camera pose given)
+        self.hole = np.zeros((200, 200), bool)
+        self.hole[65:100, 85:115] = True
+        self.prob = (self.obj & ~self.hole).astype(np.float32)
+
+    def test_ai_mask_keeps_white_object_and_real_hole(self):
+        photometric = generate_hybrid_mask(self.img)
+        ai = generate_hybrid_mask(self.img, ai_probability=self.prob)
+        self.assertEqual((photometric > 0).sum(), 0)                       # all white: the old mask loses it
+        inside = self.obj & ~self.hole
+        self.assertGreater((ai[inside] > 0).mean(), 0.95)
+        self.assertLess((ai[self.hole] > 0).mean(), 0.3)                   # through-hole stays open (no membrane):
+        # only the 1 px safety dilation along its border
+
+    def test_falls_back_to_photometric_when_model_misses_object(self):
+        from unittest import mock
+        import pipeline.mask_processor as mp
+        with tempfile.TemporaryDirectory() as d:
+            arr = np.full((100, 100, 3), 160, np.uint8)
+            arr[30:70, 30:70] = [30, 150, 40]
+            img = Path(d) / "f_1000.jpg"
+            Image.fromarray(arr).save(str(img))
+            views = [{"viewId": "1", "path": str(img), "poseId": "1", "intrinsicId": "1"}]
+            stats = {}
+            with mock.patch.object(mp, "ai_foreground_probability", return_value=np.zeros((100, 100), np.float32)):
+                mp.batch_generate_masks(views, {}, {}, Path(d) / "m", tag_blackout=False, workers=1,
+                                        ai_model="model.onnx", stats=stats)
+            self.assertEqual(stats["methods"], {"photometric (ai mask too small)": 1})
+            mask = np.array(Image.open(Path(d) / "m" / "1_f_1000.mask.png"))
+            self.assertGreater((mask[35:65, 35:65] > 0).mean(), 0.9)
+
+    def test_ai_model_available(self):
+        from pipeline.mask_processor import ai_model_available
+        self.assertFalse(ai_model_available(None))
+        self.assertFalse(ai_model_available("/no/such/model.onnx"))

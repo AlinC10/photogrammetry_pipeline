@@ -33,6 +33,7 @@ RECONSTRUCT_LOG = """\
 REPORT = """\
 Detecție: 4.7 s; tag-uri pe poză: min 4, median 9, max 11; poze fără tag-uri: 0
 Pas: 17.9992° (nominal 18.000°), sens +
+Corecția tag-urilor (denivelări ale hârtiei, față de planul discului): 0: +2.43 mm, 1: -6.79 mm, 2: +0.17 mm
 Urcare: 84.91 mm/nivel, unghi față de axă 0.686°
 poza                         tag  RMS(px)  dif.liberă(mm/°)
 0/f_1000.jpg                   9    6.673     1.00 / 0.55
@@ -66,6 +67,8 @@ class TestRunMetrics(unittest.TestCase):
         self.assertEqual((q["tags_min"], q["tags_median"]), (4, 9))
         self.assertEqual((q["rms_px"], q["lift_mm"]), (3.108, 84.91))
         self.assertEqual(q["free_diff_mm_per_level"], {"1": 1.0, "2": 4.0})
+        self.assertEqual(q["tag_corrections_mm"], {"0": 2.43, "1": -6.79, "2": 0.17})
+        self.assertEqual(q["tag_correction_max_mm"], 6.79)
 
     def test_object_image_stats(self):
         img = np.full((400, 400, 3), 0, np.uint8)

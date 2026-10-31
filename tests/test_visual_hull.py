@@ -95,6 +95,42 @@ class TestVisualHull(unittest.TestCase):
         stats = vh.hull_stats(self.carve())
         self.assertGreaterEqual(stats["radius_max_mm"], RADIUS * 1000 - 1.5)
 
+    def test_masks_with_disc_leave_an_ambiguous_cone(self):
+        """
+        Masks that keep the turntable (AI): every voxel low over the disc projects onto the disc in every view, so the
+        silhouettes cannot carve it. It is marked ambiguous: out of the stats, in the proxy volume.
+        """
+        disc_r = 0.055
+        for c, mpath in zip(self.cams, self.masks):
+            t = np.linspace(0, 2 * np.pi, 180)
+            disc = np.stack([disc_r * np.cos(t), np.zeros_like(t), disc_r * np.sin(t)], 1)
+            uv, _, _ = vh.project_points(c, disc, distorted=False)
+            m = cv2.imread(mpath, cv2.IMREAD_GRAYSCALE)
+            cv2.fillConvexPoly(m, cv2.convexHull(uv.astype(np.float32)).astype(np.int32), 255)
+            cv2.imwrite(mpath, m)
+        hull = vh.carve_visual_hull(self.cams, self.masks, radius_m=0.06, y_min_m=0.003, y_max_m=0.15,
+                                    voxel_m=0.003, distorted=False, disc_radius_m=disc_r)
+        self.assertTrue(hull["ambiguous"].any())
+        decided = vh.hull_stats(hull)
+        everything = vh.hull_stats(hull, decided_only=False)
+        self.assertLess(decided["radius_max_mm"], RADIUS * 1000 + 6)          # the object, not the disc
+        self.assertGreater(everything["radius_max_mm"], decided["radius_max_mm"])
+        self.assertGreater(everything["voxels"], decided["voxels"])
+        b = vh.proxy_bounds_from_hull(hull, cylinder_radius_m=0.08, cylinder_y_max_m=0.35, margin_m=0.01)
+        self.assertGreaterEqual(b["r_max"], everything["radius_max_mm"] / 1000)
+        # Saved and loaded with the cone
+        path = str(self.dir / "hull_amb.npz")
+        vh.save_hull(hull, path)
+        np.testing.assert_array_equal(vh.load_hull(path)["ambiguous"], hull["ambiguous"])
+
+    def test_hull_silhouette_covers_the_object(self):
+        hull = self.carve()
+        for c, mpath in zip(self.cams[:4], self.masks[:4]):
+            sil = vh.hull_silhouette(hull, c, distorted=False) > 0
+            obj = cv2.imread(mpath, cv2.IMREAD_GRAYSCALE) > 0
+            self.assertGreater(sil[obj].mean(), 0.98)                          # the whole object ...
+            self.assertLess(sil.sum(), 1.6 * obj.sum())                       # ... and not much more
+
     def test_proxy_bounds(self):
         """Hull box + margin, capped by the masking cylinder; the cylinder itself without a hull."""
         hull = self.carve()
@@ -190,6 +226,24 @@ class TestVisualHull(unittest.TestCase):
         # Restore puts the plain cloud back
         self.assertTrue(vh.restore_dense_cloud(ply))
         self.assertEqual(vh.read_dense_ply(ply)["count"], 4400)
+
+    def test_refine_skipped_when_hull_shorter_than_cloud(self):
+        """Hull carved from masks that lost the lower body (white label taken for booth): cloud left untouched."""
+        hull = self.carve()
+        occ = hull["occupancy"].copy()
+        ys = hull["origin"][1] + np.arange(occ.shape[1]) * hull["voxel_m"]
+        occ[:, ys < 0.07, :] = False                       # only the top 30 mm of the 100 mm cylinder survived
+        hull = dict(hull, occupancy=occ)
+        rng = np.random.default_rng(0)
+        a = rng.uniform(0, 2 * np.pi, 3000)
+        pts = np.stack([RADIUS * np.cos(a), rng.uniform(0.003, HEIGHT, 3000), RADIUS * np.sin(a)], 1)
+        ply = str(self.dir / "scene_dense.ply")
+        self.write_cloud(ply, pts, np.full(3000, 5))
+        stats = vh.refine_dense_cloud_with_hull(ply, hull, self.cams, self.images, self.masks, min_y_m=0.005)
+        self.assertIn("skipped", stats)
+        self.assertEqual(stats["added"], 0)
+        self.assertEqual(vh.read_dense_ply(ply)["count"], 3000)
+        self.assertFalse(Path(self.dir / "scene_dense_mvs.ply").exists())
 
     def test_fill_rejects_white_background(self):
         """Hull surface whose pixels show the white booth (e.g. inside a closed handle) gets no points."""

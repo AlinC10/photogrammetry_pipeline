@@ -405,7 +405,10 @@ class TestCloudScanTool(unittest.TestCase):
         block = src[src.index("    job = {"):]
         main_keys = set(re.findall(r'^\s+"([a-z_]+)":', block[:block.index("\n    }")], re.M))
         self.assertLessEqual(self.tool.PIPELINE_OPTIONS, main_keys)
-        self.assertLessEqual(main_keys, self.tool.PIPELINE_OPTIONS | self.tool.RESERVED_OPTIONS)
+        # Options with a server default (main.SERVER_DEFAULT_OPTIONS) need not be known by the upload scripts
+        server_only = set(re.findall(r'"([a-z_]+)"', src[src.index("SERVER_DEFAULT_OPTIONS = "):].split("\n")[0]))
+        self.assertEqual(server_only, {"rig_refine", "mask_method", "ai_view_stride"})
+        self.assertLessEqual(main_keys - server_only, self.tool.PIPELINE_OPTIONS | self.tool.RESERVED_OPTIONS)
 
     def test_ctrl_c_cancels_the_job(self):
         seen = {}

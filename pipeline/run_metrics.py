@@ -209,6 +209,12 @@ def pose_quality(report_path: str) -> Dict[str, Any]:
     m = re.search(r"Pas: ([\d.]+)°", text)
     if m:
         out["step_deg"] = float(m[1])
+    m = re.search(r"Corecția tag-urilor[^:]*:(.*)", text)
+    if m:
+        corr = {k: float(v) for k, v in re.findall(r"(\d+): ([+-]?[\d.]+) mm", m[1])}
+        if corr:
+            out["tag_corrections_mm"] = corr
+            out["tag_correction_max_mm"] = round(max(abs(v) for v in corr.values()), 2)
     per_level: Dict[str, List[float]] = {}
     for lm in re.finditer(r"^\d+/\S*?(\d)\d{3}\.\w+\s+(\d+)\s+([\d.]+)\s+([\d.]+)", text, re.M):
         per_level.setdefault(lm[1], []).append(float(lm[4]))
