@@ -36,10 +36,21 @@ Y_UP_TO_Z_UP = np.array([
 
 
 def to_print_frame(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
-    """Copy of a Y-up mesh standing upright for STL / 3MF (Z-up), base on Z = 0."""
+    """Copy of a Y-up mesh standing upright for STL / 3MF (Z-up), base on Z = 0 (the cut base sits on the bed)."""
     out = mesh.copy()
     out.apply_transform(Y_UP_TO_Z_UP)
+    if len(out.vertices):
+        out.apply_translation([0.0, 0.0, -float(out.vertices[:, 2].min())])
     return out
+
+
+def glb_factor(config: Any) -> float:
+    """
+    Factor from the exported OBJ units (export_scale per metre, default 1000 = mm) to the GLB units (glb_scale per
+    metre). glTF is defined in metres (glb_scale 1); 100 keeps the centimetre GLB the viewers were built with.
+    """
+    exp_scale = float(getattr(config, "export_scale", 1000.0)) or 1.0
+    return float(getattr(config, "glb_scale", 100.0)) / exp_scale
 
 
 def decimate_mesh(
@@ -61,6 +72,10 @@ def decimate_mesh(
         ms.load_new_mesh(str(in_p))
         curr_faces = ms.current_mesh().face_number()
         logger.info(f"Decimating mesh from {curr_faces:,d} to {target_faces:,d} faces...")
+        try:
+            closed_in = int(ms.get_topological_measures().get("boundary_edges", 1)) == 0
+        except Exception:
+            closed_in = False
 
         # 1. Texture-preserving quadric decimation keeps the UV coordinates (vt), but only exists for meshes that
         #    have them: the untextured cleaned mesh goes straight to the standard decimation.
@@ -84,6 +99,19 @@ def decimate_mesh(
                 preservetopology=True,
                 planarquadric=True,
             )
+
+        if closed_in:
+            # The high poly is closed once (mesh_cleaner); the low poly inherits it. Collapses can still open a
+            # non-manifold edge: repair and close what it opened (a few edges)
+            try:
+                if int(ms.get_topological_measures().get("boundary_edges", 0)) != 0:
+                    ms.meshing_repair_non_manifold_edges()
+                    ms.meshing_repair_non_manifold_vertices()
+                    ms.meshing_close_holes(maxholesize=100, newfaceselected=False, selfintersection=False)
+                    left = int(ms.get_topological_measures().get("boundary_edges", 0))
+                    logger.info(f"Decimated mesh re-closed ({left} open edges left).")
+            except Exception as ce:
+                logger.warning(f"Re-closing the decimated mesh failed: {ce}")
 
         ms.save_current_mesh(str(out_p), save_wedge_texcoord=True)
         logger.info(f"Decimated mesh saved to: {out_p}")
@@ -295,9 +323,11 @@ def convert_obj_to_glb(
     draco: bool = False,
     draco_level: int = 7,
     draco_bits: int = 14,
+    scale: float = 1.0,
 ) -> None:
     """
-    Packs an OBJ + MTL + texture images into a single GLB (binary glTF).
+    Packs an OBJ + MTL + texture images into a single GLB (binary glTF). `scale` multiplies the OBJ coordinates
+    (OBJ units -> GLB units, see glb_factor).
 
     Stage 1 (trimesh): loads the OBJ scene preserving all geometry and material bindings,
                        and optionally re-encodes texture images as optimized JPEG buffers.
@@ -336,6 +366,8 @@ def convert_obj_to_glb(
 
         # Load scene preserving all geometries and materials
         scene = trimesh.load(str(obj_path), process=False, force="scene")
+        if scale != 1.0:
+            scene.apply_scale(scale)
 
         if hasattr(scene, "geometry"):
             if compress_textures:
@@ -722,7 +754,7 @@ def export_print_assets(mesh_path: str, stl_path: str, mf_path: str, scale: floa
 
 
 def _export_textured_high(tex_p: str, high_obj: str, high_mtl: str, high_glb: str, exp_scale: float, draco: bool,
-                          cleaned_mesh_path: str) -> None:
+                          cleaned_mesh_path: str, glb_scale: float = 1.0) -> None:
     """High-poly OBJ with lossless PNG atlases, then its GLB (embedded PNG)."""
     src_mtl, src_tex_imgs = find_source_mtl_and_textures(Path(tex_p))
     package_textured_model(
@@ -741,15 +773,16 @@ def _export_textured_high(tex_p: str, high_obj: str, high_mtl: str, high_glb: st
             glb_path=Path(high_glb),
             compress_textures=False,  # High-poly retains lossless PNG texture
             draco=draco,
+            scale=glb_scale,
         )
     except Exception as ge:
         logger.warning(f"High GLB export warning: {ge}. Using standard GLB export.")
-        trimesh.load(cleaned_mesh_path, process=False).export(str(high_glb), file_type="glb")
+        _plain_glb(cleaned_mesh_path, high_glb, exp_scale * glb_scale)
 
 
 def _export_textured_low(low_src: str, low_obj: str, low_mtl: str, low_glb: str, exp_scale: float, draco: bool,
                          cleaned_mesh_path: str, fallback_mtl: Optional[str] = None,
-                         fallback_images: Optional[List[str]] = None) -> None:
+                         fallback_images: Optional[List[str]] = None, glb_scale: float = 1.0) -> None:
     """Low-poly OBJ from the dedicated low-poly texturing (native UVs, JPG ≤ 2048 px), then its GLB."""
     low_src_p = Path(low_src)
     low_src_mtl, low_src_tex_imgs = find_source_mtl_and_textures(low_src_p)
@@ -772,14 +805,23 @@ def _export_textured_low(low_src: str, low_obj: str, low_mtl: str, low_glb: str,
             compress_textures=True,  # Low-poly compresses textures to web-optimized JPEG
             jpeg_quality=85,
             draco=draco,
+            scale=glb_scale,
         )
     except Exception as ge:
         logger.warning(f"Low GLB export warning: {ge}. Using standard GLB export.")
-        trimesh.load(cleaned_mesh_path, process=False).export(str(low_glb), file_type="glb")
+        _plain_glb(cleaned_mesh_path, low_glb, exp_scale * glb_scale)
+
+
+def _plain_glb(mesh_path: str, glb_path: str, scale: float) -> None:
+    """Untextured GLB of a mesh in metres (the cleaned mesh), scaled to the GLB units."""
+    mesh = trimesh.load(mesh_path, process=False)
+    if scale != 1.0:
+        mesh.apply_scale(scale)
+    mesh.export(str(glb_path), file_type="glb")
 
 
 def _export_low_print(low_obj: str, low_stl: str, low_3mf: str, cleaned_mesh_path: str) -> None:
-    """Low-poly STL and 3MF from model_low.obj (already at real-world scale), Z-up."""
+    """Low-poly STL and 3MF from model_low.obj (already in the export units, mm by default), Z-up."""
     loaded_low = trimesh.load(str(low_obj), process=False)
     if isinstance(loaded_low, trimesh.Scene):
         geoms = [g for g in loaded_low.geometry.values() if isinstance(g, trimesh.Trimesh)]
@@ -795,8 +837,9 @@ def _export_low_print(low_obj: str, low_stl: str, low_3mf: str, cleaned_mesh_pat
 
 
 def _export_low_chain(low_src: str, low_obj: str, low_mtl: str, low_glb: str, low_stl: str, low_3mf: str,
-                      exp_scale: float, draco: bool, cleaned_mesh_path: str) -> None:
-    _export_textured_low(low_src, low_obj, low_mtl, low_glb, exp_scale, draco, cleaned_mesh_path)
+                      exp_scale: float, draco: bool, cleaned_mesh_path: str, glb_scale: float = 1.0) -> None:
+    _export_textured_low(low_src, low_obj, low_mtl, low_glb, exp_scale, draco, cleaned_mesh_path,
+                         glb_scale=glb_scale)
     _export_low_print(low_obj, low_stl, low_3mf, cleaned_mesh_path)
 
 
@@ -871,7 +914,8 @@ def export_multi_lod_bundle(
     low_3mf = mf_dir / "low_model.3mf"
     low_glb = glb_dir / "low_model.glb"
 
-    exp_scale = float(getattr(config, "export_scale", 100.0))
+    exp_scale = float(getattr(config, "export_scale", 1000.0))
+    glb_scale = glb_factor(config)
     draco = getattr(config, "glb_draco", True)
     run = (lambda name, fn, *a: pool.submit(name, fn, *a)) if pool is not None else (lambda name, fn, *a: _Done(fn, *a))
 
@@ -893,10 +937,11 @@ def export_multi_lod_bundle(
         # The two chains are independent when the low-poly texturing brought its own material and atlases
         low_independent = bool(low_src and low_src.is_file() and all(find_source_mtl_and_textures(low_src)))
         high_job = run("export_high", _export_textured_high, str(tex_p), str(high_obj), str(high_mtl),
-                       str(high_glb), exp_scale, draco, cleaned_mesh_path)
+                       str(high_glb), exp_scale, draco, cleaned_mesh_path, glb_scale)
         if low_independent:
             pending.append(run("export_low", _export_low_chain, str(low_src), str(low_obj), str(low_mtl),
-                               str(low_glb), str(low_stl), str(low_3mf), exp_scale, draco, cleaned_mesh_path))
+                               str(low_glb), str(low_stl), str(low_3mf), exp_scale, draco, cleaned_mesh_path,
+                               glb_scale))
             high_job.result()
         else:
             high_job.result()
@@ -904,7 +949,7 @@ def export_multi_lod_bundle(
                 _src_mtl, src_imgs = find_source_mtl_and_textures(tex_p)
                 _export_textured_low(str(low_src), str(low_obj), str(low_mtl), str(low_glb), exp_scale, draco,
                                      cleaned_mesh_path, fallback_mtl=str(high_mtl),
-                                     fallback_images=[str(x) for x in src_imgs])
+                                     fallback_images=[str(x) for x in src_imgs], glb_scale=glb_scale)
             else:
                 # 2. Package Low-Poly OBJ by geometry decimation of high_obj
                 _src_mtl, src_tex_imgs = find_source_mtl_and_textures(tex_p)
@@ -926,22 +971,26 @@ def export_multi_lod_bundle(
                 )
                 try:
                     convert_obj_to_glb(obj_folder_or_path=low_obj, glb_path=low_glb, compress_textures=True,
-                                       jpeg_quality=85, draco=draco)
+                                       jpeg_quality=85, draco=draco, scale=glb_scale)
                 except Exception as ge:
                     logger.warning(f"Low GLB export warning: {ge}. Using standard GLB export.")
-                    trimesh.load(cleaned_mesh_path, process=False).export(str(low_glb), file_type="glb")
+                    _plain_glb(cleaned_mesh_path, str(low_glb), exp_scale * glb_scale)
             _export_low_print(str(low_obj), str(low_stl), str(low_3mf), cleaned_mesh_path)
     else:
-        # Fallback to untextured mesh
+        # Fallback to untextured mesh (the cleaned mesh is in metres: OBJ in the export units, GLB in its own)
         cleaned_trimesh = trimesh.load(cleaned_mesh_path, process=False)
+        if exp_scale != 1.0:
+            cleaned_trimesh.apply_scale(exp_scale)
         cleaned_trimesh.export(str(high_obj), file_type="obj")
-        cleaned_trimesh.export(str(high_glb), file_type="glb")
+        _plain_glb(cleaned_mesh_path, str(high_glb), exp_scale * glb_scale)
         decimate_mesh(
-            input_mesh_path=cleaned_mesh_path,
+            input_mesh_path=str(high_obj),
             output_mesh_path=str(low_obj),
             target_faces=config.cleaning.target_low_poly_faces,
         )
         loaded_low = trimesh.load(str(low_obj), process=False)
+        if glb_scale != 1.0:
+            loaded_low.apply_scale(glb_scale)
         loaded_low.export(str(low_glb), file_type="glb")
         _export_low_print(str(low_obj), str(low_stl), str(low_3mf), cleaned_mesh_path)
 

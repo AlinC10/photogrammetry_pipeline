@@ -244,6 +244,12 @@ class MeshCleaningConfig:
     target_low_poly_faces: int = 0        # 0 = use low_poly_ratio
     smooth_iterations: int = 12       # Taubin volume-preserving smoothing (eliminates 2-4mm ripples)
     high_poly_smooth_iterations: int = 5 # Taubin steps for high-poly (smooths 200um noise without loss of detail)
+    # Holes closed once, on the high poly (mesh_cleaner.fill_holes_with_fairing): up to this many edges per hole,
+    # then a few Laplacian steps on the patch. 0 = old behaviour (holes up to 30 edges, no fairing)
+    max_hole_edges: int = 2000
+    hole_fairing_steps: int = 5
+    base_band_m: float = 0.015            # holes with a border this low are closed BEFORE the cut (G2)
+    rim_radius_m: float = 0.115           # pieces beyond this radius are the disc rim, not the object
 
 
 @dataclass
@@ -282,9 +288,12 @@ class MaskingConfig:
     tag_blackout: bool = True                # Blackout of the AprilTags the object cannot cover (camera ray misses the cylinder)
     tag_expansion_factor: float = 1.25       # Expand tag quad by 25% to guarantee full black border suppression
     apply_to_texturing_images: bool = True   # Set background to black RGB(0,0,0) for TextureMesh / texrecon
-    # Foreground: "ai" = BiRefNet_lite (ONNX, CPU; white labels and through-holes right), "photometric" = bright and
-    # colourless pixels are the booth (cuts white parts of objects). "ai" falls back to "photometric" without the model.
-    method: str = "ai"
+    # Foreground: "fused" = BiRefNet_lite on a crop around the object, checked against the scan's own background
+    # (per camera/level median + the disc rendered from the tag layout; mask_fusion.py): mean IoU 0.83 vs 0.32 for
+    # "ai" on 70 views, no missed view, the disc out of the masks. "ai" = BiRefNet_lite on the whole photo (keeps the
+    # disc), "photometric" = bright and colourless pixels are the booth (cuts white parts of objects). "fused" and
+    # "ai" fall back to "photometric" without the model.
+    method: str = "fused"
     ai_model_path: str = field(default_factory=lambda: os.environ.get("TURNTABLE_MASK_MODEL")
                                or "/opt/models/birefnet_lite_512.onnx")
     ai_resolution: int = 512                 # input of the 512 x 512 export; 384 px missed the aluminium bottle
@@ -295,6 +304,13 @@ class MaskingConfig:
     ai_view_stride: int = 2
     ai_min_area_ratio: float = 0.25          # AI mask < 25 % of the photometric one: model missed the object, keep the latter
     ai_used: bool = False                    # set by the masking step: the masks keep the turntable (visual hull cone)
+    # Per-view check of the masks against a loose hull of all of them (3 mm voxels, a voxel cut by >= 3 views): a
+    # view whose mask covers less than this share of that hull's silhouette misses part of the object the others
+    # see; it is left out of the visual hull and its mask gets the hull silhouette added (Densify does not black
+    # out the object). Not applied when more than max_excluded_share of the views fail (something systematic).
+    min_hull_agreement: float = 0.75
+    max_excluded_share: float = 0.25
+    excluded_views: list = field(default_factory=list)   # set by the masking step (view ids)
     disc_radius_m: float = 0.127             # turntable top (260 mm design x 0.98 print): rays landing beyond see the booth
     # How DensifyPointCloud sees the masks: "blackout" = background pixels of undistorted/ set to 0 (default),
     # "mask_path" = images unchanged + --mask-path/--ignore-mask-label 0, "none" = images unchanged, no masks
@@ -314,6 +330,9 @@ class VisualHullConfig:
     fill: bool = True                        # Append hull surface points where no MVS point is left
     support_dist_m: float = 0.003            # A hull point is "bare" with no MVS point within this distance
     max_normal_y: float = 0.8                # No fill on near-horizontal hull surfaces (the hull top is least reliable)
+    # Hole-filling patches (mesh_cleaner) snapped onto the hull where they sag less than this inside it (2.11)
+    snap_patches: bool = True
+    snap_max_dist_m: float = 0.003
 
 
 @dataclass
@@ -375,7 +394,12 @@ class PipelineConfig:
     cleaning: MeshCleaningConfig = field(default_factory=MeshCleaningConfig)
 
     # Scaling and units
-    export_scale: float = 100.0        # Default 100.0 scales raw photogrammetry mesh (2.2mm) to real-world scale (22cm / 220mm)
+    # OBJ, STL and 3MF units per metre of the reconstruction: 1000 = millimetres (what slicers, CAD and Fusion read;
+    # 100 made every print file 10x too small in Bambu / Anycubic). object.json is measured in metres either way.
+    export_scale: float = 1000.0
+    # GLB units per metre. glTF is defined in metres (1.0; Blender and three.js then show the real size); 100.0 keeps
+    # the centimetre GLB of the earlier releases (shown 100x too big) until the viewers are checked with metres.
+    glb_scale: float = 100.0
     scale_stl_to_mm: bool = True
 
     # GLB geometry compressed with Draco (KHR_draco_mesh_compression): high GLB ~22 -> ~6 MB. Viewers need a

@@ -49,6 +49,50 @@ class TestExporter(unittest.TestCase):
         self.assertGreater(up.volume, 0)                   # proper rotation: normals still point outwards
         self.assertTrue(np.allclose(tall.bounds[0], [-0.02, 0.0, -0.03]))   # the source mesh is not modified
 
+    def _units_bundle(self, glb_scale=None):
+        """Textured box 40 x 120 x 60 mm (metres, Y-up, cut base at Y = 3 mm) through export_multi_lod_bundle."""
+        tpath = Path(self.test_dir) / f"units_{glb_scale}"
+        src = tpath / "src"
+        src.mkdir(parents=True)
+        box = trimesh.creation.box(extents=(0.04, 0.12, 0.06))
+        box.apply_translation([0.0, 0.063, 0.0])
+        uv = np.random.default_rng(0).random((len(box.vertices), 2))
+        mat = trimesh.visual.material.SimpleMaterial(image=Image.new("RGB", (64, 64), "orange"))
+        box.visual = trimesh.visual.TextureVisuals(uv=uv, material=mat)
+        box.export(str(src / "textured.obj"))
+        trimesh.Trimesh(box.vertices, box.faces).export(str(src / "clean.obj"))
+        config = PipelineConfig()
+        config.glb_draco = False
+        if glb_scale is not None:
+            config.glb_scale = glb_scale
+        out = tpath / "out"
+        export_multi_lod_bundle(cleaned_mesh_path=str(src / "clean.obj"), textured_obj_path=str(src / "textured.obj"),
+                                output_dir=str(out), telemetry=self.telemetry, config=config,
+                                textured_low_obj_path=str(src / "textured.obj"), make_zip=False)
+        return out
+
+    def test_print_and_obj_files_are_in_millimetres(self):
+        """Slicers, CAD and Fusion read STL / 3MF / OBJ in mm: 120 mm tall must be 120, standing on Z = 0."""
+        import zipfile as _zip
+        out = self._units_bundle()
+        for f in ("stl/high_model.stl", "stl/low_model.stl", "3mf/high_model.3mf", "3mf/low_model.3mf"):
+            m = trimesh.load(str(out / f), force="mesh")
+            self.assertTrue(np.allclose(m.extents, [40, 60, 120], atol=0.01), (f, m.extents))
+            self.assertAlmostEqual(float(m.bounds[0][2]), 0.0, places=4)
+        model_xml = _zip.ZipFile(out / "3mf/high_model.3mf").read("3D/3dmodel.model").decode()
+        self.assertIn('unit="millimeter"', model_xml)
+        for f in ("obj/high/model_high.obj", "obj/low/model_low.obj"):
+            m = trimesh.load(str(out / f), force="mesh")
+            self.assertTrue(np.allclose(m.extents, [40, 120, 60], atol=0.01), (f, m.extents))
+
+    def test_glb_units(self):
+        """GLB: centimetres by default (as the viewers were built with), metres with glb_scale = 1 (glTF standard)."""
+        for scale, ext in ((None, [4, 12, 6]), (1.0, [0.04, 0.12, 0.06])):
+            out = self._units_bundle(scale)
+            for f in ("glb/high_model.glb", "glb/low_model.glb"):
+                m = trimesh.load(str(out / f), force="mesh")
+                self.assertTrue(np.allclose(m.extents, ext, rtol=1e-4), (scale, f, m.extents))
+
     def test_export_multi_lod_bundle_textured(self):
         tpath = Path(self.test_dir)
 

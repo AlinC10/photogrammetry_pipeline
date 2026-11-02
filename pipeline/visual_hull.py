@@ -1,7 +1,7 @@
 """
 visual_hull.py — Volume carved from the silhouette masks of all locked views (shape from silhouette).
 
-Two uses (plans/implemented/AUDIT_RECONSTRUCTIE_GENERALA.md, G6 and G2):
+Two uses (plans/arhiva/implemented/AUDIT_RECONSTRUCTIE_GENERALA.md, G6 and G2):
 1. Bounds of the object for the proxy 3D points of bridge_sfm: DensifyPointCloud derives its ROI and the depth range
    of every view from them, and the old fixed 220 mm volume was lower than tall objects (fixativ: 231-244 mm).
 2. Correcting the dense cloud where PatchMatch fails: on uniform, untextured plastic (a single-colour cap) it fuses
@@ -216,11 +216,14 @@ def proxy_bounds_from_hull(
 ) -> Dict[str, float]:
     """
     Volume for bridge_sfm.generate_proxy_3d_points: the hull box plus a margin, never larger than the masking
-    cylinder. Without a usable hull: the masking cylinder itself.
+    cylinder. Without a usable hull, or one that is only the ambiguous cone over the disc: the masking cylinder.
     """
-    # All occupied voxels: the base of the object can be inside the ambiguous cone and must stay in the volume
+    # All occupied voxels: the base of the object can be inside the ambiguous cone and must stay in the volume.
+    # Only when the silhouettes decided something, though: a hull that is nothing but the cone over the disc says
+    # nothing about the height (a wrong mask cut the lighter 153311 at the cone, 43 of 80 mm, and the ROI with it)
     stats = hull_stats(hull, decided_only=False) if hull is not None else {"voxels": 0}
-    if stats.get("voxels", 0) < 100:
+    if stats.get("voxels", 0) < 100 or (hull.get("ambiguous") is not None
+                                         and hull_stats(hull).get("voxels", 0) < 100):
         return {"y_max": float(cylinder_y_max_m), "r_max": float(cylinder_radius_m)}
     return {
         "y_max": float(min(cylinder_y_max_m, stats["y_max_mm"] / 1000 + margin_m)),
@@ -228,23 +231,21 @@ def proxy_bounds_from_hull(
     }
 
 
-def hull_silhouette(hull: Dict[str, Any], cam: Dict[str, Any], distorted: bool = True, scale: float = 0.25,
-                    margin_px: int = 2) -> np.ndarray:
+def _silhouette_small(hull: Dict[str, Any], cam: Dict[str, Any], distorted: bool, scale: float,
+                      margin_px: int, grow: bool = True) -> Optional[np.ndarray]:
     """
-    Mask (uint8 0/255, image size) of the hull seen from `cam`: the occupied voxels splatted at `scale` with their
-    footprint, closed, upsampled. Slightly larger than the object (voxel size + margin): used as the mask of the
-    views the AI model skipped (masking.ai_view_stride).
+    Hull seen from `cam` at `scale` (uint8 0/255) or None when no occupied voxel projects into the frame.
+    grow=False: the splatted voxel centres only closed (no dilation by the voxel footprint and the margin).
     """
     occ = hull["occupancy"]
-    h, w = int(cam["h"]), int(cam["w"])
-    out = np.zeros((h, w), np.uint8)
     if not occ.any():
-        return out
+        return None
+    h, w = int(cam["h"]), int(cam["w"])
     v = hull["voxel_m"]
     P = hull["origin"] + np.argwhere(occ) * v
     uv, z, ok = project_points(cam, P, distorted)
     if not ok.any():
-        return out
+        return None
     sh, sw = int(np.ceil(h * scale)), int(np.ceil(w * scale))
     small = np.zeros((sh, sw), np.uint8)
     us = np.clip(np.rint(uv[ok, 0] * scale).astype(np.int64), 0, sw - 1)
@@ -254,9 +255,45 @@ def hull_silhouette(hull: Dict[str, Any], cam: Dict[str, Any], distorted: bool =
     footprint = f * v / float(np.percentile(z[ok], 10)) * scale          # voxel size in small-image pixels
     r = int(np.ceil(footprint / 2.0 + margin_px * scale)) + 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
-    small = cv2.morphologyEx(cv2.dilate(small, kernel), cv2.MORPH_CLOSE, kernel)
+    if not grow:
+        return cv2.morphologyEx(small, cv2.MORPH_CLOSE, kernel)
+    return cv2.morphologyEx(cv2.dilate(small, kernel), cv2.MORPH_CLOSE, kernel)
+
+
+def hull_silhouette(hull: Dict[str, Any], cam: Dict[str, Any], distorted: bool = True, scale: float = 0.25,
+                    margin_px: int = 2) -> np.ndarray:
+    """
+    Mask (uint8 0/255, image size) of the hull seen from `cam`: the occupied voxels splatted at `scale` with their
+    footprint, closed, upsampled. Slightly larger than the object (voxel size + margin): used as the mask of the
+    views the AI model skipped (masking.ai_view_stride) and added to the masks of the views left out of the hull.
+    """
+    h, w = int(cam["h"]), int(cam["w"])
+    small = _silhouette_small(hull, cam, distorted, scale, margin_px)
+    if small is None:
+        return np.zeros((h, w), np.uint8)
     out = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
     return np.where(out > 127, 255, 0).astype(np.uint8)
+
+
+def mask_agreement(hull: Dict[str, Any], cameras: List[Dict[str, Any]], mask_paths: List[Optional[str]],
+                   distorted: bool = True, scale: float = 0.25) -> List[Optional[float]]:
+    """
+    Per view: the share of the hull silhouette its mask covers (None without a mask or a silhouette). With a hull
+    carved by several views together, a low value means the mask misses part of the object the other views see
+    (the AI chose the disc, the object was cut): such a view is left out of the hull (masking.min_hull_agreement).
+    """
+    out: List[Optional[float]] = []
+    for cam, mpath in zip(cameras, mask_paths):
+        small = (_silhouette_small(hull, cam, distorted, scale, 0, grow=False)
+                 if mpath and os.path.isfile(mpath) else None)
+        mask = cv2.imread(mpath, cv2.IMREAD_GRAYSCALE) if small is not None else None
+        if small is None or mask is None or not small.any():
+            out.append(None)
+            continue
+        m = cv2.resize(mask, (small.shape[1], small.shape[0]), interpolation=cv2.INTER_AREA) > 127
+        sil = small > 0
+        out.append(round(float((m & sil).sum()) / float(sil.sum()), 3))
+    return out
 
 
 def save_hull(hull: Dict[str, Any], path: str) -> None:
@@ -293,6 +330,51 @@ def surface_points(hull: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
     v = hull["voxel_m"]
     pts = hull["origin"] + np.stack([ii, jj, kk], 1)[keep] * v
     return pts, n[keep] / norm[keep, None]
+
+
+def hull_signed_distance(hull: Dict[str, Any]) -> np.ndarray:
+    """Signed distance (m) at the voxel centres to the hull surface: < 0 inside, > 0 outside (decided voxels only)."""
+    from scipy.ndimage import distance_transform_edt
+
+    occ = decided_occupancy(hull)
+    v = hull["voxel_m"]
+    # The surface lies half-way between an occupied and an empty voxel centre
+    return ((distance_transform_edt(~occ) - distance_transform_edt(occ)) * v
+            + np.where(occ, 0.5 * v, -0.5 * v)).astype(np.float32)
+
+
+def snap_to_hull(P: np.ndarray, hull: Dict[str, Any], max_dist_m: float = 0.003,
+                 sdf: Optional[np.ndarray] = None) -> Tuple[np.ndarray, int]:
+    """
+    Moves the points (m) that lie inside the hull within `max_dist_m` of its surface onto it, along the distance
+    gradient. Used on the patches of the hole filling (2.11): on convex faces the hull is nearly the object, so a
+    patch that sagged inside it gets the real shape; deeper (concavities, where the hull is a membrane) nothing
+    moves. Points outside the hull, in the ambiguous cone or out of the grid are left alone.
+    Returns (points, number moved).
+    """
+    from scipy.ndimage import map_coordinates
+
+    if sdf is None:
+        sdf = hull_signed_distance(hull)
+    v = hull["voxel_m"]
+    idx = ((P - hull["origin"]) / v).T                       # (3, N) fractional voxel coordinates
+    inside_grid = np.all((idx >= 0) & (idx <= (np.array(sdf.shape)[:, None] - 1)), axis=0)
+    d = map_coordinates(sdf, idx, order=1, mode="nearest")
+    amb = hull.get("ambiguous")
+    if amb is not None:
+        in_amb = map_coordinates(amb.astype(np.float32), idx, order=0, mode="nearest") > 0.5
+    else:
+        in_amb = np.zeros(len(P), bool)
+    move = inside_grid & ~in_amb & (d < 0) & (d > -max_dist_m)
+    if not move.any():
+        return P, 0
+    grads = np.stack([map_coordinates(g, idx[:, move], order=1, mode="nearest") for g in np.gradient(sdf, v)], 1)
+    n = np.linalg.norm(grads, axis=1)
+    ok = n > 1e-6
+    out = P.copy()
+    sel = np.flatnonzero(move)[ok]
+    out[sel] = P[sel] - (d[move][ok] / n[ok])[:, None] * grads[ok]
+    return out, int(len(sel))
 
 
 # -----------------------------------------------------------------------------
@@ -443,6 +525,7 @@ def refine_dense_cloud_with_hull(
     chroma_threshold: float = 20.0,
     min_facing: float = 0.3,
     min_height_ratio: float = 0.8,
+    debug_npz: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Corrects the dense cloud of DensifyPointCloud with the visual hull, before ReconstructMesh (skipped, cloud
@@ -457,6 +540,7 @@ def refine_dense_cloud_with_hull(
     `cameras` must be in the order of the OpenMVS scene images (load_sfm_cameras = bridge_sfm order): the
     appended view_indices index them. `image_paths` / `mask_paths`: the undistorted images and masks of the bridge.
     The original cloud is kept next to it as <name>_mvs.ply and is always the input, so a rerun never applies twice.
+    `debug_npz`: the pruned and the added points (float32, m) are saved there for the debug upload (debug_lite).
     Returns statistics (counts per reason).
     """
     from scipy.spatial import cKDTree
@@ -545,6 +629,11 @@ def refine_dense_cloud_with_hull(
         os.replace(original, ply)
 
     stats["added"] = int(len(P))
+    if debug_npz:
+        try:
+            np.savez_compressed(debug_npz, pruned=xyz[prune].astype(np.float32), added=P.astype(np.float32))
+        except Exception as e:
+            logger.warning(f"Debug points not saved: {e}")
     if len(P):
         stats["added_y_mm"] = [round(float(P[:, 1].min()) * 1000, 1), round(float(P[:, 1].max()) * 1000, 1)]
     stats["seconds"] = round(time.time() - t0, 2)

@@ -17,6 +17,8 @@ The system replaces the slow and noisy components of Meshroom (DepthMap, Meshing
 ### RULE 1: Never Modify `turntable_poses.py` Directly
 - `pipeline/turntable_poses.py` is an external mathematical module that computes AprilTag disc poses.
 - It must be called as an external module or subprocess. Do **not** modify its internal algorithm, arguments, or JSON output format.
+- Only exception (approved by the owner, 01.11.2026): the per-photo check in `write_report` runs `solvePnP` only with
+  >= 4 corners left after the outlier pass (a large object hiding the tags crashed the job before the .sfm was written).
 
 ### RULE 2: Rigid Lock of Camera Poses (No BA Drift)
 - On dark, semi-gloss, or smooth technical plastics, standard Structure-from-Motion (SfM) bundle adjustment (BA) will drift due to specular reflections and sparse feature points.
@@ -46,10 +48,20 @@ The system replaces the slow and noisy components of Meshroom (DepthMap, Meshing
 ### RULE 6: Watertight Base Slicing & Manifold Repair
 - Raw photogrammetry produces jagged boundary geometry near the turntable contact plane.
 - `pipeline/mesh_cleaner.py` executes:
-  1. Planar slice at $Y = 3.0\text{ mm}$ (dropping the turntable surface).
-  2. Extrusion of a prismatic vertical skirt down to $Y = 0.0\text{ mm}$.
-  3. 2D Ear-Clipping triangulation of the base polygon with winding normals forced strictly along $-Y$.
-  4. PyMeshLab manifold repair (closing small holes, removing non-manifold vertices/edges).
+  1. The object pieces chosen by position (vertices above the cut, inside the 115 mm rim radius), not the largest piece
+     (the disc of a small object used to win); every dropped piece is logged with its size, radius and height.
+  2. Holes whose border lies 3-15 mm above the cut closed BEFORE it (a hole reaching the cut opened the base outline).
+  3. Planar slice at $Y = 3.0\text{ mm}$ (dropping the turntable surface), optional skirt down to $Y = 0.0\text{ mm}$.
+  4. Every closed loop in the cut plane capped (polygons with holes: ring feet, several legs), ear clipping, normals
+     strictly along $-Y$; loops chained along directed boundary half-edges.
+  5. PyMeshLab (in mm): repair, decimation to the high-poly target, then the holes closed ONCE on the high poly
+     (`fill_holes_with_fairing`: up to 2000 edges, only the patch remeshed (close_holes `refinehole` cost ~20 s per
+     call), Laplacian fairing of the patch, patches snapped onto the visual hull where they sag < 3 mm inside it,
+     coherent outward orientation, split pinch vertices moved apart so an STL stays manifold). 8/8 non-watertight v8
+     models closed, sizes unchanged. The low poly is a topology-preserving decimation of it (re-closed if a collapse
+     opens an edge), STL / 3MF come from it. Poisson was tested and rejected (watertight 3/8, 34 mm bulges).
+  6. Problems the client must see go to `status.json` "warnings" (not watertight, tiny model, model at the disc rim,
+     most faces dropped, masks disagreeing, hull only the cone over the disc).
 
 ### RULE 7: Multi-LOD Deliverable Contract
 The pipeline must always produce the following asset structure in `output/`:
@@ -57,6 +69,8 @@ The pipeline must always produce the following asset structure in `output/`:
 - **Low-Poly OBJ (`output/obj/low/`):** `model_low.obj`, `model_low.mtl`, and web-optimized `model_low_texture.jpg` (downscaled, max 2048px). **Must contain valid UV texture coordinates (`vt`)**.
 - **GLB Models (`output/glb/`):** `high_model.glb` (embedded PNG texture) and `low_model.glb` (embedded JPG texture), each ONE object (one primitive per atlas), geometry Draco-compressed (`--no_draco` to disable).
 - **3D Printing Assets:** Watertight `high_model.stl`, `low_model.stl`, `high_model.3mf`, `low_model.3mf`.
+- **Units:** OBJ / STL / 3MF in millimetres (`export_scale` 1000; STL / 3MF Z-up, base on Z = 0), GLB in `glb_scale`
+  units per metre (100 = cm, the current viewers; 1 = metres, the glTF standard).
 - **Object Card (`output/object.json`):** title, description, length × width × height (mm) and volume (cm³) of the cleaned mesh.
 - **Package Archive:** `output.zip` containing all multi-LOD deliverables for Cloudflare R2 / S3.
 
@@ -68,7 +82,7 @@ To prevent dark patches, Poisson bleeding, and micro-confetti texture atlases:
 - `--empty-color 0`: Fills unobserved faces (e.g. flat cut bottom) and empty atlas areas with clean black (`RGB 0,0,0`), not neon orange.
 
 ### RULE 9: Testing & Documentation Integrity
-- All unit tests in `tests/` (128 at the time of writing) must pass before any commit.
+- All unit tests in `tests/` (162 at the time of writing) must pass before any commit.
 - Preserve existing docstrings, comments, and structure.
 
 ---
@@ -88,14 +102,16 @@ turntable_studio/
 │   ├── runpod.py               # RunPod REST pods: GPUs fastest first under a price cap + preferred, then min RAM/vCPU, guaranteed termination, bounded retries
 │   └── job.py                  # Whole cloud flow for one scan (upload -> pod -> download -> cleanup)
 ├── tools/                      # Local only (not in the image): cloud_scan.py, docker_scan.ps1, fit_ram_model.py, collect_stats.py,
-│                               #   debug_texturing.py (texture diagnostics), debug_blender_compare.py (headless Blender)
+│                               #   debug_texturing.py (texture diagnostics), debug_blender_compare.py (headless Blender),
+│                               #   pull_debug.py (debug bucket -> PC, deleted from R2 after a verified download),
+│                               #   regression.py (table of a results folder vs a reference run)
 ├── Dockerfile                  # Multi-stage CUDA 12 + OpenMVS production container
 ├── docker-compose.yml          # Container configuration with GPU passthrough
 ├── requirements.txt            # Python dependencies (NumPy, SciPy, Trimesh, PyMeshLab, etc.)
 ├── pipeline/
 │   ├── __init__.py             # Public package exports
 │   ├── config.py               # Dataclass configurations and OpenMVS binary locator
-│   ├── telemetry.py            # Hardware resource profiler (Peak RAM, VRAM, per-step timing, run_info)
+│   ├── telemetry.py            # Hardware resource profiler (Peak RAM, VRAM, per-step timing, run_info, warnings)
 │   ├── resources.py            # cgroup-aware CPUs/RAM, DensifyPointCloud RAM estimate + check, worker count
 │   ├── parallel.py             # Spawned process pool whose workers log into run_log.txt (background metrics, exports)
 │   ├── run_metrics.py          # stats.json features for RAM/time/quality models (hardware, disk speed, object, logs)
@@ -115,6 +131,9 @@ turntable_studio/
 │   ├── object_info.py          # object.json: title, description, real size (mm) and volume of the cleaned mesh
 │   ├── mask_processor.py       # Masks: BiRefNet_lite 512 ONNX on the CPU (white parts, through-holes) or photometric
 │   │                           #   fallback; masking cylinder + tag blackout
+│   ├── mask_fusion.py          # Fused masks (default): AI on a crop + per-(camera, level) background median + the disc
+│   │                           #   rendered from the tag layout; disc out of the masks, no missed view
+│   ├── debug_lite.py           # Debug archive of a scan (raw mesh Draco, masks 1/4, hull, refine points, small files)
 │   └── calibrate_intrinsics.py # Chessboard/Charuco camera matrix calibration
 └── tests/
     ├── test_bridge_sfm.py      # Camera matrix, quaternion, proxy track tests, generated masks found and applied
@@ -122,14 +141,21 @@ turntable_studio/
     ├── test_visual_hull.py     # Hull carving, proxy bounds, dense PLY I/O, prune + fill on a synthetic cylinder,
     │                           #   ambiguous disc cone, hull silhouettes, refinement skipped on a too short hull
     ├── test_rig_refine.py      # Recovers a known carriage tilt / cam1 offset; guards keep the tag poses; sfm column-major
-    ├── test_main_checks.py     # Tag-correction warning, masking cylinder widened when the hull reaches it
+    ├── test_main_checks.py     # Tag-correction warning, cylinder widened only for real (decided) contact, cone-only
+    │                           #   warning, cleaning warnings to status.json, hole patches snapped onto the hull
     ├── test_parallel.py        # Worker logs forwarded, export with a pool = sequential export, texrecon scene once, zip
-    ├── test_mesh_cleaner.py    # 2D Ear-clipping and watertight base tests
+    ├── test_mesh_cleaner.py    # Ear clipping, every base loop capped (ring foot, legs), hole at the cut, object by
+    │                           #   position next to a large disc, large hole filled once, warnings
+    ├── test_mask_fusion.py     # Fused masks on a synthetic turntable: disc removed, object kept, crop box, hull check
+    ├── test_debug_lite.py      # Debug archive parts and budget; upload only with debug-bucket credentials
+    ├── test_regression_tool.py # tools/regression.py: regressions and improvements against a reference
     ├── test_openmvs_runner.py  # TextureMesh PLY (texcoord, texnumber) -> OBJ + MTL conversion
     ├── test_exporter.py        # Multi-LOD OBJ, MTL, JPG/PNG, and GLB bundle tests (incl. multi-material GLB)
     ├── test_texrecon_runner.py # .cam export, scene/ rebuilt per run, unseen-face patch
     ├── test_texture_prep.py    # Mesh rasterizer, PNG background exactly 0, colour gains
     ├── test_camera_init.py     # turntable_poses command line (--liftMm, --tagRefine)
+    ├── test_turntable_poses_report.py # report survives photos with < 4 tag corners left (no solvePnP crash)
+    ├── test_pull_debug.py      # debug bucket pulled to the PC: verified before delete, never the delivery bucket
     ├── test_resources.py       # cgroup limits, RAM estimate vs measured runs, worker count
     ├── test_run_metrics.py     # log parsers, object/mesh metrics, telemetry step fields, CSV collector
     ├── test_cloud.py           # R2 layout, temporary credentials, pod lifecycle, preferred then minimum pod request (in-memory S3, fake RunPod)
@@ -143,8 +169,13 @@ turntable_studio/
 The following features are slated for upcoming agent implementations:
 
 ### Priority 1: Automated Background Matting (BiRefNet / SAM) — implemented (BiRefNet_lite, CPU)
-- `masking.method = "ai"`: BiRefNet_lite 512 ONNX (`/opt/models/birefnet_lite_512.onnx`, `TURNTABLE_MASK_MODEL`) on 1 view in `ai_view_stride`; the others get the visual hull silhouette. Photometric fallback per view and without the model.
-- The model keeps the turntable: the masking cylinder, tag blackout and the Y = 3 mm slice remove it; the visual hull marks the cone over the disc it cannot judge.
+- `masking.method = "fused"` (default, `pipeline/mask_fusion.py`): BiRefNet_lite 512 ONNX on a crop around the object
+  (grown and run again while the object leaves it), accepted where the scan's own background (per-(camera, level)
+  median, disc rendered from the tag layout) agrees; every view. 70 views of 7 scans: mean IoU 0.32 -> 0.83 (local, 01.11).
+- Every mask is checked against a loose hull of all of them; a view that misses part of the object is left out of the
+  visual hull and gets the hull silhouette added (`masking.min_hull_agreement`).
+- `masking.method = "ai"`: the model on the whole photo, 1 view in `ai_view_stride`, the others the hull silhouette; it
+  keeps the turntable (the visual hull marks the cone over the disc it cannot judge). Photometric fallback without the model.
 - Pending: first measured pod run (time per image with the pod's vCPUs; ~4 GB RAM per worker).
 
 ### Priority 2: AI Surface Normal Refinement & High-Relief Guidance

@@ -67,6 +67,15 @@ def _merge_cloud_stats(stats_path: Path, report: Dict[str, Any], runs) -> None:
         logger.warning(f"Could not add the cloud data to {stats_path}: {e}")
 
 
+def cleanup_prefix(job_id: str, delete_stale_after_s: Optional[float]) -> str:
+    """
+    What a finished job deletes from R2. When the next job clears the old ones at its start (delete_stale_after_s
+    set), only the photos: the result (output.zip, stats.json, run_log.txt) stays in R2 until then, e.g. when this
+    machine slept while the pod finished. Without that cleanup nothing else would delete it: the whole job goes.
+    """
+    return r2.input_prefix(job_id) if delete_stale_after_s is not None else r2.job_prefix(job_id)
+
+
 def plan_job(input_dir: str, resolution_level: int = 1, min_vcpu: int = DEFAULT_MIN_VCPU) -> Dict[str, Any]:
     """Photo count, sizes and the pod requirements derived from them (§2 of the performance plan)."""
     files = r2.local_image_files(input_dir)
@@ -240,8 +249,11 @@ def run_cloud_job(
 
     if not keep_remote:
         t0 = time.time()
-        report["deleted_objects"] = r2.delete_prefix(r2.job_prefix(job_id), bucket, client=client)
+        prefix = cleanup_prefix(job_id, delete_stale_after_s)
+        report["deleted_objects"] = r2.delete_prefix(prefix, bucket, client=client)
         t["cleanup"] = round(time.time() - t0, 2)
-        say(f"Deleted {report['deleted_objects']} objects of job {job_id} from R2.")
+        kept = ("" if prefix == r2.job_prefix(job_id)
+                else f" Result kept in {r2.output_prefix(job_id)} until the next job.")
+        say(f"Deleted {report['deleted_objects']} objects of job {job_id} from R2.{kept}")
     (dest / "cloud_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     return report

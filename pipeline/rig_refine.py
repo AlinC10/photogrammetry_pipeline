@@ -17,7 +17,7 @@ This step (after turntable_poses, which stays untouched, RULE 1):
    stay those of the tags: a few tens of parameters, no per-photo freedom (RULE 2: no SfM drift);
 5. keeps the correction only when it lowers the error on a third of the view pairs left out of the fit and stays
    physically small; otherwise the tag poses are kept unchanged.
-Measured on the scans of 30.10.2026 (plans/PLAN_PRECIZIE_SI_MASTI.md): between levels 2.9 -> 1.0 px (box),
+Measured on the scans of 30.10.2026 (plans/CUNOSTINTE_SI_MASURATORI.md §4): between levels 2.9 -> 1.0 px (box),
 1.9 -> 0.34 px (spray can), cam0-cam1 1.4 -> 0.6 px; ~10-30 s on the pod.
 """
 

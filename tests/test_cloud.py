@@ -138,6 +138,19 @@ class TestR2Layout(unittest.TestCase):
         keys = {k for (_, k) in self.s3.objects}
         self.assertEqual(keys, {"jobs/mine/input/f.jpg", "scans/f.jpg"})
 
+    def test_finished_job_keeps_its_result_until_the_next_job(self):
+        from cloud.job import cleanup_prefix
+        for key in ("jobs/j1/input/rig/0/f_1000.jpg", "jobs/j1/output/output.zip", "jobs/j1/output/status.json"):
+            self.s3.put_object(Bucket=BUCKET, Key=key, Body=b"x")
+        # cloud_scan (old jobs cleared at the start of the next one): only the photos go now
+        r2.delete_prefix(cleanup_prefix("j1", 0.0), BUCKET, client=self.s3)
+        self.assertEqual({k for (_, k) in self.s3.objects}, {"jobs/j1/output/output.zip", "jobs/j1/output/status.json"})
+        # ... and the next job deletes the result
+        self.assertEqual(r2.delete_stale_jobs(0, BUCKET, client=self.s3, keep=["j2"], now=1e12), ["j1"])
+        self.assertEqual(self.s3.objects, {})
+        # no cleanup at the start of the next job (--keep_old_jobs, the Pi): the whole job goes at the end
+        self.assertEqual(cleanup_prefix("j1", None), "jobs/j1/")
+
     def test_keys(self):
         self.assertEqual(r2.input_key("j1", "rig\\0/f_1000.jpg"), "jobs/j1/input/rig/0/f_1000.jpg")
         self.assertEqual(r2.output_key("j1", "status.json"), "jobs/j1/output/status.json")

@@ -202,5 +202,127 @@ class TestMeshCleaner(unittest.TestCase):
         self.assertAlmostEqual(res["face_count"] / len(sphere.faces), 0.75, delta=0.01)
 
 
+    # ------------------------------------------------------------------ closed models (01.11 audit, G1-G3, P7)
+
+    def _clean(self, mesh, name, **cfg):
+        in_path = Path(self.test_dir) / f"{name}.obj"
+        out_path = Path(self.test_dir) / f"{name}_clean.obj"
+        mesh.export(str(in_path))
+        config = MeshCleaningConfig(slice_y_m=0.003, skirt_bottom_y_m=0.003, **cfg)
+        res = clean_and_repair_mesh(str(in_path), str(out_path), config)
+        return res, trimesh.load(str(out_path), process=False)
+
+    def test_ring_foot_is_capped_as_a_polygon_with_a_hole(self):
+        """A mug on its rim: two nested loops in the cut plane -> one annulus, not only the largest loop (G1)."""
+        ring = trimesh.creation.annulus(r_min=0.02, r_max=0.03, height=0.06, sections=48)
+        ring.apply_transform(trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0]))
+        ring.apply_translation([0.0, 0.028, 0.0])                         # y from -0.002 to 0.058
+        report = {}
+        sealed = seal_watertight_pedestal(ring, slice_y=0.003, skirt_y=0.003, max_radius=0.12, report=report)
+        self.assertEqual(report["base"]["polygons"], 1)
+        self.assertEqual(report["base"]["holes_in_polygons"], 1)
+        self.assertTrue(sealed.is_watertight)
+        # the cap is the annulus: its area is pi (R^2 - r^2), not pi R^2
+        bottom = sealed.faces[np.all(np.abs(sealed.vertices[sealed.faces][:, :, 1] - 0.003) < 1e-6, axis=1)]
+        area = trimesh.triangles.area(sealed.vertices[bottom]).sum()
+        self.assertAlmostEqual(area, np.pi * (0.03 ** 2 - 0.02 ** 2), delta=0.1 * np.pi * (0.03 ** 2 - 0.02 ** 2))
+
+    def test_three_legs_are_all_capped(self):
+        legs = []
+        for a in (0.0, 2.1, 4.2):
+            leg = trimesh.creation.cylinder(radius=0.006, height=0.05, sections=24)
+            leg.apply_transform(trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0]))
+            leg.apply_translation([0.03 * np.cos(a), 0.023, 0.03 * np.sin(a)])
+            legs.append(leg)
+        report = {}
+        sealed = seal_watertight_pedestal(trimesh.util.concatenate(legs), slice_y=0.003, skirt_y=0.003,
+                                          max_radius=0.12, report=report)
+        self.assertEqual(report["base"]["polygons"], 3)
+        self.assertTrue(sealed.is_watertight)
+
+    def test_skirt_under_every_loop_stays_watertight(self):
+        ring = trimesh.creation.annulus(r_min=0.02, r_max=0.03, height=0.06, sections=32)
+        ring.apply_transform(trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0]))
+        ring.apply_translation([0.0, 0.028, 0.0])
+        sealed = seal_watertight_pedestal(ring, slice_y=0.003, skirt_y=0.0, max_radius=0.12)
+        self.assertTrue(sealed.is_watertight)
+        self.assertAlmostEqual(float(sealed.vertices[:, 1].min()), 0.0, places=6)
+        self.assertGreater(sealed.volume, 0.0)
+
+    def test_hole_reaching_the_cut_is_closed_before_it(self):
+        """A hole touching the cut plane used to open the base outline into a path that earcut closed with a chord (G2)."""
+        cyl = trimesh.creation.cylinder(radius=0.03, height=0.06, sections=48)
+        cyl.apply_transform(trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0]))
+        cyl.apply_translation([0.0, 0.028, 0.0])
+        cyl = cyl.subdivide_to_size(0.003)
+        c = cyl.triangles_center
+        ang = np.arctan2(c[:, 2], c[:, 0])
+        side = np.hypot(c[:, 0], c[:, 2]) > 0.029
+        hole = side & (np.abs(ang) < 0.4) & (c[:, 1] < 0.012)
+        cyl.update_faces(~hole)
+        cyl.remove_unreferenced_vertices()
+        res, out = self._clean(cyl, "g2", target_high_poly_faces=0, high_poly_ratio=1.0)
+        self.assertTrue(res["is_watertight"])
+        self.assertTrue(out.is_watertight)
+        self.assertAlmostEqual(float(out.vertices[:, 1].min()), 0.003, delta=0.0005)    # flat base kept
+        self.assertGreater(res["base_band"].get("faces_added", 0), 0)
+
+    def test_small_object_beside_a_large_disc_is_kept(self):
+        """The orange piece 094944: the disc was the largest piece and the object was thrown away (P7)."""
+        disc = trimesh.creation.cylinder(radius=0.127, height=0.003, sections=128)
+        disc.apply_transform(trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0]))
+        disc.apply_translation([0.0, -0.0005, 0.0])                       # y from -2 to 1 mm: under the cut
+        disc = disc.subdivide_to_size(0.01)
+        cube = trimesh.creation.box(extents=[0.012, 0.012, 0.012])
+        cube.apply_translation([0.01, 0.005, 0.0])                        # y from -1 to 11 mm
+        self.assertGreater(len(disc.faces), 10 * len(cube.faces))
+        res, out = self._clean(trimesh.util.concatenate([disc, cube]), "orange")
+        self.assertLess(max(out.extents), 0.02)
+        self.assertGreater(min(out.extents[[0, 2]]), 0.010)
+        self.assertTrue(res["is_watertight"])
+        self.assertEqual(res["components"]["kept"], 1)
+        self.assertNotIn("model_tiny", [w["code"] for w in res["warnings"]])
+
+    def test_large_hole_is_filled_once_on_the_high_poly(self):
+        sphere = trimesh.creation.icosphere(subdivisions=5, radius=0.04)
+        sphere.apply_translation([0.0, 0.06, 0.0])
+        top = sphere.triangles_center[:, 1] > 0.093                      # a cap of ~300 faces, ~100 border edges
+        sphere.update_faces(~top)
+        sphere.remove_unreferenced_vertices()
+        res, out = self._clean(sphere, "holed_top")
+        self.assertGreater(int(top.sum()), 100)
+        self.assertTrue(res["is_watertight"])
+        self.assertEqual(res["holes"]["boundary_edges_after"], 0)
+        self.assertGreater(res["patched_area_cm2"], 1.0)
+        # metres in, metres out (PyMeshLab works in mm inside)
+        self.assertAlmostEqual(float(out.extents[0]), 0.08, delta=0.004)
+        self.assertEqual(res["warnings"], [])
+
+    def test_warnings_for_a_lost_object(self):
+        speck = trimesh.creation.box(extents=[0.004, 0.004, 0.004])
+        speck.apply_translation([0.0, 0.004, 0.0])
+        res, _ = self._clean(speck, "speck")
+        self.assertIn("model_tiny", [w["code"] for w in res["warnings"]])
+
+    def test_split_pinch_vertices_are_separated(self):
+        """Two cubes touching at one corner: the repair splits the pinch into coincident copies an STL merges back."""
+        import pymeshlab
+        from pipeline.mesh_cleaner import _separate_coincident_vertices
+
+        a = trimesh.creation.box(extents=[10, 10, 10])
+        b = trimesh.creation.box(extents=[10, 10, 10])
+        b.apply_translation([10, 10, 10])                     # shares the corner (5, 5, 5), as separate vertices
+        both = trimesh.util.concatenate([a, b])
+        ms = pymeshlab.MeshSet()
+        ms.add_mesh(pymeshlab.Mesh(vertex_matrix=both.vertices, face_matrix=both.faces.astype(np.int32)))
+        moved = _separate_coincident_vertices(ms)
+        self.assertEqual(moved, 2)
+        V = ms.current_mesh().vertex_matrix()
+        self.assertEqual(len(np.unique(np.round(V, 6), axis=0)), len(V))
+        merged = trimesh.Trimesh(V, ms.current_mesh().face_matrix(), process=True)
+        self.assertTrue(merged.is_watertight)
+        self.assertLess(np.abs(V - both.vertices).max(), 0.021)
+
+
 if __name__ == "__main__":
     unittest.main()

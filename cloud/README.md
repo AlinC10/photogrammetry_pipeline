@@ -18,7 +18,8 @@ Pi / laptop                              R2 (one bucket)                        
                                                                                       run_log.txt, status.json (last)
 9. wait for status.json, terminate the pod (always)
 10. download + extract output.zip -> results/<id>/
-11. delete jobs/<id>/ from R2
+11. delete the photos (jobs/<id>/input/) from R2; the result stays in jobs/<id>/output/ until the next job
+    deletes the older jobs at its start (without that cleanup, e.g. --keep_old_jobs, the whole job goes now)
 ```
 
 ## Files
@@ -70,8 +71,28 @@ or died without writing a status (likely OOM, asks for 1.5× RAM). `pipeline_err
 
 ```json
 {"job_id": "...", "state": "ok | ram_insufficient | pipeline_error | input_error | timeout",
- "error": "...", "required_gb": 0, "available_gb": 0, "resources": {...}, "timings_s": {...}}
+ "error": "...", "required_gb": 0, "available_gb": 0, "resources": {...}, "timings_s": {...},
+ "warnings": [{"code": "not_watertight", "message": "...", ...}], "debug_lite": {"uploaded": false, ...}}
 ```
+
+`warnings` (with `state` "ok"): the model was delivered but may need a rescan or a check. Codes: `not_watertight`,
+`model_tiny`, `model_at_disc_rim`, `most_faces_dropped`, `masks_disagree`, `hull_cone_only`. The `message` is for
+people (the Pi / front-end can show it as is).
+
+## Debug archive (optional, separate bucket)
+
+The pod uploads `jobs/<id>/debug_lite.zip` (raw mesh as Draco, masks at 1/4, visual hull, points the hull pruned /
+added, small reports; ~5-40 MB, `pipeline/debug_lite.py`) to the DEBUG bucket, never to the delivery bucket, when the
+launcher gives it temporary credentials for it. The launcher (Pi / `cloud/job.py`) adds one line next to
+`pod_credentials_env`:
+
+```python
+env.update(r2.debug_credentials_env(job_id, ttl))   # {} without R2_DEBUG_BUCKET: nothing changes
+```
+
+`R2_DEBUG_BUCKET` (and optionally `R2_DEBUG_ACCESS_KEY_ID`, a token for that bucket only) in `.env`. Without them the
+pod skips the upload (`status.json` "debug_lite": {"uploaded": false}). On the PC: `python tools/pull_debug.py`
+downloads everything, verifies it and deletes it from R2. Job option `"debug_lite": false` turns it off.
 
 ## Test from the laptop
 

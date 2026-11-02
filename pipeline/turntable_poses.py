@@ -865,7 +865,9 @@ def write_report(model, views, obs, intr_by_id, args, R):
             continue
         rms = float(np.sqrt((err[m] ** 2).mean()))
         extra = ""
-        if len(v["tags"]) >= 2:
+        # solvePnP cere ≥ 4 colțuri; după excluderea colțurilor greșite pot rămâne mai puține
+        # chiar dacă poza avea ≥ 2 tag-uri detectate (obiect mare care acoperă tag-urile)
+        if len(v["tags"]) >= 2 and int(m.sum()) >= 4:
             c = v["intrinsicId"]
             K, D = model.p["K_%s" % c], model.p["D_%s" % c]
             Km = np.array([[K[0], 0, K[1]], [0, K[0], K[2]], [0, 0, 1]])

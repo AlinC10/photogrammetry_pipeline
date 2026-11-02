@@ -3,7 +3,7 @@
 
 numpy>=1.24.0,<2.1.0
 scipy>=1.10.0
-opencv-python-headless>=4.7.0.72
+opencv-python-headless==5.0.0.93   # pinned: what the v8 image resolved (OpenCV 5.0.0 on the pod, Python 3.10)
 pillow>=10.0.0
 pymeshlab>=2023.12
 DracoPy>=1.4.0          # Draco compression of the GLB geometry (KHR_draco_mesh_compression)

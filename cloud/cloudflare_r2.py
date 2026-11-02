@@ -501,3 +501,29 @@ def pod_credentials_env(job_id: str, ttl_seconds: int, account_id: Optional[str]
     env.update(read.as_env("R2_IN_"))
     env.update(write.as_env("R2_OUT_"))
     return env
+
+
+def debug_credentials_env(job_id: str, ttl_seconds: int, account_id: Optional[str] = None,
+                          api_token: Optional[str] = None, bucket: Optional[str] = None,
+                          parent_access_key_id: Optional[str] = None) -> Dict[str, str]:
+    """
+    Environment for the pod's debug upload (runpod_job.py, pipeline/debug_lite.py): read-write credentials limited
+    to jobs/<id>/ of the DEBUG bucket (R2_DEBUG_BUCKET), expiring after ttl_seconds. {} when no debug bucket is
+    configured or it is the delivery bucket. The parent key is R2_DEBUG_ACCESS_KEY_ID (a token for the debug bucket)
+    or R2_ACCESS_KEY_ID. The launcher (Pi / laptop) adds this to the pod environment next to pod_credentials_env:
+        env.update(r2.debug_credentials_env(job_id, ttl))
+    """
+    bucket = bucket or os.environ.get("R2_DEBUG_BUCKET", "")
+    if not bucket or bucket == bucket_from_env():
+        return {}
+    account_id = account_id or os.environ.get("CLOUDFLARE_ACCOUNT_ID")
+    api_token = api_token or os.environ.get("CLOUDFLARE_R2_API_TOKEN")
+    parent = (parent_access_key_id or os.environ.get("R2_DEBUG_ACCESS_KEY_ID")
+              or os.environ.get("R2_ACCESS_KEY_ID"))
+    if not (account_id and api_token and parent):
+        return {}
+    cred = create_temp_credentials(account_id, api_token, bucket, parent, "object-read-write",
+                                   [job_prefix(job_id)], ttl_seconds)
+    env = {"R2_DEBUG_BUCKET": bucket}
+    env.update(cred.as_env("R2_DEBUG_"))
+    return env

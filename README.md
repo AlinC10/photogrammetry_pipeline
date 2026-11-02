@@ -19,12 +19,12 @@ flowchart TD
     A["Photos<br/>input_images/rig/0 and rig/1"] --> B["1. CameraInit<br/>views + intrinsics (3.9 mm lens)"]
     B --> C["2. turntable_poses<br/>AprilTags -> locked camera poses"]
     C --> RR["2.1 Rig refinement<br/>per camera + level, sparse SIFT features"]
-    RR --> D["2.5 Masks<br/>BiRefNet_lite (CPU) + cylinder + tags"]
+    RR --> D["2.5 Masks<br/>BiRefNet_lite on a crop + scan background + rendered disc"]
     D --> V["2.6 Visual hull<br/>volume carved from the masks"]
     V --> E["3. Bridge<br/>undistortion + COLMAP model (parallel)"]
     E --> R{"RAM check"}
     R --> F["4. OpenMVS<br/>DensifyPointCloud -> 4.2b hull correction -> ReconstructMesh"]
-    F --> G["5. Mesh cleaning<br/>cut the disc at 3 mm, close the base, repair, decimate"]
+    F --> G["5. Mesh cleaning<br/>object by position, cut at 3 mm, cap every base loop, decimate, fill holes once"]
     G --> H["5.5 Texturing images<br/>PNG, mesh-silhouette masks, colour gains"]
     H --> T["4.4 texrecon<br/>(fallback: OpenMVS TextureMesh)"]
     T --> X["6. Export<br/>OBJ / GLB / STL / 3MF, high + low"]
@@ -36,13 +36,13 @@ flowchart TD
 | 1. CameraInit | Finds the photos, reads the level / step from the file name (`f_2005.jpg` = level 2, step 5), writes `cameraInit.sfm` | `pipeline/camera_init.py` |
 | 2. Poses | Detects the 12 AprilTags in every photo and fits one rigid turntable model (step angle, rotation axis, lift per level, camera intrinsics). Writes `cameras_known.sfm`, `turntable_report.txt` (RMS, lift, per-photo errors) and `turntable_calib.json` | `pipeline/turntable_poses.py` (**never modified**, called as a subprocess) |
 | 2.1 Rig refinement | SIFT on half-resolution photos, booth points dropped (static within a level), neighbouring views matched; one rigid correction per (camera, level) from the epipolar error on the object (the carriage tilts ~0.9° on the first lift, cam1 is ~0.4° off). Applied only when it lowers the error on held-out view pairs and stays small (`rig_refine.json`; tag-only poses in `cameras_known_tags.sfm`). Box: between levels 2.9 → 1.0 px, spray can 1.9 → 0.3 px; 10–30 s | `pipeline/rig_refine.py` |
-| 2.5 Masks | Object vs background inside an 80 mm × 350 mm cylinder around the axis (125 mm when the object reaches it), minus the tags the object cannot cover. Foreground from BiRefNet_lite (512 px ONNX on the CPU: keeps white labels, leaves real through-holes open) on every 2nd view, the others get the visual hull silhouette; photometric (not white) per view when the model misses the object, and for the whole scan without the model | `pipeline/mask_processor.py` |
-| 2.6 Visual hull | Voxels (1.5 mm) carved by the masks; its box sets the volume of the synthetic tracking points. The AI masks keep the turntable, so the low cone over the disc no view can judge is marked ambiguous and left out of the 4.2b correction | `pipeline/visual_hull.py` |
+| 2.5 Masks | Object vs background inside an 80 mm × 350 mm cylinder around the axis (125 mm when the object reaches it), minus the tags the object cannot cover. Default `fused`, on every view: BiRefNet_lite (512 px ONNX on the CPU) on a square crop around the object, grown and run again while the object leaves it; its "object" is kept where the scan's own background differs (per camera and level: the median of the shots; on the disc: the disc rendered from the tag layout) or cannot judge. The disc leaves the masks, no view is missed (70 views: IoU 0.32 → 0.83). Each mask is then checked against a loose hull of all of them: a view that misses part of the object is left out of the visual hull and gets its silhouette added. `ai` = the model on the whole photo (keeps the disc), `photometric` = not white; both are fallbacks | `pipeline/mask_fusion.py`, `pipeline/mask_processor.py` |
+| 2.6 Visual hull | Voxels (1.5 mm) carved by the masks (a voxel goes when ≥ 2 views see background); its box sets the volume of the synthetic tracking points, but only when the silhouettes decided something (otherwise the whole cylinder). With `ai` masks, which keep the turntable, the low cone over the disc no view can judge is marked ambiguous (a warning when the hull is nothing else). The cylinder is widened only when decided voxels reach it | `pipeline/visual_hull.py` |
 | 3. Bridge | Undistorts photos and masks, writes the COLMAP model OpenMVS imports (poses + 1500 synthetic tracking points inside the hull box: they set OpenMVS's ROI and depth range) | `pipeline/bridge_sfm.py` |
 | RAM check | Estimates DensifyPointCloud's RAM from photos × resolution and stops in seconds if the container cannot hold it | `pipeline/resources.py` |
 | 4. OpenMVS | Depth map per photo on the GPU, fusion into a dense point cloud, surface mesh. Depth maps are deleted after fusion | `pipeline/openmvs_runner.py` |
 | 4.2b Hull correction | Before ReconstructMesh: drops dense points > 5 mm inside the hull fused from ≤ 3 views (wrong depths on uniform plastic, e.g. a single-colour cap) and adds hull-surface points where nothing is left. Skipped when the hull is much shorter than the cloud (wrong masks). The plain cloud stays as `scene_dense_mvs.ply`; ReconstructMesh falls back to it if it fails | `pipeline/visual_hull.py` |
-| 5. Cleaning | Keeps the largest part, cuts at Y = 3 mm (removes the disc), keeps the largest part again (disc rim pieces), closes the base flat, repairs, decimates the high poly to 75 % of its faces + a low-poly copy with min(20 %, 50 000) faces (`--high_poly_ratio`, `--low_poly_ratio`, `--low_poly_max_faces`). Writes `object.json`: title, description, length × width × height in mm, volume | `pipeline/mesh_cleaner.py`, `pipeline/exporter.py` |
+| 5. Cleaning | Keeps the object pieces by position (vertices above the cut, inside the disc rim; not the largest piece, which can be the disc), closes holes just above the cut, cuts at Y = 3 mm, caps every loop of the cut flat (ring feet, legs), repairs, decimates the high poly to 75 % of its faces, then closes its holes once (up to 2000 edges, smoothed patch, snapped onto the visual hull where it sags < 3 mm inside it); low poly = min(20 %, 50 000) faces of it, still closed (`--high_poly_ratio`, `--low_poly_ratio`, `--low_poly_max_faces`). Writes `object.json`: title, description, length × width × height in mm, volume, watertight, patched area. Problems go to `status.json` "warnings" | `pipeline/mesh_cleaner.py`, `pipeline/exporter.py` |
 | 5.5 Texturing images | Lossless PNGs where everything outside the mesh silhouette is exactly black, per-camera colour gains from the white paper | `pipeline/texture_prep.py`, `pipeline/mesh_masks.py` |
 | 4.4 Texturing | `texrecon` picks the best photo per face and builds the atlases; unseen faces are coloured like their neighbours. High and low poly run at the same time (one `.cam` scene, low in `texrecon/low/`) when ≥ 16 GB RAM is free. Low-poly decimation, print exports, metrics and `object.json` run in background workers; export chains in parallel; `output.zip` once, at the end | `pipeline/texrecon_runner.py`, `pipeline/parallel.py` |
 | 6. Export | OBJ + MTL + PNG/JPG, GLB with embedded textures, watertight STL / 3MF at real scale, `output.zip` | `pipeline/exporter.py` |
@@ -51,8 +51,13 @@ Everything the run measured (time, RAM, VRAM, CPU, disk per step, hardware, obje
 `stats.json`; the full log into `run_log.txt` (section 7).
 
 ### Coordinates and units
-The model is built in **metres**, Y up, the disc surface at Y = 0. Exports use `--export_scale 100`
-(the OBJ/GLB/STL/3MF units then read as the real size in the slicer / viewer; tested — do not change).
+The model is built in **metres**, Y up, the disc surface at Y = 0. Units of the deliverables:
+- OBJ, STL, 3MF: **millimetres** (`--export_scale 1000`, default). STL has no unit field and every slicer reads mm;
+  with the old `--export_scale 100` (centimetres) Bambu / Anycubic showed the model 10x too small. STL / 3MF are
+  Z-up, base on Z = 0.
+- GLB: `--glb_scale` units per metre, default **100 = centimetres** (what the viewers were built with). glTF is defined
+  in metres: `--glb_scale 1` gives the real size in Blender / three.js; switch once the front-end handles it.
+- `object.json` is measured on the metre mesh: mm, cm³, cm² whatever the export scales.
 The AliceVision `.sfm` conventions (column-major rotations, principal point as offset from the centre) are in `AGENTS.md`.
 
 ---
@@ -79,7 +84,7 @@ input_images/
 * The disc must stay **in frame** on every level (at least ~4 tags per photo; the report shows `tag-uri pe poză: min`).
 * The real carriage lift was measured at ~85 mm for a commanded 80 mm: it is estimated from the photos automatically (≥ 2 levels). The tag sheet was printed at ~98 % (`--tag_scale 0.98`, default).
 * Plain, glossy surfaces (a cap of one colour) give no depth (nothing to match between photos): side lighting or
-  matte scanning spray help. Open issues and their fixes: `plans/implemented/AUDIT_RECONSTRUCTIE_GENERALA.md`.
+  matte scanning spray help. Open issues and their fixes: `plans/PLAN.md`; causes and measurements: `plans/CUNOSTINTE_SI_MASURATORI.md`.
 
 ---
 
@@ -152,13 +157,14 @@ python main.py --mock_openmvs --rig_mode --input_dir ./input_images --output_dir
 One scan = one pod, created for the job and terminated as soon as the result is in R2.
 ```
 laptop / Pi ──upload photos──▶ R2 jobs/<id>/input/ ──▶ pod: download, run, upload ──▶ R2 jobs/<id>/output/
-            ◀──────────────── download results/<id>/, delete jobs/<id>/ ◀────────────────────────────
+            ◀──────────── download results/<id>/, delete the photos from R2 ◀──────────────────────────────
 ```
 * The pod gets **temporary R2 keys** (1 hour, read-only on its photos, write-only on its output), never your keys,
   never the RunPod key.
 * GPU: the first available from a list ordered by speed (up to 1.10 $/h), with a minimum host RAM computed from the photos and a
   minimum vCPU count; 16 vCPU and 48 GB are asked for first, the minimum only when no host has them.
   GPU speed barely matters; RAM, CPUs and disk do.
+* The result stays in R2 (`jobs/<id>/output/`) until the next cloud scan, which deletes the older jobs at its start.
 * Every pod is terminated, also after errors, timeouts and cancels; one retry with more RAM if it ran out of memory.
 
 Once:
@@ -225,8 +231,8 @@ Run `python main.py --help` for all of them. The ones that matter:
 | `--intrinsics_in` | – | chessboard calibration from `pipeline/calibrate_intrinsics.py` |
 | `--no_tag_refine` | off | disable the per-tag paper-height correction |
 | `--no_rig_refine` | off | keep the tag poses (no per-camera, per-level correction from sparse object features) |
-| `--mask_method` | ai | `ai` (BiRefNet_lite on the CPU; photometric when the model or onnxruntime is missing) or `photometric` |
-| `--ai_view_stride` | 2 | AI masks on 1 view in N, the others from the visual hull silhouette (1 = every view) |
+| `--mask_method` | fused | `fused` (BiRefNet_lite on a crop, checked against the scan background and the rendered disc, every view), `ai` (the model on the whole photo) or `photometric`; without the model or onnxruntime: photometric |
+| `--ai_view_stride` | 2 | `ai` only: model on 1 view in N, the others from the visual hull silhouette (1 = every view) |
 | `--resolution_level` | 1 | DensifyPointCloud at 1/2 resolution (0 = full: ~4× GPU time and much more RAM) |
 | `--resume` | off | reuse poses and the OpenMVS mesh |
 | `--texturing_engine` | texrecon | or `openmvs` (TextureMesh) |
@@ -301,9 +307,10 @@ requirements-runtime.txt (image) / requirements.txt (+ local tools)
 pipeline/                the steps of section 1, resources.py (RAM/CPU), run_metrics.py (stats), telemetry.py
 cloud/                   cloudflare_r2.py, runpod.py, job.py, README.md
 tools/                   local only: cloud_scan.py, collect_stats.py, fit_ram_model.py,
-                         debug_texturing.py (texture diagnostics), debug_blender_compare.py (headless Blender)
+                         debug_texturing.py (texture diagnostics), debug_blender_compare.py (headless Blender),
+                         pull_debug.py (debug bucket -> PC), regression.py (results table vs a reference run)
 tests/                   unit tests (no GPU, no network)
-plans/                   open plans (RAMAS_DE_FACUT.md = what is left); plans/implemented/ = done
+plans/                   PLAN.md (what is left), CUNOSTINTE_SI_MASURATORI.md (measurements, research); arhiva/ = old plans
 docs/                    architecture description, competition documentation
 deprecated/              code no longer used (AliceVision texturing, inspect_rig_poses.py)
 to_delete/               superseded files, kept until reviewed
@@ -327,7 +334,7 @@ uv run --with numpy --with opencv-python-headless --with scipy --with trimesh --
 * **DensifyPointCloud killed without a message (exit 137)** → out of memory (WSL limit); same fixes.
 * **Black model in Blender** → *Material Preview*; after `--resume` with changed poses run without `--resume`.
 * **Holes in the middle of the object, flattened plain caps** → masks and plain surfaces: see
-  `plans/implemented/AUDIT_RECONSTRUCTIE_GENERALA.md` (G1–G3) and the debugging images it lists.
+  `plans/CUNOSTINTE_SI_MASURATORI.md` §6 (G1–G3) and the debugging images it lists.
 * **Red `NativeCommandError` in PowerShell** → only docker writing a warning to stderr; not an error of the run.
 * **Texture debugging** → `python tools/debug_texturing.py all --output_dir output --input_dir input_images`
   (needs `undistorted/` in `output/`: run with `--work_dir /workspace/output`).

@@ -325,6 +325,20 @@ class SystemTelemetry:
         """Adds run parameters (resources, image count, workers, RAM estimate) to stats.json."""
         self.run_info.update(info)
 
+    def add_warning(self, code: str, message: str, **data) -> None:
+        """
+        A problem with the result the client should see (status.json "warnings", stats.json): the pipeline went on,
+        but the model may be wrong or incomplete (e.g. "rescan"). `code` is stable, `message` is for people.
+        """
+        entry = {"code": code, "message": message}
+        entry.update(data)
+        self.run_info.setdefault("warnings", []).append(entry)
+        logging.getLogger("TurntableStudio").warning(f"[{code}] {message}")
+
+    @property
+    def warnings(self) -> list:
+        return list(self.run_info.get("warnings", []))
+
     def record_mesh(self, file_path: str, is_watertight: Optional[bool] = None,
                     volume_cm3: Optional[float] = None, bbox_mm: Optional[List[float]] = None,
                     v_count: Optional[int] = None, f_count: Optional[int] = None):

@@ -476,6 +476,28 @@ def ai_foreground_probability(rgb: np.ndarray, model_path: str, resolution: int 
     return cv2.resize(y, (w, h), interpolation=cv2.INTER_LINEAR)
 
 
+def write_mask_files(mask: np.ndarray, src_path: Path, view_id: str, out_dir: Path) -> str:
+    """
+    Writes a mask (uint8 0/255, photo size) under the canonical OpenMVS name {viewId}_{stem}.mask.png (e.g.
+    1000_f_1000.mask.png matching scene.mvs views) and returns that path. No flat f_1000.mask.png alias: in rig mode
+    both cameras have an f_1000 and one overwrote the other; the per-camera copy rig/0 or 0/ is unique.
+    """
+    dst_mask_path = out_dir / f"{view_id}_{src_path.stem}.mask.png"
+    targets = [dst_mask_path]
+    if src_path.parent.name in {"0", "1", "rig0", "rig1"}:
+        rig_sub = out_dir / src_path.parent.name
+        rig_sub.mkdir(parents=True, exist_ok=True)
+        targets += [rig_sub / f"{src_path.stem}.mask.png", rig_sub / f"{src_path.name}.mask.png"]
+    if HAS_CV2:
+        for t in targets:
+            cv2.imwrite(str(t), mask)
+    elif HAS_PIL:
+        p_mask = Image.fromarray(mask)
+        for t in targets:
+            p_mask.save(str(t), format="PNG")
+    return str(dst_mask_path)
+
+
 def _mask_one_view(task: Dict[str, Any]) -> Optional[Tuple[str, str, str, str]]:
     """
     Worker: one view -> mask files. Module level so ProcessPoolExecutor can pickle it.
@@ -532,29 +554,9 @@ def _mask_one_view(task: Dict[str, Any]) -> Optional[Tuple[str, str, str, str]]:
     else:
         mask = generate_hybrid_mask(image=src_path, **common)
 
-    out_dir = Path(task["out_dir"])
     view_id = str(v.get("viewId", task["index"]))
-    stem_name = src_path.stem
-
-    # Canonical OpenMVS naming: {viewId}_{stem}.mask.png (e.g. 1000_f_1000.mask.png matching scene.mvs views).
-    # No flat f_1000.mask.png alias: in rig mode both cameras have an f_1000 and one overwrote the other.
-    dst_mask_path = out_dir / f"{view_id}_{stem_name}.mask.png"
-    targets = [dst_mask_path]
-    # In rig mode keep the per-camera copy rig/0 or 0/ (unique per camera folder)
-    if src_path.parent.name in {"0", "1", "rig0", "rig1"}:
-        rig_sub = out_dir / src_path.parent.name
-        rig_sub.mkdir(parents=True, exist_ok=True)
-        targets += [rig_sub / f"{stem_name}.mask.png", rig_sub / f"{src_path.name}.mask.png"]
-
-    if HAS_PIL:
-        p_mask = Image.fromarray(mask)
-        for t in targets:
-            p_mask.save(str(t), format="PNG")
-    elif HAS_CV2:
-        for t in targets:
-            cv2.imwrite(str(t), mask)
-
-    return src_path.name, view_id, str(dst_mask_path), method
+    dst_mask_path = write_mask_files(mask, src_path, view_id, Path(task["out_dir"]))
+    return src_path.name, view_id, dst_mask_path, method
 
 
 def batch_generate_masks(

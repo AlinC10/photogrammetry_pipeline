@@ -2,7 +2,7 @@
 """
 cloud_scan.py — One scan in the cloud, from this machine:
 upload the photos to R2 -> pod on RunPod (pipeline) -> output.zip to R2 -> download + extract into
-results/<name>-<job_id>/ -> delete the job from R2. Not part of the Docker image (tools/ is in .dockerignore).
+results/<name>-<job_id>/ -> delete the photos from R2 (the result stays there until the next scan). Not part of the Docker image (tools/ is in .dockerignore).
 
   python tools/cloud_scan.py --dry_run                       # R2 check + RAM/disk estimate + the pod request, no cost
   python tools/cloud_scan.py --mock --gpu "NVIDIA RTX A4000"  # the real pod + R2 round trip, simulated OpenMVS (~minutes)
@@ -14,7 +14,8 @@ results/<name>-<job_id>/ -> delete the job from R2. Not part of the Docker image
 
 Ctrl+C at any time stops the wait and terminates the pod (photos stay in R2 for a retry).
 Before uploading, the jobs/<id>/ folders of all earlier jobs are deleted (photos and results of old scans; one scan
-runs at a time). Only jobs/: anything else in the bucket (e.g. the scanner's own folder) is never touched.
+runs at a time). A finished job deletes only its photos, so its result can still be fetched from R2 until then
+(with --keep_old_jobs the whole job is deleted at the end, as nothing else would). Only jobs/: anything else in the bucket (e.g. the scanner's own folder) is never touched.
 With two cloud scans at the same time, start them with --keep_old_jobs, or the second deletes the first.
 --set takes any run_pipeline() option (see PIPELINE_OPTIONS: lift_mm, tag_scale, data_term ...); values are read
 as JSON when possible (1, 0.5, true), otherwise as text. main.py's negative flags work too: --set no_tag_refine
@@ -57,7 +58,7 @@ RESERVED_OPTIONS = {"job_id", "input_dir", "output_dir", "work_dir", "mock_openm
 PIPELINE_OPTIONS = {
     "rig_mode", "resolution_level", "focal_length_mm", "step_deg", "resume", "cost_smoothness_ratio",
     "outlier_threshold", "empty_color", "global_seam_leveling", "local_seam_leveling", "target_low_poly_faces",
-    "export_scale", "scale_stl_to_mm", "texturing_engine", "data_term", "smoothness_term", "outlier_removal",
+    "export_scale", "glb_scale", "scale_stl_to_mm", "texturing_engine", "data_term", "smoothness_term", "outlier_removal",
     "texrecon_global_seam_leveling", "keep_unseen_faces", "write_intermediate_results", "mesh_texture_masks",
     "texture_mask_margin_px", "colour_normalize", "lift_mm", "estimate_lift", "tag_refine", "tag_scale", "workers",
     "keep_depth_maps", "ram_margin", "min_point_distance", "target_high_poly_faces", "visual_hull",
