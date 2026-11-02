@@ -188,6 +188,7 @@ class SystemTelemetry:
         self.run_id = time.strftime("%Y%m%d-%H%M%S", time.gmtime(self.start_wall_time))
         self.outcome: Dict[str, Any] = {"state": "running"}
         self.current_step: Optional[str] = None   # step running when an exception left the pipeline
+        self.on_step_done = None                  # callable(step name) after each finished step (progress.json)
         self.cpus = available_cpus()
         self.watch_dirs: List[str] = []
         self.global_peak_disk_gb: float = 0.0
@@ -308,6 +309,11 @@ class SystemTelemetry:
             self.steps.append(rec)
             if sys.exc_info()[0] is None:
                 self.current_step = None
+                if self.on_step_done is not None:
+                    try:
+                        self.on_step_done(name)
+                    except Exception:
+                        pass
             vram_str = f" | Peak VRAM: {rec.peak_vram_mb:.0f} MB" if rec.peak_vram_mb else ""
             logger.info(f"✔ [STEP FINISH] {name} in {elapsed:.2f}s | Peak RAM: {rec.peak_ram_mb:.0f} MB{vram_str}")
 

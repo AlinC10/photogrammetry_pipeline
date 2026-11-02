@@ -561,6 +561,7 @@ class TexReconRunner:
         out_prefix: Optional[str] = None,
         mock_mode: bool = False,
         scene_ready: bool = False,
+        mesh_ply: Optional[str] = None,
     ) -> Tuple[str, str]:
         """
         Executes texrecon on the input mesh and cameras.
@@ -573,6 +574,7 @@ class TexReconRunner:
             mock_mode: If True, simulates execution for testing without texrecon binary
             scene_ready: the .cam scene was written by prepare_scene (concurrent runs must not rebuild it). Two runs
                 at the same time also need different output folders: texrecon refuses a "tmp" folder it did not make.
+            mesh_ply: the input mesh already converted to PLY (mesh_cleaner binary_copies, B5): no conversion here.
 
         Returns:
             Tuple of (textured_obj_path, textured_mtl_path)
@@ -593,6 +595,8 @@ class TexReconRunner:
         # 2. texrecon expects input mesh in .ply format. Convert if OBJ.
         if in_mesh_p.suffix.lower() == ".ply":
             mesh_ply_p = in_mesh_p
+        elif mesh_ply and Path(mesh_ply).is_file():
+            mesh_ply_p = Path(mesh_ply).resolve()
         else:
             mesh_ply_p = self.work_dir / f"{in_mesh_p.stem}.ply"
             logger.info(f"Converting input mesh {in_mesh_p.name} to PLY format for texrecon: {mesh_ply_p.name}")

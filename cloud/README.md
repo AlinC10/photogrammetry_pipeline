@@ -70,7 +70,7 @@ or died without writing a status (likely OOM, asks for 1.5× RAM). `pipeline_err
 ## status.json (written last by the pod)
 
 ```json
-{"job_id": "...", "state": "ok | ram_insufficient | pipeline_error | input_error | timeout",
+{"job_id": "...", "state": "ok | ram_insufficient | pipeline_error | input_error | timeout | cancelled",
  "error": "...", "required_gb": 0, "available_gb": 0, "resources": {...}, "timings_s": {...},
  "warnings": [{"code": "not_watertight", "message": "...", ...}], "debug_lite": {"uploaded": false, ...}}
 ```
@@ -78,6 +78,32 @@ or died without writing a status (likely OOM, asks for 1.5× RAM). `pipeline_err
 `warnings` (with `state` "ok"): the model was delivered but may need a rescan or a check. Codes: `not_watertight`,
 `model_tiny`, `model_at_disc_rim`, `most_faces_dropped`, `masks_disagree`, `hull_cone_only`. The `message` is for
 people (the Pi / front-end can show it as is).
+
+## progress.json
+
+While it runs the pod writes `jobs/<id>/output/progress.json`: `{"step": "<last finished step>", "at": ...}`, the
+step names of `stats.json` ("2. Turntable Poses (Rigid Lock)", ...: the Pi's `pod_step_label` maps them to messages).
+In streaming mode, before the pipeline: `{"step": "0. Waiting for photos", "photos": n, "level": L}`.
+
+## Streaming: pod started with the scan (JOB_JSON `"stream": true`)
+
+`plans/PLAN_STREAMING_DAG.md` §2. The pod is requested when the scan starts; it lists `jobs/<id>/input/` every
+`STREAM_POLL_S` (2 s), downloads each new photo (to `<name>.part`, then renamed) and pre-computes what depends on the
+photos alone (`pipeline/stream_prework.py`: SIFT, background medians, preliminary poses + AI crops of every finished
+level). The scanner writes, under `jobs/<id>/input/`:
+
+| file | when | content |
+|---|---|---|
+| `level_done_<L>.json` | optional, when the photos of level L are uploaded | `{"level": L, "files": ["rig/0/f_1000.jpg", ...]}` |
+| `capture_done.json` | after the upload of every photo was verified | `{"n_images": 80, "levels": [1, 2], "files": [...], "step_deg": 18, "finished_at": ...}` |
+| `cancel.json` | the scan was cancelled (besides terminating the pod) | `{}` |
+
+On `capture_done.json` the pod downloads what is missing, keeps exactly the listed photos and runs the pipeline with
+the caches; the results are those of a normal run (only the time changes). No new photo for `STREAM_IDLE_S` (420 s)
+without `capture_done.json` → `status.json` `input_error` ("capture abandoned"); `cancel.json` → `cancelled`.
+`status.json` gets `"stream"` (photos, capture time, pre-work per level) and `timings_s.wait_after_capture_s`
+(capture_done seen → status.json). Without `"stream"` the job runs as before. The pod RAM is chosen before the number
+of photos is known: the launcher plans it for `2 × (360 / step_deg) × max_levels` photos.
 
 ## Debug archive (optional, separate bucket)
 
@@ -93,6 +119,8 @@ env.update(r2.debug_credentials_env(job_id, ttl))   # {} without R2_DEBUG_BUCKET
 `R2_DEBUG_BUCKET` (and optionally `R2_DEBUG_ACCESS_KEY_ID`, a token for that bucket only) in `.env`. Without them the
 pod skips the upload (`status.json` "debug_lite": {"uploaded": false}). On the PC: `python tools/pull_debug.py`
 downloads everything, verifies it and deletes it from R2. Job option `"debug_lite": false` turns it off.
+Its large parts are built in the background right after ReconstructMesh; the archive goes up beside `output.zip`,
+both before `status.json`.
 
 ## Test from the laptop
 

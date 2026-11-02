@@ -285,6 +285,40 @@ class TestBridgeSFM(unittest.TestCase):
             else:
                 self.assertGreater(out[150, 50].mean(), 100)
 
+    def test_early_undistortion_gives_identical_files(self):
+        """B1: undistorted photos written early (undistort_rgb_images) + masks later = the bridge in one go, byte for byte."""
+        from pipeline.bridge_sfm import undistort_rgb_images
+
+        test_path = Path(self.test_dir)
+        img_path = test_path / "rig" / "0" / "f_1000.jpg"
+        img_path.parent.mkdir(parents=True)
+        rng = np.random.default_rng(3)
+        cv2.imwrite(str(img_path), rng.integers(0, 255, (300, 400, 3), dtype=np.uint8))
+        masks = test_path / "masks"
+        masks.mkdir()
+        mask = np.zeros((300, 400), dtype=np.uint8)
+        mask[50:250, 120:330] = 255
+        cv2.imwrite(str(masks / "1000_f_1000.mask.png"), mask)
+        sfm_file = self._one_view_sfm(test_path, img_path)
+        sfm = json.loads(sfm_file.read_text())
+        sfm["intrinsics"][0]["distortionParams"] = [-0.12, 0.03]
+        sfm_file.write_text(json.dumps(sfm))
+
+        outs = {}
+        for early in (False, True):
+            und = test_path / f"und_{early}"
+            if early:
+                self.assertEqual(undistort_rgb_images(sfm, str(und), workers=2), 1)
+            convert_sfm_to_colmap(str(sfm_file), str(test_path / f"colmap_{early}"), str(und), masks_src_dir=str(masks),
+                                  masks_dst_dir=str(test_path / f"mdst_{early}"), images_ready=early)
+            outs[early] = und
+        names = sorted(p.name for p in outs[False].iterdir())
+        self.assertEqual(names, sorted(p.name for p in outs[True].iterdir()))
+        for n in names:
+            self.assertEqual((outs[False] / n).read_bytes(), (outs[True] / n).read_bytes(), n)
+        self.assertEqual((test_path / "colmap_False" / "cameras.txt").read_text(),
+                         (test_path / "colmap_True" / "cameras.txt").read_text())
+
     def test_proxy_points_follow_the_given_bounds(self):
         """The proxy volume (DensifyPointCloud ROI and depth range) comes from proxy_bounds, not 220 mm / 85 mm."""
         pts = generate_proxy_3d_points(n_points=1500, y_max=0.30, r_max=0.05, r_min=0.01)

@@ -175,10 +175,12 @@ def prepare_texturing_images(
     max_gain_deviation: float = 0.25,
     tag_layout_path: Optional[str] = None,
     workers: int = 4,
+    mesh_arrays: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Writes `<viewId>_<stem>.png` (texturing image, background exactly 0) and
     `<viewId>_<stem>.mask.png` for every registered view into `output_dir`.
+    `mesh_arrays`: .npz with the vertices / faces of `mesh_path` already parsed (B5), read instead of the OBJ.
     Returns a summary with the per-camera gains, the image list and per-view mask statistics.
     """
     import trimesh
@@ -192,9 +194,13 @@ def prepare_texturing_images(
     out.mkdir(parents=True, exist_ok=True)
 
     cams = load_sfm_cameras(sfm_json_path)
-    mesh = trimesh.load(str(mesh_path), process=False, force="mesh")
-    V = np.asarray(mesh.vertices, dtype=np.float64)
-    F = np.asarray(mesh.faces, dtype=np.int64)
+    if mesh_arrays and Path(mesh_arrays).is_file():
+        arr = np.load(str(mesh_arrays))          # the same mesh, already parsed (mesh_cleaner binary_copies, B5)
+        V, F = arr["vertices"].astype(np.float64), arr["faces"].astype(np.int64)
+    else:
+        mesh = trimesh.load(str(mesh_path), process=False, force="mesh")
+        V = np.asarray(mesh.vertices, dtype=np.float64)
+        F = np.asarray(mesh.faces, dtype=np.int64)
 
     # Undistortion maps, one per intrinsic (identical to cv2.undistort used by bridge_sfm)
     maps: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}

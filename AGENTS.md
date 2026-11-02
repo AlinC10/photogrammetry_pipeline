@@ -82,7 +82,7 @@ To prevent dark patches, Poisson bleeding, and micro-confetti texture atlases:
 - `--empty-color 0`: Fills unobserved faces (e.g. flat cut bottom) and empty atlas areas with clean black (`RGB 0,0,0`), not neon orange.
 
 ### RULE 9: Testing & Documentation Integrity
-- All unit tests in `tests/` (162 at the time of writing) must pass before any commit.
+- All unit tests in `tests/` (186 at the time of writing) must pass before any commit.
 - Preserve existing docstrings, comments, and structure.
 
 ---
@@ -92,7 +92,9 @@ To prevent dark patches, Poisson bleeding, and micro-confetti texture atlases:
 ```text
 turntable_studio/
 ├── main.py                     # Master CLI and pipeline execution orchestrator (writes output/run_log.txt itself)
-├── runpod_job.py               # Inside a RunPod pod: download photos from R2, run_pipeline, upload output + status.json
+├── runpod_job.py               # Inside a RunPod pod: download photos from R2 (or stream them while the scanner takes them:
+│                               #   "stream" job, capture_done.json / level_done_<L>.json / cancel.json), run_pipeline,
+│                               #   progress.json per step, upload output + debug archive in parallel, status.json last
 ├── docker_entrypoint.sh        # Container entry: runpod_job.py when JOB_ID is set, otherwise main.py
 ├── docker/runtime_deps.sh      # Copies the shared libraries of OpenMVS/texrecon into the slim runtime image
 ├── requirements-runtime.txt    # Python packages of the image (requirements.txt = runtime + local tools)
@@ -104,7 +106,8 @@ turntable_studio/
 ├── tools/                      # Local only (not in the image): cloud_scan.py, docker_scan.ps1, fit_ram_model.py, collect_stats.py,
 │                               #   debug_texturing.py (texture diagnostics), debug_blender_compare.py (headless Blender),
 │                               #   pull_debug.py (debug bucket -> PC, deleted from R2 after a verified download),
-│                               #   regression.py (table of a results folder vs a reference run)
+│                               #   regression.py (table of a results folder vs a reference run),
+│                               #   stream_sim.py (streaming replay of an old scan: cached front of the pipeline = uncached)
 ├── Dockerfile                  # Multi-stage CUDA 12 + OpenMVS production container
 ├── docker-compose.yml          # Container configuration with GPU passthrough
 ├── requirements.txt            # Python dependencies (NumPy, SciPy, Trimesh, PyMeshLab, etc.)
@@ -114,6 +117,9 @@ turntable_studio/
 │   ├── telemetry.py            # Hardware resource profiler (Peak RAM, VRAM, per-step timing, run_info, warnings)
 │   ├── resources.py            # cgroup-aware CPUs/RAM, DensifyPointCloud RAM estimate + check, worker count
 │   ├── parallel.py             # Spawned process pool whose workers log into run_log.txt (background metrics, exports)
+│   ├── taskgraph.py            # Small task executor: dependencies, resource limits, critical-path order, records
+│   ├── stream_cache.py         # Streaming caches: SIFT per photo, background medians per group, AI crops (exact hits only)
+│   ├── stream_prework.py       # Pod work while the photos arrive: SIFT, medians, preliminary poses + AI of finished levels
 │   ├── run_metrics.py          # stats.json features for RAM/time/quality models (hardware, disk speed, object, logs)
 │   ├── camera_init.py          # Image discovery (flat or rig/0 + rig/1) and CameraInit SFM
 │   ├── turntable_poses.py      # AprilTag disc detection and rigid pose calculation (LOCKED)
@@ -159,7 +165,9 @@ turntable_studio/
     ├── test_resources.py       # cgroup limits, RAM estimate vs measured runs, worker count
     ├── test_run_metrics.py     # log parsers, object/mesh metrics, telemetry step fields, CSV collector
     ├── test_cloud.py           # R2 layout, temporary credentials, pod lifecycle, preferred then minimum pod request (in-memory S3, fake RunPod)
-    └── test_telemetry.py       # RAM/VRAM profiler and timer tests
+    ├── test_telemetry.py       # RAM/VRAM profiler and timer tests
+    ├── test_taskgraph.py       # Task executor: dependencies, partial failure, no hang, critical path, limits
+    └── test_stream.py          # Streaming pod: photos as they appear, markers, cancel, scanner gone silent, pre-work
 ```
 
 ---

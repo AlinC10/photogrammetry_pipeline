@@ -105,6 +105,42 @@ class TestParallel(unittest.TestCase):
                          mesh_file_metrics(str(par / "stl" / "high_model.stl"))["f_count"])
         self.assertGreater(by_name["model_low.obj"].face_count, 0)
 
+    def test_early_exports_match_the_export_at_the_end(self):
+        """B3: high / low chains started when their texturing ended give the same files; a different source is redone."""
+        from pipeline.exporter import EarlyExports
+
+        src = self.tmp / "src"
+        src.mkdir()
+        high = _textured_source(src, "model_textured", "purple")
+        (src / "low").mkdir()
+        low = _textured_source(src / "low", "model_textured_low", "orange")
+        other = self.tmp / "other"
+        other.mkdir()
+        low_other = _textured_source(other, "model_textured_low", "green")     # e.g. the TextureMesh fallback
+        clean = self.tmp / "clean.obj"
+        trimesh.creation.box(extents=(0.05, 0.05, 0.05)).export(str(clean))
+        cfg = PipelineConfig()
+        cfg.glb_draco = False
+
+        seq = self.tmp / "seq"
+        export_multi_lod_bundle(str(clean), str(high), str(seq), SystemTelemetry(str(seq)), cfg,
+                                textured_low_obj_path=str(low_other), make_zip=False)
+        early_dir = self.tmp / "early"
+        with LoggingProcessPool(2) as pool:
+            early = EarlyExports(str(early_dir), str(clean), cfg, pool)
+            early.start_high(str(high))
+            early.start_low(str(low))            # started from a model the end no longer uses
+            export_multi_lod_bundle(str(clean), str(high), str(early_dir), SystemTelemetry(str(early_dir)), cfg,
+                                    textured_low_obj_path=str(low_other), make_zip=False, pool=pool, early=early)
+            self.assertEqual(early.jobs, {})
+
+        files = lambda root: sorted(str(p.relative_to(root)) for p in root.rglob("*")
+                                    if p.is_file() and p.suffix != ".json")
+        self.assertEqual(files(seq), files(early_dir))
+        for rel in files(seq):
+            if Path(rel).suffix in (".obj", ".mtl", ".png", ".jpg", ".stl"):
+                self.assertEqual((seq / rel).read_bytes(), (early_dir / rel).read_bytes(), rel)
+
     def test_texrecon_scene_written_once_for_concurrent_runs(self):
         runner = TexReconRunner(TexReconConfig(), str(self.tmp / "texrecon"))
         scene = self.tmp / "texrecon" / "scene"
@@ -127,6 +163,32 @@ class TestParallel(unittest.TestCase):
             kinds = {Path(i.filename).suffix: i.compress_type for i in zf.infolist()}
         self.assertEqual(kinds[".png"], zipfile.ZIP_STORED)
         self.assertEqual(kinds[".obj"], zipfile.ZIP_DEFLATED)
+
+    def test_incremental_zip_same_files(self):
+        """B4: deliverables zipped in a thread, stats.json and logs added at the end = the zip made in one go."""
+        from pipeline.exporter import OutputZip
+
+        out = self.tmp / "out"
+        for sub in (("obj", "high"), ("obj", "low"), ("stl",), ("glb",)):
+            out.joinpath(*sub).mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (64, 64), color="red").save(str(out / "obj" / "high" / "t.png"))
+        (out / "obj" / "high" / "m.obj").write_text("v 0 0 0\n" * 2000)
+        (out / "obj" / "low" / "l.obj").write_text("v 1 1 1\n" * 500)
+        (out / "stl" / "high_model.stl").write_bytes(bytes(range(256)) * 50)
+        (out / "object.json").write_text('{"title": "x"}')
+        (out / "stats.json").write_text('{"final": true}')
+        (out / "run_log.txt").write_text("log\n")
+        logs = {"logs/run_log.txt": str(out / "run_log.txt")}
+        ref = package_output_zip(str(out), "ref.zip", str(out / "stats.json"), logs)
+        z = OutputZip(str(out), "inc.zip")
+        z.add_deliverables_async()
+        inc = z.finish(str(out / "stats.json"), logs)
+        with zipfile.ZipFile(ref) as a, zipfile.ZipFile(inc) as b:
+            self.assertEqual(sorted(a.namelist()), sorted(b.namelist()))
+            self.assertEqual(len(b.namelist()), len(set(b.namelist())))
+            for n in a.namelist():
+                self.assertEqual(a.read(n), b.read(n), n)
+            self.assertIn("stats.json", b.namelist())
 
 
 if __name__ == "__main__":

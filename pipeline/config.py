@@ -409,3 +409,6 @@ class PipelineConfig:
     # Cloud & Artifact export
     export_zip: bool = True
     zip_name: str = "output.zip"
+    # Streaming pre-work (runpod_job.py "stream"): SIFT, background medians and AI crops computed while the photos
+    # arrived (pipeline/stream_cache.py); None = everything computed here
+    stream_cache_dir: Optional[str] = None

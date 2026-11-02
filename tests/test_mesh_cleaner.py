@@ -190,6 +190,30 @@ class TestMeshCleaner(unittest.TestCase):
         self.assertEqual(face_target(800000, 0.2, maximum=50000), 50000)    # low poly: min(20 %, 50 000)
         self.assertEqual(face_target(100000, 0.2, maximum=50000), 20000)
 
+    def test_binary_copies_equal_what_the_obj_gives(self):
+        """B5: <name>.ply = texrecon's own OBJ -> PLY conversion (bytes), <name>.npz = the OBJ vertices / faces."""
+        from pipeline.config import TexReconConfig
+        from pipeline.texrecon_runner import TexReconRunner
+
+        sphere = trimesh.creation.icosphere(subdivisions=3, radius=0.04)
+        sphere.apply_translation([0.0, 0.06, 0.0])
+        in_path = Path(self.test_dir) / "sphere.obj"
+        out_path = Path(self.test_dir) / "clean.obj"
+        sphere.export(str(in_path))
+        res = clean_and_repair_mesh(str(in_path), str(out_path),
+                                    MeshCleaningConfig(slice_y_m=0.003, skirt_bottom_y_m=0.003), binary_copies=True)
+        self.assertTrue(Path(res["ply_path"]).is_file())
+        conv_dir = Path(self.test_dir) / "tr"
+        runner = TexReconRunner(TexReconConfig(), str(conv_dir))
+        (conv_dir / "scene").mkdir(parents=True)
+        runner.run_texturing("unused.sfm", str(out_path), self.test_dir, out_prefix=str(conv_dir / "m"),
+                             mock_mode=True, scene_ready=True)
+        self.assertEqual((conv_dir / "clean.ply").read_bytes(), Path(res["ply_path"]).read_bytes())
+        ref = trimesh.load(str(out_path), process=False, force="mesh")
+        arr = np.load(res["arrays_path"])
+        self.assertTrue(np.array_equal(arr["vertices"], np.asarray(ref.vertices, np.float64)))
+        self.assertTrue(np.array_equal(arr["faces"], np.asarray(ref.faces, np.int64)))
+
     def test_high_poly_ratio_decimates_every_mesh(self):
         """With the default ratio a mesh of any size loses ~25 % of its faces (no fixed cap left it untouched)."""
         sphere = trimesh.creation.icosphere(subdivisions=5, radius=0.04)

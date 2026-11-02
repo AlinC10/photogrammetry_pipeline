@@ -92,16 +92,41 @@ def view_groups(cams: List[Dict[str, Any]], name_regex: str) -> Tuple[np.ndarray
     return cam, np.array(lvl), np.array(shot)
 
 
-def _detect(path: str, K: np.ndarray, dist: np.ndarray, cfg: RigRefineConfig):
+def detect_keypoints(path: str, cfg: RigRefineConfig) -> Tuple[np.ndarray, np.ndarray]:
+    """SIFT keypoints (full-resolution pixel centres) and descriptors of one photo: depends on the photo only."""
     img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
     if img is None:
-        return np.zeros((0, 2)), np.zeros((0, 2)), np.zeros((0, 128), np.float32)
+        return np.zeros((0, 2)), np.zeros((0, 128), np.float32)
     if cfg.scale != 1.0:
         img = cv2.resize(img, None, fx=cfg.scale, fy=cfg.scale, interpolation=cv2.INTER_AREA)
     kp, desc = cv2.SIFT_create(nfeatures=cfg.max_features).detectAndCompute(img, None)
     if desc is None or not kp:
-        return np.zeros((0, 2)), np.zeros((0, 2)), np.zeros((0, 128), np.float32)
+        return np.zeros((0, 2)), np.zeros((0, 128), np.float32)
     uv = (np.float64([k.pt for k in kp]) + 0.5) / cfg.scale - 0.5          # full-resolution pixel centres
+    return uv, desc
+
+
+def cache_keypoints(path: str, cfg: RigRefineConfig, cache_dir: str) -> int:
+    """Streaming pre-work: SIFT of a photo that just arrived, saved for _detect (stream_cache). Returns keypoints."""
+    from . import stream_cache
+
+    hit = stream_cache.load_sift(cache_dir, path, cfg.scale, cfg.max_features)
+    if hit is not None:
+        return len(hit[0])
+    uv, desc = detect_keypoints(path, cfg)
+    stream_cache.save_sift(cache_dir, path, cfg.scale, cfg.max_features, uv, desc)
+    return len(uv)
+
+
+def _detect(path: str, K: np.ndarray, dist: np.ndarray, cfg: RigRefineConfig, cache_dir: Optional[str] = None):
+    cached = None
+    if cache_dir:
+        from . import stream_cache
+
+        cached = stream_cache.load_sift(cache_dir, path, cfg.scale, cfg.max_features)
+    uv, desc = cached if cached is not None else detect_keypoints(path, cfg)
+    if not len(uv):
+        return np.zeros((0, 2)), np.zeros((0, 2)), np.zeros((0, 128), np.float32)
     nrm = cv2.undistortPoints(uv.reshape(-1, 1, 2), K, dist).reshape(-1, 2)
     return uv, nrm, desc
 
@@ -317,10 +342,11 @@ def write_refined_sfm(src_sfm: str, dst_sfm: str, cams: List[Dict[str, Any]], Rs
 
 def refine_rig_poses(cameras_known_sfm: str, name_regex: str, cfg: Optional[RigRefineConfig] = None,
                      workers: int = 1, report_path: Optional[str] = None,
-                     backup_sfm: Optional[str] = None) -> Dict[str, Any]:
+                     backup_sfm: Optional[str] = None, feature_cache: Optional[str] = None) -> Dict[str, Any]:
     """
     Fits the per-(camera, level) correction and, when accepted, rewrites cameras_known.sfm in place (the tag-only
     poses are kept in backup_sfm). Returns the report (also written to report_path as JSON).
+    `feature_cache`: stream_cache directory with the SIFT of the photos computed while they arrived.
     """
     cfg = cfg or RigRefineConfig()
     t0 = time.time()
@@ -328,7 +354,7 @@ def refine_rig_poses(cameras_known_sfm: str, name_regex: str, cfg: Optional[RigR
     cam, lvl, shot = view_groups(cams, name_regex)
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
-        feats = list(ex.map(lambda c: _detect(c["path"], c["K"], c["dist"], cfg), cams))
+        feats = list(ex.map(lambda c: _detect(c["path"], c["K"], c["dist"], cfg, feature_cache), cams))
     t_feat = time.time() - t0
     static = static_keypoints(feats, cam, lvl, shot, cfg, workers)
     obs = collect_observations(cams, feats, static, cfg, workers)

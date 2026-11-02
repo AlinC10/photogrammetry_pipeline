@@ -63,6 +63,21 @@ class TestDebugLite(unittest.TestCase):
         pts = debug_lite.load_npz_member(info["path"], "refine_points.npz")
         self.assertEqual(pts["pruned"].shape, (5, 3))
 
+    def test_prebuilt_parts_give_the_same_archive(self):
+        """B2: the large parts built during the run (build_debug_parts) + the small files = the archive built at the end."""
+        ref = debug_lite.build_debug_lite(str(self.out), str(self.work), str(self.work / "ref.zip"))
+        parts = debug_lite.build_debug_parts(str(self.out), str(self.work), str(self.work / "parts.zip"))
+        self.assertGreaterEqual(parts["parts"], 6)
+        (self.out / "stats.json").write_text(json.dumps({"a": 2}))     # the final stats.json comes later
+        info = debug_lite.build_debug_lite(str(self.out), str(self.work), str(self.work / "d.zip"),
+                                           parts_zip=parts["path"])
+        with zipfile.ZipFile(ref["path"]) as a, zipfile.ZipFile(info["path"]) as b:
+            self.assertEqual(a.namelist(), b.namelist())
+            for n in a.namelist():
+                if n != "stats.json":
+                    self.assertEqual(a.read(n), b.read(n), n)
+            self.assertEqual(json.loads(b.read("stats.json")), {"a": 2})
+
     def test_size_budget(self):
         info = debug_lite.build_debug_lite(str(self.out), str(self.work), str(self.work / "d.zip"), max_mb=0.0005)
         self.assertTrue(info["skipped"])

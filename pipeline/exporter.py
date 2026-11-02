@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import shutil
+import threading
 import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -674,9 +675,15 @@ REPORT_FILES = ("object.json", "turntable_report.txt", "turntable_calib.json", "
 STORED_SUFFIXES = {".png", ".jpg", ".jpeg", ".glb", ".3mf", ".zip", ".gz"}
 
 
+# Deflate level of the text files (OBJ, STL, logs): level 1 is ~5x faster than the default 6 for ~10 % more bytes
+# (45 MB of OBJ + STL: 4.2 s -> 0.75 s, 14.8 -> 16.7 MB); the files inside are the same
+ZIP_COMPRESSLEVEL = 1
+
+
 def _zip_write(zipf: zipfile.ZipFile, path: Path, arcname: str) -> None:
     method = zipfile.ZIP_STORED if Path(path).suffix.lower() in STORED_SUFFIXES else zipfile.ZIP_DEFLATED
-    zipf.write(path, arcname=arcname, compress_type=method)
+    zipf.write(path, arcname=arcname, compress_type=method,
+               compresslevel=ZIP_COMPRESSLEVEL if method == zipfile.ZIP_DEFLATED else None)
 
 
 def collect_log_files(output_dir: str, extra_dirs: Optional[List[str]] = None) -> Dict[str, str]:
@@ -699,6 +706,68 @@ def collect_log_files(output_dir: str, extra_dirs: Optional[List[str]] = None) -
     return logs
 
 
+class OutputZip:
+    """
+    output.zip in two parts (plans/PLAN_STREAMING_DAG.md B4): the deliverables (obj/, stl/, 3mf/, glb/) as soon as
+    they are written, in a thread while the mesh metrics and the final stats.json are made (add_deliverables_async),
+    then stats.json, the reports and the logs (finish). Same files as package_output_zip, which uses it in one go.
+    """
+
+    def __init__(self, output_dir: str, zip_name: str = "output.zip"):
+        self.out_base = Path(output_dir).resolve()
+        self.path = self.out_base / zip_name
+        logger.info(f"Packaging multi-LOD assets into ZIP archive: {self.path}...")
+        self._zf = zipfile.ZipFile(str(self.path), "w", compression=zipfile.ZIP_DEFLATED)
+        self._thread: Optional[threading.Thread] = None
+        self._error: Optional[BaseException] = None
+        self._names: set = set()
+
+    def _add(self, path: Path, arcname: str) -> None:
+        if arcname in self._names:
+            return
+        _zip_write(self._zf, path, arcname)
+        self._names.add(arcname)
+
+    def add_deliverables(self) -> None:
+        for parts in DELIVERABLE_DIRS:
+            folder = self.out_base.joinpath(*parts)
+            for root, _, files in sorted(os.walk(folder)):
+                for f in sorted(files):
+                    file_p = Path(root) / f
+                    self._add(file_p, str(file_p.relative_to(self.out_base)))
+
+    def add_deliverables_async(self) -> None:
+        def run() -> None:
+            try:
+                self.add_deliverables()
+            except BaseException as e:      # reported by finish()
+                self._error = e
+
+        self._thread = threading.Thread(target=run, name="output-zip", daemon=True)
+        self._thread.start()
+
+    def finish(self, stats_json_path: Optional[str] = None, log_files: Optional[Dict[str, str]] = None) -> Path:
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
+        try:
+            if self._error is not None:
+                raise self._error
+            self.add_deliverables()          # no-op for what the thread already added
+            if stats_json_path and Path(stats_json_path).is_file():
+                self._add(Path(stats_json_path), "stats.json")
+            for name in REPORT_FILES:
+                if (self.out_base / name).is_file():
+                    self._add(self.out_base / name, name)
+            for arcname, path in sorted((log_files or {}).items()):
+                if Path(path).is_file():
+                    self._add(Path(path), arcname)
+        finally:
+            self._zf.close()
+        logger.info(f"Created {self.path.name} ({self.path.stat().st_size / (1024 * 1024):.2f} MB)")
+        return self.path
+
+
 def package_output_zip(
     output_dir: str,
     zip_name: str = "output.zip",
@@ -709,28 +778,9 @@ def package_output_zip(
     Builds output.zip: obj/, stl/, 3mf/, glb/, stats.json, turntable_report.txt,
     turntable_calib.json and logs/ (log_files = {arcname: path}). PNG/JPG/GLB/3MF are stored, the rest deflated.
     """
-    out_base = Path(output_dir).resolve()
-    zip_path = out_base / zip_name
-    logger.info(f"Packaging multi-LOD assets into ZIP archive: {zip_path}...")
-
-    with zipfile.ZipFile(str(zip_path), "w", compression=zipfile.ZIP_DEFLATED) as zipf:
-        if stats_json_path and Path(stats_json_path).is_file():
-            _zip_write(zipf, Path(stats_json_path), "stats.json")
-        for name in REPORT_FILES:
-            if (out_base / name).is_file():
-                _zip_write(zipf, out_base / name, name)
-        for parts in DELIVERABLE_DIRS:
-            folder = out_base.joinpath(*parts)
-            for root, _, files in os.walk(folder):
-                for f in sorted(files):
-                    file_p = Path(root) / f
-                    _zip_write(zipf, file_p, str(file_p.relative_to(out_base)))
-        for arcname, path in sorted((log_files or {}).items()):
-            if Path(path).is_file():
-                _zip_write(zipf, Path(path), arcname)
-
-    logger.info(f"Created {zip_path.name} ({zip_path.stat().st_size / (1024 * 1024):.2f} MB)")
-    return zip_path
+    z = OutputZip(output_dir, zip_name)
+    z.add_deliverables()
+    return z.finish(stats_json_path, log_files)
 
 
 def export_print_assets(mesh_path: str, stl_path: str, mf_path: str, scale: float) -> List[str]:
@@ -859,6 +909,104 @@ class _Done:
         return self._value
 
 
+class EarlyExports:
+    """
+    B3 (plans/PLAN_STREAMING_DAG.md): the high-poly chain (OBJ + PNG -> GLB) starts as soon as texrecon high is done,
+    the low-poly chain as soon as texrecon low is done, each in a worker of `pool`, instead of both waiting for the
+    slower texturing. Same functions and arguments as export_multi_lod_bundle, which takes the started jobs over
+    (`early=`) when the textured model it gets is the one they started from; otherwise it waits for them and exports
+    again (texrecon failed and the OpenMVS fallback textured the model).
+    """
+
+    def __init__(self, output_dir: str, cleaned_mesh_path: str, config: PipelineConfig, pool: Any):
+        self.out_base = Path(output_dir).resolve()
+        self.cleaned = cleaned_mesh_path
+        self.config = config
+        self.pool = pool
+        self.jobs: Dict[str, Tuple[str, Any]] = {}
+        self._lock = threading.Lock()
+        _reset_deliverable_dirs(self.out_base)
+
+    def _args(self):
+        return (float(getattr(self.config, "export_scale", 1000.0)), getattr(self.config, "glb_draco", True),
+                glb_factor(self.config))
+
+    def start_high(self, textured_obj: Optional[str]) -> None:
+        if not textured_obj or not Path(textured_obj).is_file() or "high" in self.jobs:
+            return
+        exp_scale, draco, glb_scale = self._args()
+        d = _deliverable_paths(self.out_base)
+        with self._lock:
+            self.jobs["high"] = (str(Path(textured_obj)), self.pool.submit(
+                "export_high", _export_textured_high, str(Path(textured_obj)), str(d["high_obj"]),
+                str(d["high_mtl"]), str(d["high_glb"]), exp_scale, draco, self.cleaned, glb_scale))
+        logger.info("High-poly export started (texrecon high done).")
+
+    def start_low(self, textured_low_obj: Optional[str]) -> None:
+        if not textured_low_obj or not Path(textured_low_obj).is_file() or "low" in self.jobs:
+            return
+        if not all(find_source_mtl_and_textures(Path(textured_low_obj))):
+            return                                    # needs the high-poly material: export_multi_lod_bundle does it
+        exp_scale, draco, glb_scale = self._args()
+        d = _deliverable_paths(self.out_base)
+        with self._lock:
+            self.jobs["low"] = (str(Path(textured_low_obj)), self.pool.submit(
+                "export_low", _export_low_chain, str(Path(textured_low_obj)), str(d["low_obj"]), str(d["low_mtl"]),
+                str(d["low_glb"]), str(d["low_stl"]), str(d["low_3mf"]), exp_scale, draco, self.cleaned, glb_scale))
+        logger.info("Low-poly export started (texrecon low done).")
+
+    def take(self, kind: str, src: Optional[str]) -> Optional[Any]:
+        """The started job of `kind` when it exported `src`; None otherwise (after waiting for it)."""
+        with self._lock:
+            entry = self.jobs.pop(kind, None)
+        if entry is None:
+            return None
+        if src is not None and str(Path(src)) == entry[0]:
+            return entry[1]
+        try:
+            entry[1].result()
+        except Exception:
+            pass
+        # What it wrote goes: the export of the other model must not keep its extra atlases
+        d = _deliverable_paths(self.out_base)
+        folder = self.out_base / "obj" / kind
+        if folder.is_dir():
+            shutil.rmtree(str(folder))
+        folder.mkdir(parents=True, exist_ok=True)
+        for k in ((f"{kind}_glb",) + (("low_stl", "low_3mf") if kind == "low" else ())):
+            d[k].unlink(missing_ok=True)
+        return None
+
+    def drain(self) -> None:
+        for kind in list(self.jobs):
+            self.take(kind, None)
+
+
+def _reset_deliverable_dirs(out_base: Path) -> None:
+    """Start from empty deliverable folders: a previous run with more texture atlases would otherwise leave its extra
+    model_high_tex_N.png files here and inside output.zip."""
+    for parts in DELIVERABLE_DIRS:
+        d = out_base.joinpath(*parts)
+        if d.is_dir():
+            shutil.rmtree(str(d))
+        d.mkdir(parents=True, exist_ok=True)
+
+
+def _deliverable_paths(out_base: Path) -> Dict[str, Path]:
+    return {
+        "high_obj": out_base / "obj" / "high" / "model_high.obj",
+        "high_mtl": out_base / "obj" / "high" / "model_high.mtl",
+        "high_stl": out_base / "stl" / "high_model.stl",
+        "high_3mf": out_base / "3mf" / "high_model.3mf",
+        "high_glb": out_base / "glb" / "high_model.glb",
+        "low_obj": out_base / "obj" / "low" / "model_low.obj",
+        "low_mtl": out_base / "obj" / "low" / "model_low.mtl",
+        "low_stl": out_base / "stl" / "low_model.stl",
+        "low_3mf": out_base / "3mf" / "low_model.3mf",
+        "low_glb": out_base / "glb" / "low_model.glb",
+    }
+
+
 def export_multi_lod_bundle(
     cleaned_mesh_path: str,
     textured_obj_path: Optional[str],
@@ -870,6 +1018,8 @@ def export_multi_lod_bundle(
     make_zip: bool = True,
     pool: Optional[Any] = None,
     print_high: Optional[List[str]] = None,
+    on_files_ready: Optional[Any] = None,
+    early: Optional[EarlyExports] = None,
 ) -> Dict[str, Any]:
     """
     Generates all deliverables matching Cloudflare R2 and RunPod specifications:
@@ -885,34 +1035,17 @@ def export_multi_lod_bundle(
     `pool` (parallel.LoggingProcessPool): the high-poly chain (OBJ + PNG -> GLB), the low-poly chain (OBJ + JPG -> GLB
     -> STL/3MF), the high STL/3MF and the mesh metrics of telemetry run in its workers; the files are the same as
     without a pool. `print_high`: high STL / 3MF already written (export_print_assets after mesh cleaning), moved in.
+    `on_files_ready()`: called once every deliverable is written, before their metrics (main.py starts zipping them).
+    `early` (EarlyExports): the high / low chains already started when their texturing finished (B3).
     """
     out_base = Path(output_dir).resolve()
-    obj_high_dir = out_base / "obj" / "high"
-    obj_low_dir = out_base / "obj" / "low"
-    stl_dir = out_base / "stl"
-    mf_dir = out_base / "3mf"
-    glb_dir = out_base / "glb"
-
-    # Start from empty deliverable folders: a previous run with more texture atlases would
-    # otherwise leave its extra model_high_tex_N.png files here and inside output.zip.
-    for d in [obj_high_dir, obj_low_dir, stl_dir, mf_dir, glb_dir]:
-        if d.is_dir():
-            shutil.rmtree(str(d))
-        d.mkdir(parents=True, exist_ok=True)
-
-    # 1. High-Poly Assets
-    high_obj = obj_high_dir / "model_high.obj"
-    high_mtl = obj_high_dir / "model_high.mtl"
-    high_stl = stl_dir / "high_model.stl"
-    high_3mf = mf_dir / "high_model.3mf"
-    high_glb = glb_dir / "high_model.glb"
-
-    # Low-Poly Assets paths
-    low_obj = obj_low_dir / "model_low.obj"
-    low_mtl = obj_low_dir / "model_low.mtl"
-    low_stl = stl_dir / "low_model.stl"
-    low_3mf = mf_dir / "low_model.3mf"
-    low_glb = glb_dir / "low_model.glb"
+    if early is None:
+        _reset_deliverable_dirs(out_base)
+    d = _deliverable_paths(out_base)
+    high_obj, high_mtl, high_stl, high_3mf, high_glb = (d[k] for k in ("high_obj", "high_mtl", "high_stl",
+                                                                       "high_3mf", "high_glb"))
+    low_obj, low_mtl, low_stl, low_3mf, low_glb = (d[k] for k in ("low_obj", "low_mtl", "low_stl", "low_3mf",
+                                                                  "low_glb"))
 
     exp_scale = float(getattr(config, "export_scale", 1000.0))
     glb_scale = glb_factor(config)
@@ -936,12 +1069,17 @@ def export_multi_lod_bundle(
         low_src = Path(textured_low_obj_path) if textured_low_obj_path else None
         # The two chains are independent when the low-poly texturing brought its own material and atlases
         low_independent = bool(low_src and low_src.is_file() and all(find_source_mtl_and_textures(low_src)))
-        high_job = run("export_high", _export_textured_high, str(tex_p), str(high_obj), str(high_mtl),
-                       str(high_glb), exp_scale, draco, cleaned_mesh_path, glb_scale)
+        high_job = early.take("high", str(tex_p)) if early is not None else None
+        if high_job is None:
+            high_job = run("export_high", _export_textured_high, str(tex_p), str(high_obj), str(high_mtl),
+                           str(high_glb), exp_scale, draco, cleaned_mesh_path, glb_scale)
         if low_independent:
-            pending.append(run("export_low", _export_low_chain, str(low_src), str(low_obj), str(low_mtl),
-                               str(low_glb), str(low_stl), str(low_3mf), exp_scale, draco, cleaned_mesh_path,
-                               glb_scale))
+            low_job = early.take("low", str(low_src)) if early is not None else None
+            if low_job is None:
+                low_job = run("export_low", _export_low_chain, str(low_src), str(low_obj), str(low_mtl),
+                              str(low_glb), str(low_stl), str(low_3mf), exp_scale, draco, cleaned_mesh_path,
+                              glb_scale)
+            pending.append(low_job)
             high_job.result()
         else:
             high_job.result()
@@ -977,6 +1115,8 @@ def export_multi_lod_bundle(
                     _plain_glb(cleaned_mesh_path, str(low_glb), exp_scale * glb_scale)
             _export_low_print(str(low_obj), str(low_stl), str(low_3mf), cleaned_mesh_path)
     else:
+        if early is not None:
+            early.drain()
         # Fallback to untextured mesh (the cleaned mesh is in metres: OBJ in the export units, GLB in its own)
         cleaned_trimesh = trimesh.load(cleaned_mesh_path, process=False)
         if exp_scale != 1.0:
@@ -996,6 +1136,10 @@ def export_multi_lod_bundle(
 
     for job in pending:
         job.result()
+    if early is not None:
+        early.drain()                     # a started chain nobody took over must not write while zipping
+    if on_files_ready is not None:
+        on_files_ready()
 
     # Mesh metrics of the deliverables for stats.json (each parse of a 1-2 M face OBJ/STL takes seconds: in parallel)
     order = [high_stl, high_3mf, high_glb, low_glb, high_obj, low_obj, low_stl, low_3mf]

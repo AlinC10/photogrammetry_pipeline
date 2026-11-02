@@ -108,6 +108,46 @@ class TestMaskFusion(unittest.TestCase):
                                        cylinder_radius_m=0.08, workers=1, ai_model=model, stats=stats)
         return out, stats
 
+    def test_stream_caches_give_the_same_masks(self):
+        """Medians and AI crops computed while the photos arrive (stream_cache) = the masks computed at the end."""
+        from pipeline import stream_cache
+
+        calls = []
+
+        def caching_fake(rgb, model_path, resolution=512, threads=2, cache_path=None):
+            if cache_path is not None and Path(cache_path).is_file():
+                return np.load(str(cache_path))
+            calls.append(1)
+            y = fake_model(rgb, model_path)
+            if cache_path is not None:
+                Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+                np.save(str(cache_path), y)
+            return y
+
+        def run(out, cache):
+            stats = {}
+            with mock.patch.object(mf, "ai_foreground_probability", side_effect=caching_fake):
+                mf.batch_fused_masks(self.cams, [(0, 1)] * len(self.cams), str(self.dir / out), str(self.dir / "w"),
+                                     self.tags, tag_scale=1.0, disc_radius_m=DISC_R, cylinder_radius_m=0.08,
+                                     workers=1, ai_model="fake.onnx", stats=stats,
+                                     ai_cache_dir=stream_cache.ai_dir(cache), median_cache_dir=cache)
+            return stats
+
+        ref = run("ref", None)
+        cache = str(self.dir / "stream")
+        # pre-work: the median of the level and the AI on the same crops
+        med = mf.median_image([mf.read_quarter(c["path"]) for c in self.cams])
+        stream_cache.save_median(cache, [c["path"] for c in self.cams], med)
+        run("pre", cache)
+        n_first = len(calls)
+        stream_cache.stats(reset=True)
+        st = run("cached", cache)
+        self.assertEqual(len(calls), n_first)                     # no model run the second time
+        self.assertEqual(st["ai_cache_hits"], ref["model_runs"])
+        self.assertEqual(stream_cache.stats().get("median_hit"), 1)
+        for f in sorted((self.dir / "ref").glob("*.mask.png")):
+            self.assertEqual(f.read_bytes(), (self.dir / "cached" / f.name).read_bytes(), f.name)
+
     def test_disc_texture_has_white_disc_and_black_tags(self):
         n = self.tex.shape[0]
         self.assertEqual(self.tex[n // 2, n // 2], 255)                    # centre of the disc: paper

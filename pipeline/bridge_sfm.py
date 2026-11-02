@@ -164,10 +164,12 @@ def _undistort_view_images(
     masks_src_dir: Optional[str],
     masks_dst_dir: Optional[str],
     blackout_background: bool = True,
+    image_ready: bool = False,
 ) -> bool:
     """
     Undistorts one view's image (and its mask, if one is found) and blacks out the background
     (unless `blackout_background` is False: DensifyPointCloud then reads the masks through --mask-path).
+    `image_ready`: the undistorted image was already written by undistort_rgb_images (B1), only the mask part runs.
     Returns True when a mask was found. Independent per view, so it runs in a thread pool.
     """
     src_img_path = Path(v["path"])
@@ -175,10 +177,11 @@ def _undistort_view_images(
     K_new = c_info["K_new"]
 
     # Undistort original image
-    undistort_single_image(
-        str(src_img_path), str(dst_img_path),
-        c_info["K_orig"], c_info["dist"], K_new, is_mask=False
-    )
+    if not (image_ready and dst_img_path.is_file()):
+        undistort_single_image(
+            str(src_img_path), str(dst_img_path),
+            c_info["K_orig"], c_info["dist"], K_new, is_mask=False
+        )
 
     # Undistort mask if available
     mask_candidates = [
@@ -246,6 +249,42 @@ def _undistort_view_images(
     return found_mask
 
 
+def _intrinsics_table(sfm: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Per intrinsic id: original K, distortion, the undistorted K (alpha 0: no black borders), size, COLMAP id."""
+    table = {}
+    for intr in sfm["intrinsics"]:
+        intr_id = str(intr["intrinsicId"])
+        K, dist, w, h = build_camera_matrix_and_distortion(intr)
+        K_new, _roi = cv2.getOptimalNewCameraMatrix(K, dist, (w, h), alpha=0.0)
+        table[intr_id] = {"K_orig": K, "dist": dist, "K_new": K_new, "w": w, "h": h,
+                          "colmap_id": int(intr_id) + 1}
+    return table
+
+
+def undistort_rgb_images(sfm: Dict[str, Any], undistorted_images_dir: str, workers: int = 1) -> int:
+    """
+    B1 (plans/PLAN_STREAMING_DAG.md): the undistorted photos <viewId>_<name> alone, as convert_sfm_to_colmap writes
+    them. They depend only on the intrinsics (turntable_poses), not on the poses rig_refine corrects (RULE 2) nor on
+    the masks, so main.py runs this beside the rig refinement and the masking; convert_sfm_to_colmap(...,
+    images_ready=True) then only undistorts the masks and blacks the background out (the same operations, in the
+    same order on each file). `sfm`: the cameras_known.sfm content read before rig_refine rewrites it.
+    """
+    out = Path(undistorted_images_dir).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    intr = _intrinsics_table(sfm)
+    posed = {str(p["poseId"]) for p in sfm.get("poses", [])}
+    tasks = [(v, intr[str(v["intrinsicId"])]) for v in sfm.get("views", []) if str(v["poseId"]) in posed]
+
+    def one(task) -> None:
+        v, c = task
+        name = f"{v['viewId']}_{Path(v['path']).name}"
+        undistort_single_image(str(v["path"]), str(out / name), c["K_orig"], c["dist"], c["K_new"], is_mask=False)
+
+    with ThreadPoolExecutor(max_workers=max(1, int(workers or 1))) as ex:
+        list(ex.map(one, tasks))
+    return len(tasks)
+
+
 def convert_sfm_to_colmap(
     sfm_json_path: str,
     output_colmap_dir: str,
@@ -255,8 +294,10 @@ def convert_sfm_to_colmap(
     workers: int = 1,
     proxy_bounds: Optional[Dict[str, float]] = None,
     blackout_background: bool = True,
+    images_ready: bool = False,
 ) -> Dict[str, Any]:
     """
+    `images_ready`: undistort_rgb_images already wrote the undistorted photos (same intrinsics): only the masks.
     `proxy_bounds`: {"y_max", "r_max"} of the proxy points (visual_hull.proxy_bounds_from_hull). DensifyPointCloud
     sets its ROI and the depth range of each view from them, so they must enclose the whole object.
     Reads AliceVision cameras_known.sfm, undistorts images and masks,
@@ -275,25 +316,11 @@ def convert_sfm_to_colmap(
         sfm = json.load(f)
 
     # 1. Process Intrinsics and compute K_new
-    intr_data = {}
+    intr_data = _intrinsics_table(sfm)
     colmap_cameras = []
 
-    for intr in sfm["intrinsics"]:
-        intr_id = str(intr["intrinsicId"])
-        K, dist, w, h = build_camera_matrix_and_distortion(intr)
-
-        # Optimal new camera matrix with alpha=0.0 (no black borders)
-        K_new, roi = cv2.getOptimalNewCameraMatrix(K, dist, (w, h), alpha=0.0)
-
-        intr_data[intr_id] = {
-            "K_orig": K,
-            "dist": dist,
-            "K_new": K_new,
-            "w": w,
-            "h": h,
-            "colmap_id": int(intr_id) + 1,
-        }
-
+    for intr_id, c in intr_data.items():
+        K_new = c["K_new"]
         fx_new = float(K_new[0, 0])
         fy_new = float(K_new[1, 1])
         cx_new = float(K_new[0, 2])
@@ -301,7 +328,7 @@ def convert_sfm_to_colmap(
 
         # COLMAP PINHOLE: CAMERA_ID, MODEL, WIDTH, HEIGHT, fx, fy, cx, cy
         colmap_cameras.append(
-            f"{intr_data[intr_id]['colmap_id']} PINHOLE {w} {h} {fx_new:.6f} {fy_new:.6f} {cx_new:.6f} {cy_new:.6f}"
+            f"{c['colmap_id']} PINHOLE {c['w']} {c['h']} {fx_new:.6f} {fy_new:.6f} {cx_new:.6f} {cy_new:.6f}"
         )
 
     # Prepare COLMAP directories (both root and sparse/ / sparse/0/ for all OpenMVS versions)
@@ -393,7 +420,7 @@ def convert_sfm_to_colmap(
     def run_task(task) -> bool:
         tv, tc, tname = task
         return _undistort_view_images(tv, tc, tname, undist_img_path, masks_src_dir, masks_dst_dir,
-                                      blackout_background)
+                                      blackout_background, images_ready)
 
     if workers == 1:
         found = list(map(run_task, image_tasks))

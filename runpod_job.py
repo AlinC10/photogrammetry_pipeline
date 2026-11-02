@@ -9,8 +9,16 @@ Environment (set by cloud/job.py):
   optional R2_DEBUG_BUCKET + R2_DEBUG_* temporary credentials on jobs/<id>/ of the debug bucket
   (cloudflare_r2.debug_credentials_env): pipeline/debug_lite.py archive uploaded there as jobs/<id>/debug_lite.zip.
 
-Writes to jobs/<id>/output/: output.zip, stats.json, run_log.txt and, LAST, status.json:
-  {"state": "ok" | "ram_insufficient" | "pipeline_error" | "input_error" | "timeout", ...}
+Streaming (JOB_JSON "stream": true, plans/PLAN_STREAMING_DAG.md §2): the pod is started when the scan starts. It lists
+jobs/<id>/input/ every STREAM_POLL_S, downloads each new photo and pre-computes what depends on the photos alone
+(pipeline/stream_prework.py) until the scanner writes input/capture_done.json ({"files": [...], ...}: every photo of
+the scan), then runs the pipeline with those caches. input/level_done_<L>.json (optional) marks a level as uploaded;
+input/cancel.json, or no new photo for STREAM_IDLE_S, ends the job without a model. Without "stream" the photos are
+all there at the start, as before.
+
+Writes to jobs/<id>/output/: progress.json (the last finished step, for the scanner), output.zip, stats.json,
+run_log.txt and, LAST, status.json:
+  {"state": "ok" | "ram_insufficient" | "pipeline_error" | "input_error" | "timeout" | "cancelled", ...}
   With "ok", "warnings" lists what the client should show ({"code", "message", ...}: model not watertight, object
   at the disc rim, masks disagree, ...): the model was delivered but may need a rescan.
 The pod never stops itself (it has no RunPod key): the client terminates it after reading status.json.
@@ -21,11 +29,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from cloud import cloudflare_r2 as r2
 
@@ -35,10 +46,165 @@ INPUT_DIR = Path(os.environ.get("POD_INPUT_DIR", "/workspace/input_images"))
 OUTPUT_DIR = Path(os.environ.get("POD_OUTPUT_DIR", "/workspace/output"))
 WORK_DIR = Path(os.environ.get("TURNTABLE_WORK_DIR", "/tmp/turntable_work"))
 WATCHDOG_MARGIN_S = 180   # leave time to upload the log and status.json before the credentials expire
+STREAM_POLL_S = float(os.environ.get("STREAM_POLL_S", "2"))
+# Longer than the scanner's upload queue drain (UPLOAD_DRAIN_TIMEOUT_S 300 s) before it writes capture_done.json
+STREAM_IDLE_S = float(os.environ.get("STREAM_IDLE_S", "420"))
+CAPTURE_DONE, CANCEL = "capture_done.json", "cancel.json"
+LEVEL_DONE_RX = re.compile(r"^level_done_(\d+)\.json$")
+PHOTO_LEVEL_RX = re.compile(r"(\d)[_]?\d{1,4}$")      # f_1003 -> level 1 (TurntableConfig.name_regex)
 
 
-def upload_outputs(out_client, bucket: str, job_id: str, status: dict) -> None:
-    """output.zip, stats.json, run_log.txt (whatever exists), then status.json last: the completion signal."""
+class StreamCancelled(Exception):
+    pass
+
+
+class StreamInputError(Exception):
+    pass
+
+
+class ProgressWriter:
+    """jobs/<id>/output/progress.json ({"step": ..., ...}) from a thread: the pipeline never waits for R2."""
+
+    def __init__(self, client, bucket: str, job_id: str):
+        self.client, self.bucket, self.key = client, bucket, r2.output_key(job_id, "progress.json")
+        self._latest = None
+        self._cv = threading.Condition()
+        self._closed = False
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def set(self, step: str, **extra) -> None:
+        with self._cv:
+            self._latest = dict(extra, step=step, at=time.time())
+            self._cv.notify()
+
+    def _run(self) -> None:
+        while True:
+            with self._cv:
+                while self._latest is None and not self._closed:
+                    self._cv.wait()
+                if self._latest is None:
+                    return
+                data, self._latest = self._latest, None
+            try:
+                r2.put_json(data, self.key, self.bucket, client=self.client)
+            except Exception as e:
+                logger.debug(f"progress.json not written: {e}")
+
+    def close(self) -> None:
+        with self._cv:
+            self._closed = True
+            self._cv.notify()
+
+
+def _download_atomic(key: str, target: Path, bucket: str, client) -> bool:
+    """To <target>.part, then renamed: a half-written photo is never seen under its name."""
+    part = target.with_name(target.name + ".part")
+    ok = r2.download_file(key, str(part), bucket, client=client)
+    if ok:
+        os.replace(str(part), str(target))
+    else:
+        part.unlink(missing_ok=True)
+    return ok
+
+
+def stream_inputs(job_id: str, bucket: str, client, dest: Path, on_photo=None, on_level=None,
+                  progress: Optional[ProgressWriter] = None, poll_s: Optional[float] = None,
+                  idle_s: Optional[float] = None, max_wait_s: Optional[float] = None) -> Dict[str, Any]:
+    """
+    Downloads the photos of jobs/<id>/input/ as they appear, until capture_done.json lists them all. Calls
+    on_photo(relative key, local path) for each new photo, on_level(level, files) for each level_done marker.
+    Returns {"manifest", "photos", "first_photo_at", "last_photo_at", "capture_done_at"}.
+    Raises StreamCancelled (cancel.json) or StreamInputError (idle too long, a listed photo missing).
+    """
+    poll_s = STREAM_POLL_S if poll_s is None else poll_s
+    idle_s = STREAM_IDLE_S if idle_s is None else idle_s
+    prefix = r2.input_prefix(job_id)
+    dest = Path(dest).resolve()
+    dest.mkdir(parents=True, exist_ok=True)
+    have: Dict[str, Path] = {}
+    markers_seen: set = set()
+    first_at = last_at = None
+    last_new = t_start = time.time()
+    pool = ThreadPoolExecutor(max_workers=8)
+
+    def fetch(keys: List[str]) -> List[str]:
+        jobs = []
+        for key in keys:
+            rel = key[len(prefix):]
+            target = (dest / rel).resolve()
+            if dest not in target.parents:
+                continue                                  # a key like ../../x must not escape dest
+            target.parent.mkdir(parents=True, exist_ok=True)
+            jobs.append((key, rel, target, pool.submit(_download_atomic, key, target, bucket, client)))
+        got = []
+        for key, rel, target, fut in jobs:
+            if fut.result():
+                have[key] = target
+                got.append(rel)
+                if on_photo is not None:
+                    on_photo(rel, str(target))
+        return got
+
+    try:
+        while True:
+            keys = r2.list_keys(prefix=prefix, bucket=bucket, client=client)
+            names = {k[len(prefix):]: k for k in keys}
+            if CANCEL in names:
+                raise StreamCancelled("cancel.json")
+            images = sorted(k for k in keys if Path(k).suffix.lower() in r2.IMAGE_SUFFIXES and k not in have)
+            got = fetch(images) if images else []
+            now = time.time()
+            if got:
+                first_at = first_at or now
+                last_at = last_new = now
+                if progress is not None:
+                    levels = [m.group(1) for m in (PHOTO_LEVEL_RX.search(Path(r).stem) for r in got) if m]
+                    progress.set("0. Waiting for photos", photos=len(have), level=int(max(levels)) if levels else None)
+            for rel, key in sorted(names.items()):
+                m = LEVEL_DONE_RX.match(rel)
+                if m and key not in markers_seen:
+                    markers_seen.add(key)
+                    marker = r2.get_json(key, bucket, client=client) or {}
+                    if on_level is not None:
+                        on_level(int(m.group(1)), [str(f) for f in marker.get("files") or []])
+            if CAPTURE_DONE in names:
+                manifest = r2.get_json(names[CAPTURE_DONE], bucket, client=client) or {}
+                done_at = time.time()
+                files = [str(f).lstrip("/") for f in manifest.get("files") or []]
+                missing = [f for f in files if prefix + f not in have]
+                if missing:
+                    present = r2.list_keys(prefix=prefix, bucket=bucket, client=client)
+                    gone = [f for f in missing if prefix + f not in present]
+                    if gone:
+                        raise StreamInputError(f"{len(gone)} photo(s) of capture_done.json not in R2: {gone[:5]}")
+                    fetch([prefix + f for f in missing])
+                    still = [f for f in missing if prefix + f not in have]
+                    if still:
+                        raise StreamInputError(f"{len(still)} photo(s) could not be downloaded: {still[:5]}")
+                if files:
+                    # exactly the photos of the manifest (what the scanner verified), nothing older or extra
+                    wanted = {prefix + f for f in files}
+                    for key in [k for k in have if k not in wanted]:
+                        have.pop(key).unlink(missing_ok=True)
+                if not have:
+                    raise StreamInputError("capture_done.json but no photo")
+                return {"manifest": manifest, "photos": len(have), "first_photo_at": first_at,
+                        "last_photo_at": last_at, "capture_done_at": done_at}
+            if now - last_new > idle_s:
+                raise StreamInputError(f"capture abandoned: no new photo for {idle_s:.0f} s "
+                                       f"({len(have)} received, no capture_done.json)")
+            if max_wait_s is not None and now - t_start > max_wait_s:
+                raise StreamInputError(f"no capture_done.json after {max_wait_s:.0f} s")
+            time.sleep(poll_s)
+    finally:
+        pool.shutdown(wait=True)
+
+
+def upload_outputs(out_client, bucket: str, job_id: str, status: dict, before_status=None) -> None:
+    """
+    output.zip, stats.json, run_log.txt (whatever exists), then status.json last: the completion signal.
+    `before_status()`: runs after the files and before status.json (waits for the debug archive upload).
+    """
     for name in ("output.zip", "stats.json", "run_log.txt"):
         path = OUTPUT_DIR / name
         if path.is_file():
@@ -46,13 +212,24 @@ def upload_outputs(out_client, bucket: str, job_id: str, status: dict) -> None:
             logger.info(f"Upload {name}: {'ok' if ok else 'FAILED'}")
             if not ok and name == "output.zip" and status.get("state") == "ok":
                 status.update(state="pipeline_error", error="output.zip upload failed")
+    if before_status is not None:
+        before_status()
     r2.put_json(status, r2.output_key(job_id, "status.json"), bucket, client=out_client)
+
+
+DEBUG_PARTS_ZIP = WORK_DIR / "debug_lite_parts.zip"
+
+
+def debug_upload_possible() -> bool:
+    debug_bucket = os.environ.get("R2_DEBUG_BUCKET", "")
+    return bool(debug_bucket and os.environ.get("R2_DEBUG_ACCESS_KEY_ID") and debug_bucket != r2.bucket_from_env())
 
 
 def upload_debug_lite(job_id: str) -> dict:
     """
     pipeline/debug_lite.py archive -> jobs/<id>/debug_lite.zip of the DEBUG bucket, with the R2_DEBUG_* temporary
     credentials the launcher passes (cloudflare_r2.debug_credentials_env); skipped without them. Never fatal.
+    The large parts were built by the pipeline during the run (DEBUG_PARTS_ZIP) when it got that far.
     """
     debug_bucket = os.environ.get("R2_DEBUG_BUCKET", "")
     if not debug_bucket or not os.environ.get("R2_DEBUG_ACCESS_KEY_ID"):
@@ -62,7 +239,8 @@ def upload_debug_lite(job_id: str) -> dict:
     try:
         from pipeline.debug_lite import build_debug_lite
 
-        info = build_debug_lite(str(OUTPUT_DIR), str(WORK_DIR), str(WORK_DIR / "debug_lite.zip"))
+        info = build_debug_lite(str(OUTPUT_DIR), str(WORK_DIR), str(WORK_DIR / "debug_lite.zip"),
+                                parts_zip=str(DEBUG_PARTS_ZIP) if DEBUG_PARTS_ZIP.is_file() else None)
         ok = r2.upload_file(info["path"], debug_bucket, r2.job_prefix(job_id) + "debug_lite.zip",
                             client=r2.client_from_env("R2_DEBUG_"))
         logger.info(f"Debug archive upload: {'ok' if ok else 'FAILED'} ({info['size_mb']} MB)")
@@ -70,6 +248,19 @@ def upload_debug_lite(job_id: str) -> dict:
     except Exception as e:
         logger.warning(f"Debug archive not uploaded: {e}")
         return {"uploaded": False, "reason": str(e)[:200]}
+
+
+STREAM_CACHE_DIR = WORK_DIR / "stream"
+
+
+def _end_prework(prework) -> Optional[dict]:
+    if prework is None:
+        return None
+    try:
+        prework.capture_done()
+        return prework.finish(timeout=30)
+    except Exception as e:
+        return {"error": str(e)[:200]}
 
 
 def main() -> int:
@@ -105,14 +296,48 @@ def main() -> int:
     threading.Thread(target=watchdog, daemon=True).start()
 
     status = {"job_id": job_id, "state": "pipeline_error", "started_at": started}
+    progress = ProgressWriter(out_client, bucket, job_id)
+    stream = bool(job.get("stream"))
+    prework = None
+    stream_info: Dict[str, Any] = {}
     try:
         t0 = time.time()
-        keys = r2.download_job_images(job_id, str(INPUT_DIR), bucket, client=in_client)
-        timings["download_input"] = round(time.time() - t0, 2)
-        logger.info(f"Downloaded {len(keys)} photos in {timings['download_input']} s")
+        if stream:
+            from pipeline.stream_prework import StreamPrework
+
+            progress.set("0. Waiting for photos", photos=0, level=None)
+            prework = StreamPrework(str(INPUT_DIR), str(STREAM_CACHE_DIR), job,
+                                    workers=max(1, (os.cpu_count() or 2) - 1),
+                                    level_masks=bool(job.get("stream_level_masks", True)))
+            got = stream_inputs(job_id, bucket, in_client, INPUT_DIR, on_photo=prework.photo_arrived,
+                                on_level=prework.level_marker, progress=progress)
+            prework.capture_done()
+            capture_done_at = got["capture_done_at"]
+            stream_info = {"photos": got["photos"], "pod_ready_before_first_photo_s":
+                           round(got["first_photo_at"] - started, 2) if got["first_photo_at"] else None,
+                           "capture_s": round(got["last_photo_at"] - got["first_photo_at"], 2)
+                           if got["first_photo_at"] and got["last_photo_at"] else None,
+                           "capture_done_after_last_photo_s":
+                           round(capture_done_at - (got["last_photo_at"] or capture_done_at), 2)}
+            timings["stream_wait"] = round(time.time() - t0, 2)
+            logger.info(f"Streaming: {got['photos']} photos, capture_done after {timings['stream_wait']} s")
+        else:
+            keys = r2.download_job_images(job_id, str(INPUT_DIR), bucket, client=in_client)
+            capture_done_at = None
+            timings["download_input"] = round(time.time() - t0, 2)
+            logger.info(f"Downloaded {len(keys)} photos in {timings['download_input']} s")
+    except StreamCancelled:
+        status.update(state="cancelled", error="cancelled by the scanner")
+        _end_prework(prework)
+        upload_outputs(out_client, bucket, job_id, status)
+        progress.close()
+        done.set()
+        return 1
     except Exception as e:
         status.update(state="input_error", error=str(e))
+        _end_prework(prework)
         upload_outputs(out_client, bucket, job_id, status)
+        progress.close()
         done.set()
         return 1
 
@@ -123,6 +348,15 @@ def main() -> int:
     pipeline_job.update(input_dir=str(INPUT_DIR), output_dir=str(OUTPUT_DIR), work_dir=str(WORK_DIR),
                         rig_mode=bool(job.get("rig_mode", (INPUT_DIR / "rig").is_dir())),
                         ram_margin=float(os.environ.get("RAM_MARGIN", job.get("ram_margin", 1.0))))
+    if job.get("debug_lite", True) and debug_upload_possible():
+        pipeline_job["debug_lite_parts"] = str(DEBUG_PARTS_ZIP)     # large parts built during the run (B2)
+    pipeline_job["on_step_done"] = lambda name: progress.set(name)
+    if stream:
+        from pipeline import stream_cache
+
+        stream_cache.stats(reset=True)
+        pipeline_job.update(stream_cache=str(STREAM_CACHE_DIR), stream_info=stream_info,
+                            before_masks=lambda: prework.wait_levels(timeout=300))
     status["resources"] = describe_resources()
     try:
         t0 = time.time()
@@ -137,14 +371,32 @@ def main() -> int:
         status.update(state="pipeline_error", error=f"{type(e).__name__}: {e}",
                       traceback=traceback.format_exc()[-4000:])
     finally:
-        # Before status.json: the client terminates the pod as soon as it reads it
+        # The debug archive goes up beside output.zip (B2), but before status.json: the client terminates the pod
+        # as soon as it reads it
+        debug_thread = None
         if job.get("debug_lite", True):
-            t0 = time.time()
-            status["debug_lite"] = upload_debug_lite(job_id)
-            timings["debug_lite"] = round(time.time() - t0, 2)
-        timings["total"] = round(time.time() - started, 2)
+            def debug_upload() -> None:
+                t1 = time.time()
+                status["debug_lite"] = upload_debug_lite(job_id)
+                timings["debug_lite"] = round(time.time() - t1, 2)
+
+            debug_thread = threading.Thread(target=debug_upload, daemon=True)
+            debug_thread.start()
+
+        def before_status() -> None:
+            if debug_thread is not None:
+                debug_thread.join(timeout=600)
+            timings["total"] = round(time.time() - started, 2)
+            if capture_done_at is not None:
+                # main indicator of the streaming mode: last photo announced -> model delivered
+                timings["wait_after_capture_s"] = round(time.time() - capture_done_at, 2)
+            status["timings_s"] = timings
+
         status["timings_s"] = timings
-        upload_outputs(out_client, bucket, job_id, status)
+        if prework is not None:
+            status["stream"] = dict(stream_info, prework=_end_prework(prework))
+        upload_outputs(out_client, bucket, job_id, status, before_status)
+        progress.close()
         done.set()
     logger.info(f"Job {job_id} finished: {status['state']}")
     return 0 if status["state"] == "ok" else 1

@@ -217,26 +217,49 @@ def read_quarter(path: str) -> Optional[np.ndarray]:
     return img
 
 
-def group_medians(paths: Sequence[str], groups: Sequence[Any], out_dir: Path, threads: int = 4
-                  ) -> Dict[Any, str]:
-    """Median image (1/4 resolution) of every group of views, saved as .npy; {group: path}."""
+def median_image(imgs: Sequence[Optional[np.ndarray]]) -> Optional[np.ndarray]:
+    """Per-pixel median (uint8) of the decoded images of one group (those of the first one's size)."""
+    stack = [im for im in imgs if im is not None]
+    if not stack:
+        return None
+    shape = stack[0].shape
+    arr = np.stack([s for s in stack if s.shape == shape])
+    med = np.empty(shape, np.uint8)
+    for r0 in range(0, shape[0], 128):                 # row chunks: np.median works in float64
+        med[r0:r0 + 128] = np.median(arr[:, r0:r0 + 128], axis=0).astype(np.uint8)
+    return med
+
+
+def group_medians(paths: Sequence[str], groups: Sequence[Any], out_dir: Path, threads: int = 4,
+                  cache_dir: Optional[str] = None) -> Dict[Any, str]:
+    """
+    Median image (1/4 resolution) of every group of views, saved as .npy; {group: path}. `cache_dir`
+    (stream_cache): a median already computed from exactly the same photos is used as it is.
+    """
+    from . import stream_cache
+
     out_dir.mkdir(parents=True, exist_ok=True)
-    with ThreadPoolExecutor(max_workers=max(1, threads)) as ex:     # decoding releases the GIL
-        imgs = list(ex.map(read_quarter, paths))
+    order = sorted(set(groups), key=str)
+    members = {g: [paths[i] for i in range(len(paths)) if groups[i] == g] for g in order}
     res: Dict[Any, str] = {}
-    for g in sorted(set(groups), key=str):
-        stack = [imgs[i] for i in range(len(paths)) if groups[i] == g and imgs[i] is not None]
-        if not stack:
-            continue
-        shape = stack[0].shape
-        stack = [s for s in stack if s.shape == shape]
-        arr = np.stack(stack)
-        med = np.empty(shape, np.uint8)
-        for r0 in range(0, shape[0], 128):                 # row chunks: np.median works in float64
-            med[r0:r0 + 128] = np.median(arr[:, r0:r0 + 128], axis=0).astype(np.uint8)
-        p = out_dir / f"median_{len(res)}.npy"
-        np.save(str(p), med)
-        res[g] = str(p)
+    todo = []
+    for g in order:
+        hit = stream_cache.median_path(cache_dir, members[g]) if cache_dir else None
+        if hit is not None:
+            res[g] = str(hit)
+        else:
+            todo.append(g)
+    if todo:
+        need = sorted({p for g in todo for p in members[g]})
+        with ThreadPoolExecutor(max_workers=max(1, threads)) as ex:     # decoding releases the GIL
+            decoded = dict(zip(need, ex.map(read_quarter, need)))
+        for k, g in enumerate(todo):
+            med = median_image([decoded[p] for p in members[g]])
+            if med is None:
+                continue
+            pth = out_dir / f"median_{order.index(g)}.npy"
+            np.save(str(pth), med)
+            res[g] = str(pth)
     return res
 
 
@@ -253,8 +276,12 @@ def _ai_on_crop(task: Dict[str, Any], cam: Dict[str, Any], I: np.ndarray, full_i
     hq, wq = I.shape[:2]
     x0, y0, x1, y1 = box
     q0, q1, p0, p1 = x0 // SCALE, -(-x1 // SCALE), y0 // SCALE, -(-y1 // SCALE)
-    cache = (Path(task["ai_cache_dir"]) / f"{cam['view_id']}_{x0}_{y0}_{x1}_{y1}.npy"
+    # Keyed on the photo, not the view id (that depends on how many photos the scan has: the streaming pre-work
+    # runs on one level before the others exist)
+    cache = (Path(task["ai_cache_dir"]) / f"{Path(cam['path']).parent.name}_{Path(cam['path']).stem}_{x0}_{y0}_{x1}_{y1}.npy"
              if task.get("ai_cache_dir") else None)
+    if cache is not None and cache.is_file():
+        task["_ai_hits"] = task.get("_ai_hits", 0) + 1
     if min(q1 - q0, p1 - p0) >= task["ai_resolution"]:
         crop = cv2.cvtColor(np.ascontiguousarray(I[p0:p1, q0:q1]), cv2.COLOR_BGR2RGB)
     else:
@@ -355,6 +382,7 @@ def _phase1(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     np.savez_compressed(task["npz"], ai=ai, obj=obj, strong=strong, unreliable=unreliable, roi=roi, near=near,
                         zone=zone, rough=rough, tag_ink=tag_ink)
     return {"index": task["index"], "box": box, "ai_note": ai_note, "retried": retried,
+            "ai_cache_hits": task.get("_ai_hits", 0),
             "t_model_s": round(time.time() - t1, 3),
             "t_s": round(time.time() - t0, 3)}
 
@@ -417,19 +445,22 @@ def batch_fused_masks(
     ai_cache_dir: Optional[str] = None,
     min_ai_recall: float = 0.5,
     stats: Optional[Dict[str, Any]] = None,
+    median_cache_dir: Optional[str] = None,
 ) -> Dict[str, str]:
     """
     Fused masks for `cameras` (mesh_masks.load_sfm_cameras entries); `groups[i]` = (camera, level) of view i (the
     background median is taken per group). Without `ai_model` the background model alone decides (with the
     photometric test where it cannot judge). Writes <viewId>_<stem>.mask.png like batch_generate_masks and
     returns the same {image name: mask path} mapping; `stats` receives methods and timings.
+    `median_cache_dir` (stream_cache): background medians computed while the photos arrived.
     """
     t0 = time.time()
     out_dir = Path(output_masks_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     work = Path(work_dir)
     work.mkdir(parents=True, exist_ok=True)
-    medians = group_medians([c["path"] for c in cameras], list(groups), work, threads=max(1, workers))
+    medians = group_medians([c["path"] for c in cameras], list(groups), work, threads=max(1, workers),
+                            cache_dir=median_cache_dir)
     t_med = time.time() - t0
     tex_path = work / "disc_texture.npy"
     np.save(str(tex_path), disc_texture(tags, tag_scale, disc_radius_m))
@@ -494,7 +525,7 @@ def batch_fused_masks(
                                                "fusion": round(time.time() - t0 - t_med - t_p1, 1)},
                      model_s_per_view=round(float(np.mean(model_t)), 3) if model_t else None,
                      missing=len(tasks) - len(done), crops_grown=retries,
-                     model_runs=model_runs)
+                     model_runs=model_runs, ai_cache_hits=sum(int(r.get("ai_cache_hits") or 0) for r in results if r))
     logger.info(f"Fused masks: {len(done)}/{len(tasks)} views in {time.time() - t0:.1f} s "
                 f"(medians {t_med:.1f} s, {workers} worker(s); "
                 f"{', '.join(f'{k}: {v}' for k, v in sorted(methods.items()))}).")

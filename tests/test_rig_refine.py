@@ -133,6 +133,34 @@ class TestRigRefine(unittest.TestCase):
         self.assertTrue(all(s[:50].all() for s in static))
         self.assertFalse(any(s[50:].any() for s in static))
 
+    def test_sift_cache_same_features(self):
+        """Streaming pre-work: SIFT saved when the photo arrives = SIFT computed in the step; a changed photo is a miss."""
+        import tempfile
+        import time as _time
+        from pipeline import stream_cache
+        from pipeline.rig_refine import _detect, cache_keypoints
+
+        with tempfile.TemporaryDirectory() as d:
+            rng = np.random.default_rng(5)
+            img = cv2.GaussianBlur(rng.integers(0, 255, (600, 800), dtype=np.uint8), (5, 5), 1.5)
+            path = str(Path(d) / "rig" / "0" / "f_1003.jpg")
+            Path(path).parent.mkdir(parents=True)
+            cv2.imwrite(path, img)
+            cfg = RigRefineConfig()
+            K = np.array([[700.0, 0, 400], [0, 700.0, 300], [0, 0, 1]])
+            dist = np.array([-0.1, 0.02, 0, 0, 0])
+            cache = str(Path(d) / "stream")
+            self.assertGreater(cache_keypoints(path, cfg, cache), 50)
+            ref = _detect(path, K, dist, cfg)
+            stream_cache.stats(reset=True)
+            got = _detect(path, K, dist, cfg, cache)
+            self.assertEqual(stream_cache.stats().get("sift_hit"), 1)
+            for a, b in zip(ref, got):
+                self.assertTrue(np.array_equal(a, b))
+            _time.sleep(0.01)
+            cv2.imwrite(path, 255 - img)                          # another photo under the same name
+            self.assertIsNone(stream_cache.load_sift(cache, path, cfg.scale, cfg.max_features))
+
     def test_write_refined_sfm_column_major(self):
         cams = self.model[:2]
         sfm = {"views": [{"viewId": c["view_id"], "poseId": f"p{c['view_id']}", "intrinsicId": c["intrinsic_id"],

@@ -11,6 +11,8 @@ import json
 import logging
 import os
 import shutil
+import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -55,7 +57,7 @@ def detach_run_log(handler: logging.Handler) -> None:
 
 
 from pipeline.texrecon_runner import TexReconRunner, find_texrecon_binary
-from pipeline.bridge_sfm import convert_sfm_to_colmap
+from pipeline.bridge_sfm import convert_sfm_to_colmap, undistort_rgb_images
 from pipeline.mask_processor import ai_model_available, batch_generate_masks, load_tag_layout
 from pipeline.mask_fusion import batch_fused_masks
 from pipeline.camera_init import (
@@ -79,7 +81,8 @@ from pipeline.exporter import (
     decimate_mesh,
     export_multi_lod_bundle,
     export_print_assets,
-    package_output_zip,
+    EarlyExports,
+    OutputZip,
 )
 from pipeline.parallel import LoggingProcessPool
 from pipeline.mesh_cleaner import clean_and_repair_mesh, face_target
@@ -89,6 +92,7 @@ from pipeline.rig_refine import refine_rig_poses, view_groups
 from pipeline import visual_hull
 from pipeline.openmvs_runner import OpenMVSRunner
 from pipeline import run_metrics
+from pipeline import stream_cache
 from pipeline.resources import InsufficientRamError, check_ram, describe_resources, resolve_workers
 from pipeline.telemetry import SystemTelemetry
 from pipeline.texrecon_runner import TEXRECON_DATA_TERMS
@@ -99,6 +103,33 @@ MASK_METHODS = ("fused", "ai", "photometric")
 # a new image changes the behaviour of every scan without touching the scripts that upload the photos
 SERVER_DEFAULT_OPTIONS = frozenset({"rig_refine", "mask_method", "ai_view_stride"})
 from pipeline.texture_prep import prepare_texturing_images
+
+
+def turntable_config(job: Dict[str, Any]) -> TurntableConfig:
+    """Turntable / pose options of a job (also used by the streaming pre-work, pipeline/stream_prework.py)."""
+    return TurntableConfig(
+        step_deg=job.get("step_deg", 18.0),
+        tag_scale=float(job.get("tag_scale", TurntableConfig.tag_scale)),
+        default_focal_mm=job.get("focal_length_mm", 3.9),
+        lift_mm=float(job.get("lift_mm", TurntableConfig.lift_mm)),
+        estimate_lift=None if job.get("estimate_lift") in (None, "auto") else bool(job["estimate_lift"]),
+        tag_refine=bool(job.get("tag_refine", True)),
+        intrinsics_in=job.get("intrinsics_in"),
+    )
+
+
+def masking_config(job: Dict[str, Any]) -> MaskingConfig:
+    """Masking options of a job (also used by the streaming pre-work)."""
+    return MaskingConfig(densify_masks=job.get("densify_masks", "blackout"), method=job.get("mask_method", "fused"),
+                         ai_view_stride=int(job.get("ai_view_stride", 2)))
+
+
+def ai_mask_workers(m: MaskingConfig, workers: int) -> int:
+    """Processes for the AI masks: each holds the model (~3 GB peak) and uses ai_threads threads."""
+    res = describe_resources()
+    by_cpu = max(1, int(res["cpus"]) // max(1, m.ai_threads))
+    by_ram = max(1, int((float(res["ram_free_gb"]) - 4.0) // m.ai_ram_per_worker_gb))
+    return max(1, min(workers, by_cpu, by_ram))
 
 
 def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -132,7 +163,10 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
 
     # Initialize Telemetry
     telemetry = SystemTelemetry(output_dir=str(out_path))
+    telemetry.on_step_done = job.get("on_step_done")      # runpod_job.py: progress.json for the scanner
     telemetry.start_sampling(interval_sec=0.2)
+    if job.get("stream_info"):
+        telemetry.set_info(stream=dict(job["stream_info"]))
 
     resources = describe_resources()
     workers = resolve_workers(job.get("workers"))
@@ -227,15 +261,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             max_threads=resources["cpus"],
             keep_depth_maps=bool(job.get("keep_depth_maps", False)),
         ),
-        turntable=TurntableConfig(
-            step_deg=job.get("step_deg", 18.0),
-            tag_scale=float(job.get("tag_scale", TurntableConfig.tag_scale)),
-            default_focal_mm=job.get("focal_length_mm", 3.9),
-            lift_mm=float(job.get("lift_mm", TurntableConfig.lift_mm)),
-            estimate_lift=None if job.get("estimate_lift") in (None, "auto") else bool(job["estimate_lift"]),
-            tag_refine=bool(job.get("tag_refine", True)),
-            intrinsics_in=job.get("intrinsics_in"),
-        ),
+        turntable=turntable_config(job),
         cleaning=MeshCleaningConfig(
             slice_y_m=job.get("slice_y_m", 0.003),
             skirt_bottom_y_m=job.get("skirt_bottom_y_m", 0.000),
@@ -246,8 +272,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             target_high_poly_faces=int(job.get("target_high_poly_faces") or 0),
             target_low_poly_faces=int(job.get("target_low_poly_faces") or 0),
         ),
-        masking=MaskingConfig(densify_masks=densify_masks, method=job.get("mask_method", "fused"),
-                              ai_view_stride=int(job.get("ai_view_stride", 2))),
+        masking=masking_config(job),
         rig_refine=RigRefineConfig(enabled=bool(job.get("rig_refine", True))),
         visual_hull=VisualHullConfig(
             enabled=bool(job.get("visual_hull", True)),
@@ -258,9 +283,15 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         glb_scale=job.get("glb_scale", 100.0),
         scale_stl_to_mm=job.get("scale_stl_to_mm", True),
         glb_draco=bool(job.get("glb_draco", True)),
+        stream_cache_dir=job.get("stream_cache") or None,
     )
 
     bg: Optional[LoggingProcessPool] = None
+    debug_parts: Optional[threading.Thread] = None
+    early_exports: Optional[EarlyExports] = None
+    out_zip: Dict[str, OutputZip] = {}
+    if job.get("debug_lite_parts"):
+        Path(job["debug_lite_parts"]).unlink(missing_ok=True)       # never the parts of an earlier run
     try:
         # ----------------------------------------------------------------------
         # STEP 1: Scan Images and Generate CameraInit SFM
@@ -326,6 +357,10 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             _check_tag_corrections(pose_q, config, telemetry)
             _check_lift(pose_q, config.turntable, n_levels, telemetry)
 
+        # The undistorted photos need only the intrinsics: beside the rig refinement and the masks (B1)
+        early_undistort = None if mock_openmvs else _start_early_undistort(
+            cameras_known_sfm, str(work_path / "undistorted"), workers)
+
         # ----------------------------------------------------------------------
         # STEP 2.1: Rigid per-(camera, level) correction from sparse object features (rig_refine.py)
         # ----------------------------------------------------------------------
@@ -337,11 +372,15 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         # ----------------------------------------------------------------------
         masks_out_dir = str(out_path / "masks")
         mask_hull: Optional[Dict[str, Any]] = None
-        ai_cache_dir = str(work_path / "ai_masks_cache")
+        # Streaming: the AI outputs of the crops computed while the photos arrived (same scan) are kept
+        ai_cache_dir = stream_cache.ai_dir(config.stream_cache_dir) or str(work_path / "ai_masks_cache")
         masks_src: Optional[str] = config.masks_dir or str(Path(input_dir) / "masks")
         if not Path(masks_src).is_dir():
             masks_src = None
 
+        if job.get("before_masks"):
+            # Streaming: the AI of the levels the pod pre-computed finishes first (RAM: one set of model workers)
+            job["before_masks"]()
         if config.use_masks and config.masking.enabled and config.masking.auto_generate:
             with telemetry.step("2.5. Automated Masking & Turntable Elimination"):
                 # Masks of an earlier scan with more photos would otherwise be picked up by name
@@ -351,8 +390,10 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                 if stale:
                     logger.info(f"Removed {len(stale)} mask file(s) of a previous run from {masks_out_dir}.")
                 if not mock_openmvs:
-                    # Model outputs of this scan only: the cache serves the second masking (wider cylinder)
-                    shutil.rmtree(ai_cache_dir, ignore_errors=True)
+                    # Model outputs of this scan only: the cache serves the second masking (wider cylinder). The
+                    # streaming cache belongs to this scan already (keyed on photo + crop box): kept
+                    if not config.stream_cache_dir:
+                        shutil.rmtree(ai_cache_dir, ignore_errors=True)
                     n_masks, mask_hull = _generate_masks(cameras_known_sfm, masks_out_dir, config, workers, telemetry,
                                                          ai_cache_dir)
                     masks_src = masks_out_dir
@@ -400,6 +441,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         colmap_dir = str(work_path / "colmap")
         undistorted_dir = str(work_path / "undistorted")
 
+        images_ready = _join_early_undistort(early_undistort, telemetry)
         with telemetry.step("3. Bridge SFM & Image Undistortion"):
             bridge = convert_sfm_to_colmap(
                 sfm_json_path=cameras_known_sfm,
@@ -410,6 +452,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                 workers=workers,
                 proxy_bounds=proxy_bounds,
                 blackout_background=config.masking.densify_masks == "blackout",
+                images_ready=images_ready,
             )
         telemetry.set_info(bridge={"masks_applied": bridge.get("masks_applied"), "proxy_bounds": proxy_bounds,
                                    "densify_masks": config.masking.densify_masks})
@@ -519,6 +562,9 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
 
             bg.submit("openmvs", run_metrics.openmvs_log_stats, str(openmvs_dir))
             bg.submit("raw_mesh", run_metrics.mesh_quality, raw_reconstructed_mesh, "raw")
+            if job.get("debug_lite_parts"):
+                # Large parts of the debug archive (raw mesh, masks, hull) while the mesh is cleaned and textured
+                debug_parts = _start_debug_parts(str(out_path), str(work_path), job["debug_lite_parts"])
 
             # ----------------------------------------------------------------------
             # STEP 5: Watertight Base Slicing & Mesh Cleaning (BEFORE Texturing!)
@@ -532,6 +578,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                     output_obj_path=cleaned_obj_path,
                     config=config.cleaning,
                     patch_hook=hook,
+                    binary_copies=True,       # PLY for texrecon, arrays for the texturing images (B5)
                 )
             _report_cleaning(clean_res, hook, telemetry)
 
@@ -580,6 +627,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                             max_gain_deviation=ti.max_gain_deviation,
                             tag_layout_path=config.turntable.tag_layout,
                             workers=ti.workers,
+                            mesh_arrays=clean_res.get("arrays_path"),
                         )
                         texturing_images_dir = prep["images_dir"]
                 except Exception as prep_err:
@@ -600,10 +648,12 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             # ----------------------------------------------------------------------
             if config.texturing_engine == "texrecon":
                 try:
+                    early_exports = EarlyExports(str(out_path), cleaned_obj_path, config, bg)
                     with telemetry.step("4.4 mvs-texturing (texrecon)"):
                         textured_obj_path, textured_low_obj_path = _run_texrecon(
                             config, cameras_known_sfm, cleaned_obj_path, cleaned_low_path, texturing_images_dir,
-                            out_path, job.get("mock_openmvs", False), telemetry)
+                            out_path, job.get("mock_openmvs", False), telemetry, early_exports,
+                            clean_res.get("ply_path"))
                 except Exception as tr_err:
                     logger.warning(
                         f"mvs-texturing failed ({tr_err}). Falling back to OpenMVS texturing."
@@ -720,6 +770,9 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                 make_zip=False,                  # built once, at the very end, with the final stats.json and logs
                 pool=bg,
                 print_high=print_high,
+                # the deliverables go into output.zip while their metrics are computed (B4)
+                on_files_ready=lambda: _start_output_zip(out_zip, str(out_path), config.zip_name),
+                early=early_exports,
             )
         if bg is not None:
             done = bg.results()
@@ -736,20 +789,25 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         telemetry.stop_sampling()
         run_log_handler.flush()
         telemetry.set_info(log_counters=run_metrics.log_counters(str(out_path / "run_log.txt")))
+        if config.stream_cache_dir:
+            telemetry.set_info(stream=dict(job.get("stream_info") or {}, cache_hits=stream_cache.stats()))
         telemetry.set_outcome("ok")
         stats_file = telemetry.save_json()
         telemetry.print_table()
 
-        # output.zip once, last, so it carries the final stats.json and the complete logs
+        # output.zip closed last, so it carries the final stats.json and the complete logs
         run_log_handler.flush()
-        zip_path = package_output_zip(
-            str(out_path), config.zip_name, stats_file,
+        if not out_zip:
+            _start_output_zip(out_zip, str(out_path), config.zip_name, run_async=False)
+        zip_path = out_zip.pop("zip").finish(
+            stats_file,
             collect_log_files(str(out_path), extra_dirs=[str(openmvs_dir)] if work_path != out_path else None),
         )
         bundle["zip_path"] = str(zip_path)
         bundle["zip_size_mb"] = round(zip_path.stat().st_size / (1024 * 1024), 2)
         telemetry.set_info(output_zip_mb=bundle["zip_size_mb"])
         stats_file = telemetry.save_json()
+        _join_debug_parts(debug_parts)
         detach_run_log(run_log_handler)
 
         return {
@@ -764,6 +822,14 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         logger.exception(f"Pipeline failed: {e}")
         if bg is not None:
             bg.shutdown(cancel=True)
+        if out_zip:                       # no half-written output.zip next to a failed run
+            z = out_zip.pop("zip")
+            try:
+                z.finish()
+            except Exception:
+                pass
+            z.path.unlink(missing_ok=True)
+        _join_debug_parts(debug_parts)
         telemetry.stop_sampling()
         telemetry.set_outcome("error", error_type=type(e).__name__, error=str(e)[:500],
                               failed_step=telemetry.current_step)
@@ -775,10 +841,81 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         raise
 
 
+def _start_early_undistort(cameras_known_sfm: str, undistorted_dir: str, workers: int) -> Dict[str, Any]:
+    """bridge_sfm.undistort_rgb_images in a thread (B1); the sfm is read now, before rig_refine rewrites it."""
+    state: Dict[str, Any] = {}
+    try:
+        with open(cameras_known_sfm, "r", encoding="utf-8") as f:
+            sfm = json.load(f)
+    except Exception as e:
+        logger.warning(f"Early undistortion not started ({e}).")
+        return state
+
+    def run() -> None:
+        t0 = time.time()
+        try:
+            state["images"] = undistort_rgb_images(sfm, undistorted_dir, max(1, workers // 2))
+        except Exception as e:
+            state["error"] = str(e)[:200]
+        state["seconds"] = round(time.time() - t0, 2)
+
+    state["thread"] = threading.Thread(target=run, name="undistort-rgb", daemon=True)
+    state["thread"].start()
+    return state
+
+
+def _join_early_undistort(state: Optional[Dict[str, Any]], telemetry: SystemTelemetry) -> bool:
+    """True when the undistorted photos are all written (otherwise step 3 writes them as before)."""
+    if not state or "thread" not in state:
+        return False
+    t0 = time.time()
+    state["thread"].join()
+    info = {k: state.get(k) for k in ("images", "seconds", "error") if state.get(k) is not None}
+    info["waited_s"] = round(time.time() - t0, 2)
+    telemetry.set_info(undistort_early=info)
+    if state.get("error"):
+        logger.warning(f"Early undistortion failed ({state['error']}): done in step 3.")
+        return False
+    return True
+
+
+def _start_output_zip(holder: Dict[str, OutputZip], out_dir: str, zip_name: str, run_async: bool = True) -> None:
+    """output.zip opened and, in a thread, filled with the deliverables already written (OutputZip)."""
+    z = OutputZip(out_dir, zip_name)
+    holder["zip"] = z
+    if run_async:
+        z.add_deliverables_async()
+
+
+def _start_debug_parts(out_dir: str, work_dir: str, parts_path: str) -> threading.Thread:
+    """debug_lite.build_debug_parts in a thread (B2); a failure only means runpod_job builds them at the end."""
+    from pipeline.debug_lite import build_debug_parts
+
+    def run() -> None:
+        try:
+            info = build_debug_parts(out_dir, work_dir, parts_path)
+            logger.info(f"Debug archive parts ready in the background: {info['parts']} part(s), {info['seconds']} s.")
+        except Exception as e:
+            logger.warning(f"Debug archive parts not built during the run ({e}).")
+            Path(parts_path).unlink(missing_ok=True)
+
+    t = threading.Thread(target=run, name="debug-parts", daemon=True)
+    t.start()
+    return t
+
+
+def _join_debug_parts(t: Optional[threading.Thread]) -> None:
+    if t is not None and t.is_alive():
+        t.join(timeout=300)
+
+
 def _run_texrecon(config: PipelineConfig, cameras_known_sfm: str, cleaned_obj_path: str,
                   cleaned_low_path: Optional[Path], images_dir: str, out_path: Path, mock: bool,
-                  telemetry: SystemTelemetry) -> Tuple[str, Optional[str]]:
+                  telemetry: SystemTelemetry, early: Optional[EarlyExports] = None,
+                  cleaned_ply: Optional[str] = None) -> Tuple[str, Optional[str]]:
     """
+    `cleaned_ply`: the cleaned mesh already converted to PLY (B5).
+    `early` (EarlyExports): the export of each model starts as soon as its texturing is done (B3).
     Step 4.4: texrecon on the high- and the low-poly mesh. The .cam scene is written once and both run at the same
     time (the low poly in texrecon/low/: texrecon refuses a "tmp" folder it did not make) when the RAM allows; the
     low-poly run takes ~20-45 s that no longer add up. A failed high-poly run raises (TextureMesh fallback); a failed
@@ -787,16 +924,26 @@ def _run_texrecon(config: PipelineConfig, cameras_known_sfm: str, cleaned_obj_pa
     tr_runner = TexReconRunner(config=config.texrecon, work_dir=str(out_path / "texrecon"))
     tr_runner.prepare_scene(cameras_known_sfm, images_dir)
 
+    def started(kind: str, path: str) -> str:
+        if early is not None:
+            try:
+                (early.start_high if kind == "high" else early.start_low)(path)
+            except Exception as e:      # the export at the end does it then
+                logger.warning(f"Early {kind}-poly export not started ({e}).")
+        return path
+
     def high() -> str:
-        return tr_runner.run_texturing(
+        return started("high", tr_runner.run_texturing(
             sfm_data_path=cameras_known_sfm, input_mesh_path=cleaned_obj_path, images_folder=images_dir,
-            out_prefix=str(out_path / "texrecon" / "model_textured"), mock_mode=mock, scene_ready=True)[0]
+            out_prefix=str(out_path / "texrecon" / "model_textured"), mock_mode=mock, scene_ready=True,
+            mesh_ply=cleaned_ply)[0])
 
     def low() -> str:
         logger.info("Running branching texturing on low-poly mesh (texrecon)...")
-        return tr_runner.run_texturing(
+        return started("low", tr_runner.run_texturing(
             sfm_data_path=cameras_known_sfm, input_mesh_path=str(cleaned_low_path), images_folder=images_dir,
-            out_prefix=str(out_path / "texrecon" / "low" / "model_textured_low"), mock_mode=mock, scene_ready=True)[0]
+            out_prefix=str(out_path / "texrecon" / "low" / "model_textured_low"), mock_mode=mock,
+            scene_ready=True)[0])
 
     if not (cleaned_low_path and Path(cleaned_low_path).is_file()):
         return high(), None
@@ -924,13 +1071,7 @@ def _generate_masks(cameras_known_sfm: str, masks_out_dir: str, config: Pipeline
     use_ai = m.method in ("ai", "fused") and ai_model_available(m.ai_model_path)
     if m.method in ("ai", "fused") and not use_ai:
         logger.warning(f"AI mask model not available ({m.ai_model_path} or onnxruntime missing): photometric masks.")
-    ai_workers = workers
-    if use_ai:
-        # Each worker holds the model (~3 GB peak) and uses ai_threads threads
-        res = describe_resources()
-        by_cpu = max(1, int(res["cpus"]) // max(1, m.ai_threads))
-        by_ram = max(1, int((float(res["ram_free_gb"]) - 4.0) // m.ai_ram_per_worker_gb))
-        ai_workers = max(1, min(workers, by_cpu, by_ram))
+    ai_workers = ai_mask_workers(m, workers) if use_ai else workers
 
     def run(views: List[Dict[str, Any]]) -> Tuple[Dict[str, str], Dict[str, Any]]:
         stats: Dict[str, Any] = {}
@@ -977,9 +1118,10 @@ def _generate_masks(cameras_known_sfm: str, masks_out_dir: str, config: Pipeline
             chroma_threshold=m.chroma_threshold, brightness_white_threshold=m.brightness_white_threshold,
             tag_blackout=m.tag_blackout, tag_expansion_factor=m.tag_expansion_factor, workers=ai_workers,
             ai_model=m.ai_model_path, ai_resolution=m.ai_resolution, ai_threads=m.ai_threads,
-            ai_cache_dir=ai_cache_dir, stats=stats)
+            ai_cache_dir=ai_cache_dir, stats=stats, median_cache_dir=config.stream_cache_dir)
         info.update(views_model=len(cams), methods=stats.get("methods"), seconds=stats.get("seconds"),
-                    model_s_per_view=stats.get("model_s_per_view"))
+                    model_s_per_view=stats.get("model_s_per_view"), model_runs=stats.get("model_runs"),
+                    ai_cache_hits=stats.get("ai_cache_hits"))
         check = _check_masks_against_hull(cams, masks_out_dir, config, telemetry)
         info["hull_check"] = check
     elif stride == 1:
@@ -1089,6 +1231,7 @@ def _refine_rig(cameras_known_sfm: str, config: PipelineConfig, out_path: Path, 
                 cameras_known_sfm, config.turntable.name_regex, config.rig_refine, workers=workers,
                 report_path=str(out_path / "rig_refine.json"),
                 backup_sfm=str(out_path / "cameras_known_tags.sfm"),
+                feature_cache=config.stream_cache_dir,
             )
         telemetry.set_info(rig_refine={k: res.get(k) for k in (
             "accepted", "reason", "holdout_before", "holdout_after", "max_rotation_deg", "max_translation_mm",

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import io
 import logging
+import time
 import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -56,8 +57,49 @@ def _small_mask(path: Path) -> Optional[bytes]:
     return buf.tobytes() if ok else None
 
 
-def build_debug_lite(output_dir: str, work_dir: str, zip_path: str, max_mb: float = 60.0) -> Dict[str, Any]:
-    """Writes the archive; returns {"path", "size_mb", "parts": [...], "skipped": [...]}."""
+def _heavy_parts(out: Path, work: Path):
+    """(name, bytes, compress) of the large parts, built lazily: hull, refinement points, raw mesh, masks."""
+    for d in (work, out):
+        if (d / "visual_hull.npz").is_file():
+            yield "visual_hull.npz", (d / "visual_hull.npz").read_bytes(), False
+            break
+    if (work / "debug_lite" / "refine_points.npz").is_file():
+        yield "refine_points.npz", (work / "debug_lite" / "refine_points.npz").read_bytes(), False
+    for d in (work / "openmvs", out / "openmvs"):
+        if d.is_dir():
+            yield "raw_mesh.drc", _raw_mesh_draco(d), False
+            break
+    masks = sorted((out / "masks").glob("*.mask.png")) if (out / "masks").is_dir() else []
+    for m in masks:
+        yield f"masks/{m.name}", _small_mask(m), False
+
+
+def build_debug_parts(output_dir: str, work_dir: str, parts_path: str, max_mb: float = 60.0) -> Dict[str, Any]:
+    """
+    The large parts alone (raw mesh, masks, hull, refinement points), built by main.py in a thread right after
+    ReconstructMesh while the mesh is cleaned and textured (B2: off the critical path). build_debug_lite(...,
+    parts_zip=) then only adds the small files of the finished run.
+    """
+    t0 = time.time()
+    zp = Path(parts_path)
+    zp.parent.mkdir(parents=True, exist_ok=True)
+    budget, total, n = int(max_mb * 1024 * 1024), 0, 0
+    with zipfile.ZipFile(zp, "w", compression=zipfile.ZIP_STORED) as zf:
+        for name, data, _ in _heavy_parts(Path(output_dir), Path(work_dir)):
+            if data is None or total + len(data) > budget:
+                continue
+            zf.writestr(name, data)
+            total += len(data)
+            n += 1
+    return {"path": str(zp), "parts": n, "seconds": round(time.time() - t0, 1)}
+
+
+def build_debug_lite(output_dir: str, work_dir: str, zip_path: str, max_mb: float = 60.0,
+                     parts_zip: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Writes the archive; returns {"path", "size_mb", "parts": [...], "skipped": [...]}. `parts_zip`: the large parts
+    already built by build_debug_parts (same content; built here when missing or unreadable).
+    """
     out, work = Path(output_dir), Path(work_dir)
     budget = int(max_mb * 1024 * 1024)
     parts: List[str] = []
@@ -65,6 +107,12 @@ def build_debug_lite(output_dir: str, work_dir: str, zip_path: str, max_mb: floa
     zp = Path(zip_path)
     zp.parent.mkdir(parents=True, exist_ok=True)
     total = [0]
+    prebuilt = None
+    if parts_zip and Path(parts_zip).is_file():
+        try:
+            prebuilt = zipfile.ZipFile(parts_zip)
+        except zipfile.BadZipFile:
+            logger.warning("Debug: prebuilt parts unreadable, building them again.")
     with zipfile.ZipFile(zp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         def add(name: str, data: Optional[bytes], compress: bool = True) -> None:
             if data is None:
@@ -81,19 +129,13 @@ def build_debug_lite(output_dir: str, work_dir: str, zip_path: str, max_mb: floa
                 if (base / name).is_file():
                     add(name, (base / name).read_bytes())
                     break
-        for d in (work, out):
-            if (d / "visual_hull.npz").is_file():
-                add("visual_hull.npz", (d / "visual_hull.npz").read_bytes(), compress=False)
-                break
-        if (work / "debug_lite" / "refine_points.npz").is_file():
-            add("refine_points.npz", (work / "debug_lite" / "refine_points.npz").read_bytes(), compress=False)
-        for d in (work / "openmvs", out / "openmvs"):
-            if d.is_dir():
-                add("raw_mesh.drc", _raw_mesh_draco(d), compress=False)
-                break
-        masks = sorted((out / "masks").glob("*.mask.png")) if (out / "masks").is_dir() else []
-        for m in masks:
-            add(f"masks/{m.name}", _small_mask(m), compress=False)
+        if prebuilt is not None:
+            with prebuilt:
+                for name in prebuilt.namelist():
+                    add(name, prebuilt.read(name), compress=False)
+        else:
+            for name, data, compress in _heavy_parts(out, work):
+                add(name, data, compress)
     size_mb = round(zp.stat().st_size / (1024 * 1024), 2)
     if skipped:
         logger.warning(f"Debug archive over {max_mb:.0f} MB: {len(skipped)} part(s) left out.")

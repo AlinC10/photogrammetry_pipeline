@@ -553,13 +553,33 @@ def mesh_warnings(res: Dict[str, Any], config: MeshCleaningConfig) -> List[Dict[
     return out
 
 
+def _write_binary_copies(mesh: trimesh.Trimesh, obj_path: Path) -> Dict[str, str]:
+    """<obj>.ply and <obj>.npz from the mesh parsed back from the OBJ (see clean_and_repair_mesh binary_copies)."""
+    out: Dict[str, str] = {}
+    try:
+        ply = obj_path.with_suffix(".ply")
+        mesh.export(str(ply))                    # before anything is computed on it: same bytes as the conversion
+        out["ply_path"] = str(ply)
+        npz = obj_path.with_suffix(".npz")
+        np.savez(str(npz), vertices=np.asarray(mesh.vertices, np.float64), faces=np.asarray(mesh.faces, np.int64))
+        out["arrays_path"] = str(npz)
+    except Exception as e:
+        logger.warning(f"Binary copies of the cleaned mesh not written ({e}); the OBJ is read instead.")
+    return out
+
+
 def clean_and_repair_mesh(
     input_obj_path: str,
     output_obj_path: str,
     config: MeshCleaningConfig,
     patch_hook=None,
+    binary_copies: bool = False,
 ) -> Dict[str, Any]:
     """
+    `binary_copies` (B5, plans/PLAN_STREAMING_DAG.md): the cleaned mesh as parsed back from the OBJ written here is
+    also saved as <name>.ply (the exact bytes texrecon_runner's OBJ -> PLY conversion writes) and <name>.npz (float64
+    vertices, int64 faces: what texture_prep reads from the OBJ), so the texturing steps skip parsing the OBJ text.
+    res["ply_path"] / res["arrays_path"] name them (absent when not written).
     Raw photogrammetry mesh -> closed high-poly mesh (the one texrecon, STL / 3MF and the low-poly decimation use):
     1. the object pieces by position (select_object_components), not the largest piece;
     2. holes near the base closed, then the planar cut, all base loops capped (seal_watertight_pedestal);
@@ -696,6 +716,8 @@ def clean_and_repair_mesh(
 
         # Re-check watertightness with trimesh
         final_check = trimesh.load(str(out_p), process=False)
+        if binary_copies:
+            report.update(_write_binary_copies(final_check, out_p))
         is_watertight = bool(final_check.is_watertight)
         if is_watertight and final_check.volume is not None:
             volume_cm3 = round(float(final_check.volume) * 1e6, 2)
