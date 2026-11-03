@@ -62,6 +62,9 @@ def scan_row(folder: Path, names: Dict[str, str], check_stl: bool = False) -> Op
         "faces_high": obj.get("faces_high"),
         "warnings": sorted({w.get("code", "?") for w in warnings if isinstance(w, dict)}),
         "time_s": stats.get("total_execution_time_sec"),
+        "time_until_capture_s": stats.get("time_until_capture_done_s") or (cloud.get("pod_timings_s") or {}).get("time_until_capture_done_s"),
+        "time_after_capture_s": stats.get("time_after_capture_done_s") or (cloud.get("pod_timings_s") or {}).get("time_after_capture_done_s"),
+        "total_time_s": stats.get("total_time_s") or (cloud.get("pod_timings_s") or {}).get("total_time_s"),
         "cost_usd": cloud.get("cost_estimate"),
         "state": status.get("state"),
     }

@@ -167,6 +167,8 @@ class OpenMVSConfig:
     keep_depth_maps: bool = False     # False: depth*.dmap (~74 MB each at level 1) are deleted after fusion
     smooth_mesh: int = 2              # OpenMVS ReconstructMesh --smooth (default 2)
     min_point_distance: float = 0.5   # ReconstructMesh --min-point-distance, in pixels (OpenMVS default 2.5)
+    refine_mesh_enabled: bool = True  # Photo-consistency RefineMesh after ReconstructMesh
+    refine_resolution_level: int = 1  # RefineMesh image downscale (1 = 2x)
     texture_resolution: int = 4096    # high-res texture atlas
     low_poly_texture_res: int = 2048  # low-poly texture atlas
     empty_color: int = 0              # 0 = black (prevents neon orange on unobserved/bottom faces)
@@ -199,18 +201,11 @@ class OpenMVSConfig:
 @dataclass
 class TurntableConfig:
     """Turntable geometry and camera rig configuration."""
-    turntable_poses_script: str = field(
-        default_factory=lambda: os.environ.get("TURNTABLE_POSES_PATH")
-        or str(Path(__file__).resolve().parent / "turntable_poses.py")
-    )
-    tag_layout: Optional[str] = field(
-        default_factory=lambda: str(Path(__file__).resolve().parent / "platan_260mm_layout.json")
-    )
+    turntable_poses_script: str = str(Path(__file__).resolve().parent / "turntable_poses.py")
+    tag_layout: Optional[str] = str(Path(__file__).resolve().parent / "platan_345mm_layout.json")
     step_deg: float = 18.0            # 20 steps per full 360 rotation
-    # Print scale of the tag sheet (measured / designed). The sheet of this rig came out of the printer at ~98 %
-    # ("fit to page"): disc 255 instead of 260 mm, tags 0-6 196 instead of 200 mm, Parkside 221.5 mm vs 226.9 mm
-    # modelled at 1.0. Set 1.0 for a sheet printed at actual size.
-    tag_scale: float = 0.98
+    # Print scale of the tag sheet (measured / designed). The 345mm disc is calibrated at 0.99 (2.97 cm measured tag vs 3.00 cm design).
+    tag_scale: float = 0.99
     name_regex: str = r"(?P<level>\d)[_]?(?P<index>\d{1,4})$"
     sensor_width_mm: float = DEFAULT_SENSOR_WIDTH_MM
     default_focal_mm: float = DEFAULT_FOCAL_LENGTH_MM
@@ -243,7 +238,7 @@ class MeshCleaningConfig:
     target_high_poly_faces: int = 0       # 0 = use high_poly_ratio
     target_low_poly_faces: int = 0        # 0 = use low_poly_ratio
     smooth_iterations: int = 12       # Taubin volume-preserving smoothing (eliminates 2-4mm ripples)
-    high_poly_smooth_iterations: int = 5 # Taubin steps for high-poly (smooths 200um noise without loss of detail)
+    high_poly_smooth_iterations: int = 5 # Taubin steps for high-poly (smooths 200um-1mm noise without loss of detail)
     # Holes closed once, on the high poly (mesh_cleaner.fill_holes_with_fairing): up to this many edges per hole,
     # then a few Laplacian steps on the patch. 0 = old behaviour (holes up to 30 edges, no fairing)
     max_hole_edges: int = 2000

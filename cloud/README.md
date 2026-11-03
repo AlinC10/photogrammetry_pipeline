@@ -101,8 +101,9 @@ level). The scanner writes, under `jobs/<id>/input/`:
 On `capture_done.json` the pod downloads what is missing, keeps exactly the listed photos and runs the pipeline with
 the caches; the results are those of a normal run (only the time changes). No new photo for `STREAM_IDLE_S` (420 s)
 without `capture_done.json` → `status.json` `input_error` ("capture abandoned"); `cancel.json` → `cancelled`.
-`status.json` gets `"stream"` (photos, capture time, pre-work per level) and `timings_s.wait_after_capture_s`
-(capture_done seen → status.json). Without `"stream"` the job runs as before. The pod RAM is chosen before the number
+`status.json` gets `"stream"` (photos, capture time, pre-work per level) and three key execution timings in `timings_s`:
+`time_until_capture_done_s` (pod start → capture_done received), `time_after_capture_done_s` (alias `wait_after_capture_s`: capture_done → finished),
+and `total_time_s` (total pod duration). These three properties are also recorded in `stats.json`. Without `"stream"` the job runs as before. The pod RAM is chosen before the number
 of photos is known: the launcher plans it for `2 × (360 / step_deg) × max_levels` photos.
 
 ## Debug archive (optional, separate bucket)

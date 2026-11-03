@@ -129,7 +129,10 @@ def background_model(I: np.ndarray, M: np.ndarray, disc_zone: np.ndarray, D: np.
     k7 = np.ones((7, 7), np.uint8)
     d_min = 0.33 + 0.67 * cv2.erode(D, k7) / 255.0
     d_max = 0.33 + 0.67 * cv2.dilate(D, k7) / 255.0
-    obj_disc = (chroma > 45) | (r < 0.30 * d_min) | (r > 1.2 * d_max + 0.05)
+    dark_on_paper = (d_min > 0.75) & (r < 0.68)
+    dark_on_tag = (d_min <= 0.75) & (r < 0.20 * d_min)
+    bright_on_tag = r > (1.2 * d_max + 0.05)
+    obj_disc = (chroma > 35) | dark_on_paper | dark_on_tag | bright_on_tag
     # Booth: difference to the median where the median is clearly the booth
     med_ok = (M.mean(2) > 110) & ((M.max(2) - M.min(2)) < 25)
     diff = cv2.GaussianBlur(np.abs(I - M).max(2), (5, 5), 0)
@@ -182,6 +185,33 @@ def keep_touching(mask: np.ndarray, region: np.ndarray) -> np.ndarray:
         return mask.astype(bool)
     keep = np.zeros(n, bool)
     keep[hit] = True
+    return keep[lab]
+
+
+def keep_touching_or_roi(mask: np.ndarray, region: np.ndarray, roi: np.ndarray, min_isolated_area: int = 30) -> np.ndarray:
+    """
+    Components of `mask` that touch `region` (the object stands on the disc), OR components that lie safely
+    inside `roi` with sufficient area (e.g. screwdriver handle separated from base by a thin metallic shaft).
+    Excludes components touching the image border unless they touch `region`.
+    """
+    n, lab, st, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    if n <= 1:
+        return mask.astype(bool)
+    hit = np.unique(lab[region & mask])
+    hit_set = set(hit[hit > 0])
+    h, w = mask.shape[:2]
+    border = np.zeros((h, w), bool)
+    border[0, :] = border[-1, :] = border[:, 0] = border[:, -1] = True
+    keep = np.zeros(n, bool)
+    for i in range(1, n):
+        if i in hit_set:
+            keep[i] = True
+            continue
+        area = st[i, cv2.CC_STAT_AREA]
+        if area >= min_isolated_area:
+            comp = (lab == i)
+            if not np.any(comp & border) and not np.any(comp & ~roi):
+                keep[i] = True
     return keep[lab]
 
 
@@ -352,8 +382,8 @@ def _phase1(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     # 2.5x the area of the box grown without that band (a long object reaching over the rim: remote control)
     seed = drop_small_components(obj & roi, 20, 0.2)
     seed_d = cv2.dilate(seed.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0 if seed.any() else zone
-    rough_s = keep_touching(drop_small_components((obj | (photometric & ~(near & ~zone))) & roi, 20, 0.2), seed_d)
-    rough_l = keep_touching(drop_small_components((obj | photometric) & roi, 20, 0.2), seed_d)
+    rough_s = keep_touching_or_roi(drop_small_components((obj | (photometric & ~(near & ~zone))) & roi, 20, 0.2), seed_d, roi)
+    rough_l = keep_touching_or_roi(drop_small_components((obj | photometric) & roi, 20, 0.2), seed_d, roi)
     box_s, box_l = crop_box(rough_s, w, h), crop_box(rough_l, w, h)
     area = lambda b: max(1, (b[2] - b[0]) * (b[3] - b[1]))
     rough, box = (rough_l, box_l) if area(box_l) <= 2.5 * area(box_s) else (rough_s, box_s)

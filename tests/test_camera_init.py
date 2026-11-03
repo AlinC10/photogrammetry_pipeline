@@ -27,8 +27,8 @@ class TestTurntablePosesCommand(unittest.TestCase):
         self.assertEqual(float(self._opt(cmd, "--liftMm")), 80.0)
         self.assertEqual(self._opt(cmd, "--estimateLift"), "False")
         self.assertEqual(self._opt(cmd, "--tagRefine"), "True")
-        # the rig's tag sheet was printed at ~98 %
-        self.assertAlmostEqual(float(self._opt(cmd, "--tagScale")), 0.98)
+        # the 345mm rig's tag sheet was printed and measured at ~99 % (2.97 cm vs 3.00 cm)
+        self.assertAlmostEqual(float(self._opt(cmd, "--tagScale")), 0.99)
         self.assertNotIn("--intrinsicsIn", cmd)
 
     def test_custom_options(self):

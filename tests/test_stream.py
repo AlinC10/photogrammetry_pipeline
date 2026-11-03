@@ -245,11 +245,17 @@ class TestPodStreamingEndToEnd(unittest.TestCase):
             self.assertEqual(status["state"], "ok")
             self.assertEqual(status["stream"]["photos"], len(photos))
             self.assertIn("wait_after_capture_s", status["timings_s"])
+            self.assertIn("time_until_capture_done_s", status["timings_s"])
+            self.assertIn("time_after_capture_done_s", status["timings_s"])
+            self.assertIn("total_time_s", status["timings_s"])
             progress = r2.get_json(r2.output_key("js", "progress.json"), BUCKET, client=s3)
             self.assertIsNotNone(progress)
             stats = json.loads(zipfile.ZipFile(io.BytesIO(s3.objects[(BUCKET, r2.output_key("js", "output.zip"))]))
                                .read("stats.json"))
             self.assertEqual(stats["run_info"]["stream"]["photos"], len(photos))
+            self.assertIn("total_time_s", stats)
+            self.assertIn("time_until_capture_done_s", stats)
+            self.assertIn("time_after_capture_done_s", stats)
 
     def test_pod_reports_cancel(self):
         import runpod_job

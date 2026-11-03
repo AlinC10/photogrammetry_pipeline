@@ -476,6 +476,72 @@ class TestCloudScanTool(unittest.TestCase):
         self.assertTrue(seen["cancelled"])
         self.assertEqual(report["result"], "failed")
 
+    def test_stream_args_parsed(self):
+        with mock.patch.object(self.tool, "run_interruptible",
+                               return_value={"job_id": "j", "timings_s": {}, "result": "ok"}):
+            code = self.tool.main(["--dry_run", "--stream", "--stream_delay=0.1"])
+            self.assertEqual(code, 0)
+
+
+class TestStreamingFlow(unittest.TestCase):
+    def setUp(self):
+        self.s3 = FakeS3()
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+
+    def test_stream_helpers(self):
+        from cloud.job import stream_n_images, plan_stream_job, write_capture_done, write_cancel
+        self.assertEqual(stream_n_images(18.0, 4), 160)
+        plan = plan_stream_job(160)
+        self.assertEqual(plan["n_images"], 160)
+        self.assertTrue(plan["stream"])
+        self.assertGreater(plan["min_ram_gb"], 0)
+
+        keys = ["jobs/j1/input/rig/0/f_1000.jpg", "jobs/j1/input/rig/1/f_1000.jpg", "jobs/j1/input/rig/0/f_2000.jpg"]
+        done = write_capture_done("j1", keys, step_deg=18.0, bucket=BUCKET, client=self.s3)
+        self.assertEqual(done["n_images"], 3)
+        self.assertEqual(done["levels"], [1, 2])
+        self.assertIn("jobs/j1/input/capture_done.json", {k for (_, k) in self.s3.objects})
+
+        ok = write_cancel("j1", bucket=BUCKET, client=self.s3)
+        self.assertTrue(ok)
+        self.assertIn("jobs/j1/input/cancel.json", {k for (_, k) in self.s3.objects})
+
+    def test_stream_upload_photos(self):
+        from PIL import Image
+        from cloud.job import stream_upload_photos
+        files = {}
+        for cam in ("0", "1"):
+            for lvl in (1, 2):
+                p = self.tmp / "rig" / cam / f"f_{lvl}000.jpg"
+                p.parent.mkdir(parents=True, exist_ok=True)
+                Image.fromarray(np.zeros((10, 10, 3), np.uint8)).save(p)
+                files[f"rig/{cam}/f_{lvl}000.jpg"] = str(p)
+
+        res = stream_upload_photos("jstream", files, BUCKET, client=self.s3)
+        self.assertFalse(res["cancelled"])
+        self.assertEqual(len(res["uploaded"]), 4)
+        keys = {k for (_, k) in self.s3.objects}
+        self.assertIn("jobs/jstream/input/level_done_1.json", keys)
+        self.assertIn("jobs/jstream/input/level_done_2.json", keys)
+        self.assertIn("jobs/jstream/input/capture_done.json", keys)
+
+    def test_stream_upload_cancellation(self):
+        import threading
+        from PIL import Image
+        from cloud.job import stream_upload_photos
+        cancel = threading.Event()
+        cancel.set()
+        files = {}
+        p = self.tmp / "rig" / "0" / "f_1000.jpg"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(np.zeros((10, 10, 3), np.uint8)).save(p)
+        files["rig/0/f_1000.jpg"] = str(p)
+
+        res = stream_upload_photos("jcancel", files, BUCKET, client=self.s3, cancel_event=cancel)
+        self.assertTrue(res["cancelled"])
+        self.assertIn("jobs/jcancel/input/cancel.json", {k for (_, k) in self.s3.objects})
+
 
 if __name__ == "__main__":
     unittest.main()

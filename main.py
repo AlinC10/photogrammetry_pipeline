@@ -107,9 +107,16 @@ from pipeline.texture_prep import prepare_texturing_images
 
 def turntable_config(job: Dict[str, Any]) -> TurntableConfig:
     """Turntable / pose options of a job (also used by the streaming pre-work, pipeline/stream_prework.py)."""
+    layout = job.get("tag_layout") or TurntableConfig.tag_layout
+    tag_scale_val = job.get("tag_scale")
+    if tag_scale_val is None:
+        tag_scale = 0.98 if (layout and "260" in str(layout)) else 0.99
+    else:
+        tag_scale = float(tag_scale_val)
     return TurntableConfig(
+        tag_layout=layout,
         step_deg=job.get("step_deg", 18.0),
-        tag_scale=float(job.get("tag_scale", TurntableConfig.tag_scale)),
+        tag_scale=tag_scale,
         default_focal_mm=job.get("focal_length_mm", 3.9),
         lift_mm=float(job.get("lift_mm", TurntableConfig.lift_mm)),
         estimate_lift=None if job.get("estimate_lift") in (None, "auto") else bool(job["estimate_lift"]),
@@ -120,8 +127,23 @@ def turntable_config(job: Dict[str, Any]) -> TurntableConfig:
 
 def masking_config(job: Dict[str, Any]) -> MaskingConfig:
     """Masking options of a job (also used by the streaming pre-work)."""
-    return MaskingConfig(densify_masks=job.get("densify_masks", "blackout"), method=job.get("mask_method", "fused"),
-                         ai_view_stride=int(job.get("ai_view_stride", 2)))
+    layout = job.get("tag_layout") or TurntableConfig.tag_layout
+    is_260 = bool(layout and "260" in str(layout))
+    cyl_r = job.get("cylinder_radius_m")
+    if cyl_r is None:
+        cyl_r = 0.080 if is_260 else 0.130
+    disc_r = job.get("disc_radius_m")
+    if disc_r is None:
+        disc_r = 0.127 if is_260 else 0.170
+    wide_cyl_r = 0.095 if is_260 else 0.138
+    return MaskingConfig(
+        densify_masks=job.get("densify_masks", "blackout"),
+        method=job.get("mask_method", "fused"),
+        ai_view_stride=int(job.get("ai_view_stride", 2)),
+        cylinder_radius_m=float(cyl_r),
+        wide_cylinder_radius_m=float(wide_cyl_r),
+        disc_radius_m=float(disc_r),
+    )
 
 
 def ai_mask_workers(m: MaskingConfig, workers: int) -> int:
@@ -166,7 +188,10 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
     telemetry.on_step_done = job.get("on_step_done")      # runpod_job.py: progress.json for the scanner
     telemetry.start_sampling(interval_sec=0.2)
     if job.get("stream_info"):
-        telemetry.set_info(stream=dict(job["stream_info"]))
+        stream_meta = dict(job["stream_info"])
+        if job.get("capture_done_at") and job.get("started_at") and "time_until_capture_done_s" not in stream_meta:
+            stream_meta["time_until_capture_done_s"] = round(float(job["capture_done_at"]) - float(job["started_at"]), 2)
+        telemetry.set_info(stream=stream_meta)
 
     resources = describe_resources()
     workers = resolve_workers(job.get("workers"))
@@ -223,6 +248,8 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
     if data_term not in TEXRECON_DATA_TERMS:
         raise ValueError(f"data_term must be one of {TEXRECON_DATA_TERMS} (texrecon rejects anything else), got '{data_term}'")
 
+    layout = job.get("tag_layout") or TurntableConfig.tag_layout
+
     # Build Configuration
     config = PipelineConfig(
         input_dir=input_dir,
@@ -258,6 +285,8 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             outlier_threshold=job.get("outlier_threshold", 0.0),
             global_seam_leveling=job.get("global_seam_leveling", 0),
             local_seam_leveling=job.get("local_seam_leveling", 1),
+            refine_mesh_enabled=bool(job.get("refine_mesh", True)),
+            refine_resolution_level=int(job.get("refine_resolution_level", 1)),
             max_threads=resources["cpus"],
             keep_depth_maps=bool(job.get("keep_depth_maps", False)),
         ),
@@ -265,7 +294,8 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         cleaning=MeshCleaningConfig(
             slice_y_m=job.get("slice_y_m", 0.003),
             skirt_bottom_y_m=job.get("skirt_bottom_y_m", 0.000),
-            max_radius_m=job.get("max_radius_m", 0.12),
+            max_radius_m=job.get("max_radius_m", 0.12 if (layout and "260" in str(layout)) else 0.160),
+            rim_radius_m=job.get("rim_radius_m", 0.115 if (layout and "260" in str(layout)) else 0.155),
             high_poly_ratio=float(job.get("high_poly_ratio", 0.75)),
             low_poly_ratio=float(job.get("low_poly_ratio", 0.2)),
             low_poly_max_faces=int(job.get("low_poly_max_faces", 50000)),
@@ -560,6 +590,23 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
                 else:
                     raw_reconstructed_mesh = str(openmvs_dir / "scene_mesh.ply")
 
+            # ----------------------------------------------------------------------
+            # STEP 4.5: OpenMVS RefineMesh (Photo-consistency surface regularizer)
+            # ----------------------------------------------------------------------
+            if config.openmvs.refine_mesh_enabled and raw_reconstructed_mesh and Path(raw_reconstructed_mesh).is_file():
+                with telemetry.step("4.5 OpenMVS RefineMesh"):
+                    try:
+                        refined_ply = runner.run_refine_mesh(
+                            input_mvs="scene_dense.mvs",
+                            mesh_file=raw_reconstructed_mesh,
+                            output_mvs="scene_mesh_refined.mvs",
+                        )
+                        if refined_ply and Path(refined_ply).is_file() and Path(refined_ply).stat().st_size > 0:
+                            logger.info(f"Using refined mesh geometry: {refined_ply}")
+                            raw_reconstructed_mesh = refined_ply
+                    except Exception as rf_err:
+                        logger.warning(f"RefineMesh failed ({rf_err}); continuing with raw reconstructed mesh.")
+
             bg.submit("openmvs", run_metrics.openmvs_log_stats, str(openmvs_dir))
             bg.submit("raw_mesh", run_metrics.mesh_quality, raw_reconstructed_mesh, "raw")
             if job.get("debug_lite_parts"):
@@ -789,8 +836,18 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         telemetry.stop_sampling()
         run_log_handler.flush()
         telemetry.set_info(log_counters=run_metrics.log_counters(str(out_path / "run_log.txt")))
-        if config.stream_cache_dir:
-            telemetry.set_info(stream=dict(job.get("stream_info") or {}, cache_hits=stream_cache.stats()))
+        if config.stream_cache_dir or job.get("stream_info"):
+            stream_meta = dict(job.get("stream_info") or {})
+            now = time.time()
+            if job.get("capture_done_at"):
+                t_after = round(now - float(job["capture_done_at"]), 2)
+                stream_meta["time_after_capture_done_s"] = t_after
+                stream_meta["wait_after_capture_s"] = t_after
+            if job.get("started_at"):
+                stream_meta["total_time_s"] = round(now - float(job["started_at"]), 2)
+            if config.stream_cache_dir:
+                stream_meta["cache_hits"] = stream_cache.stats()
+            telemetry.set_info(stream=stream_meta)
         telemetry.set_outcome("ok")
         stats_file = telemetry.save_json()
         telemetry.print_table()
@@ -1476,7 +1533,7 @@ def parse_args():
     lift.add_argument("--no_estimate_lift", dest="estimate_lift", action="store_const", const=False, help="Trust --lift_mm instead of estimating the lift")
     parser.add_argument("--no_tag_refine", action="store_true", help="Disable turntable_poses --tagRefine (per-tag paper unevenness)")
     parser.add_argument("--intrinsics_in", default=None, help="Chessboard intrinsics JSON from calibrate_intrinsics.py, passed to turntable_poses --intrinsicsIn")
-    parser.add_argument("--tag_scale", type=float, default=TurntableConfig.tag_scale, help="Print scale of the tag sheet: measured / designed distance (e.g. 0-6 centres: measured mm / 200), passed to turntable_poses --tagScale (default 0.98: this rig's sheet; 1.0 for a sheet printed at actual size)")
+    parser.add_argument("--tag_scale", type=float, default=None, help="Print scale of the tag sheet: measured / designed distance (e.g. 0.99 for 345mm disc, 0.98 for 260mm disc; default: automatic by layout)")
     parser.add_argument("--workers", type=int, default=0, help="Parallel workers for masks, undistortion and texturing images (0 = automatic from CPUs and free RAM; env TURNTABLE_WORKERS)")
     parser.add_argument("--work_dir", default=None, help="Fast directory for undistorted images and OpenMVS files (default: output_dir; env TURNTABLE_WORK_DIR)")
     parser.add_argument("--keep_depth_maps", action="store_true", help="Keep OpenMVS depth*.dmap after fusion (~74 MB per image at level 1)")
@@ -1488,6 +1545,10 @@ def parse_args():
     parser.add_argument("--no_visual_hull_refine", action="store_true", help="Keep the hull for the proxy volume, but feed ReconstructMesh the plain DensifyPointCloud output")
     parser.add_argument("--visual_hull_voxel_mm", type=float, default=1.5, help="Voxel size of the visual hull in mm (default: 1.5)")
     parser.add_argument("--densify_masks", choices=list(DENSIFY_MASK_MODES), default="blackout", help="How DensifyPointCloud sees the masks: 'blackout' (background pixels set to 0, default), 'mask_path' (unchanged images + --mask-path), 'none'")
+    parser.add_argument("--no_refine_mesh", action="store_true", help="Disable OpenMVS RefineMesh surface refinement before cleaning")
+    parser.add_argument("--tag_layout", default=None, help="Custom tag layout JSON (e.g. pipeline/platan_345mm_layout.json)")
+    parser.add_argument("--cylinder_radius_m", type=float, default=None, help="Object cylinder radius in metres (default 0.08 for 260mm disc, 0.13 for 345mm disc)")
+    parser.add_argument("--disc_radius_m", type=float, default=None, help="Turntable disc radius in metres (default 0.127 for 260mm disc, 0.170 for 345mm disc)")
     parser.add_argument("--mock_openmvs", action="store_true", help="Simulate OpenMVS for fast testing")
     return parser.parse_args()
 
@@ -1515,6 +1576,10 @@ def main():
         "tag_refine": not args.no_tag_refine,
         "intrinsics_in": args.intrinsics_in,
         "tag_scale": args.tag_scale,
+        "tag_layout": args.tag_layout,
+        "cylinder_radius_m": args.cylinder_radius_m,
+        "disc_radius_m": args.disc_radius_m,
+        "refine_mesh": not args.no_refine_mesh,
         "workers": args.workers,
         "work_dir": args.work_dir,
         "keep_depth_maps": args.keep_depth_maps,

@@ -202,10 +202,10 @@ def stream_inputs(job_id: str, bucket: str, client, dest: Path, on_photo=None, o
 
 def upload_outputs(out_client, bucket: str, job_id: str, status: dict, before_status=None) -> None:
     """
-    output.zip, stats.json, run_log.txt (whatever exists), then status.json last: the completion signal.
-    `before_status()`: runs after the files and before status.json (waits for the debug archive upload).
+    output.zip, run_log.txt, stats.json, then status.json last: the completion signal.
+    `before_status()`: runs before uploading stats.json and status.json (waits for debug archive upload and finalizes timings).
     """
-    for name in ("output.zip", "stats.json", "run_log.txt"):
+    for name in ("output.zip", "run_log.txt"):
         path = OUTPUT_DIR / name
         if path.is_file():
             ok = r2.upload_file(str(path), bucket, r2.output_key(job_id, name), client=out_client)
@@ -214,6 +214,10 @@ def upload_outputs(out_client, bucket: str, job_id: str, status: dict, before_st
                 status.update(state="pipeline_error", error="output.zip upload failed")
     if before_status is not None:
         before_status()
+    stats_path = OUTPUT_DIR / "stats.json"
+    if stats_path.is_file():
+        ok = r2.upload_file(str(stats_path), bucket, r2.output_key(job_id, "stats.json"), client=out_client)
+        logger.info(f"Upload stats.json: {'ok' if ok else 'FAILED'}")
     r2.put_json(status, r2.output_key(job_id, "status.json"), bucket, client=out_client)
 
 
@@ -313,14 +317,18 @@ def main() -> int:
                                 on_level=prework.level_marker, progress=progress)
             prework.capture_done()
             capture_done_at = got["capture_done_at"]
+            time_until_capture_done_s = round(capture_done_at - started, 2)
             stream_info = {"photos": got["photos"], "pod_ready_before_first_photo_s":
                            round(got["first_photo_at"] - started, 2) if got["first_photo_at"] else None,
                            "capture_s": round(got["last_photo_at"] - got["first_photo_at"], 2)
                            if got["first_photo_at"] and got["last_photo_at"] else None,
                            "capture_done_after_last_photo_s":
-                           round(capture_done_at - (got["last_photo_at"] or capture_done_at), 2)}
+                           round(capture_done_at - (got["last_photo_at"] or capture_done_at), 2),
+                           "time_until_capture_done_s": time_until_capture_done_s}
             timings["stream_wait"] = round(time.time() - t0, 2)
-            logger.info(f"Streaming: {got['photos']} photos, capture_done after {timings['stream_wait']} s")
+            timings["time_until_capture_done_s"] = time_until_capture_done_s
+            logger.info(f"Streaming: {got['photos']} photos, capture_done after {timings['stream_wait']} s "
+                        f"(until capture_done: {time_until_capture_done_s} s)")
         else:
             keys = r2.download_job_images(job_id, str(INPUT_DIR), bucket, client=in_client)
             capture_done_at = None
@@ -345,6 +353,7 @@ def main() -> int:
     from pipeline.resources import InsufficientRamError, describe_resources
 
     pipeline_job = dict(job)
+    pipeline_job.setdefault("tag_layout", str(Path(__file__).resolve().parent / "pipeline/platan_345mm_layout.json"))
     pipeline_job.update(input_dir=str(INPUT_DIR), output_dir=str(OUTPUT_DIR), work_dir=str(WORK_DIR),
                         rig_mode=bool(job.get("rig_mode", (INPUT_DIR / "rig").is_dir())),
                         ram_margin=float(os.environ.get("RAM_MARGIN", job.get("ram_margin", 1.0))))
@@ -356,6 +365,7 @@ def main() -> int:
 
         stream_cache.stats(reset=True)
         pipeline_job.update(stream_cache=str(STREAM_CACHE_DIR), stream_info=stream_info,
+                            capture_done_at=capture_done_at, started_at=started,
                             before_masks=lambda: prework.wait_levels(timeout=300))
     status["resources"] = describe_resources()
     try:
@@ -386,11 +396,39 @@ def main() -> int:
         def before_status() -> None:
             if debug_thread is not None:
                 debug_thread.join(timeout=600)
-            timings["total"] = round(time.time() - started, 2)
+            now = time.time()
+            total_time_s = round(now - started, 2)
+            time_after_capture_done_s = round(now - capture_done_at, 2) if capture_done_at is not None else None
+            time_until_capture_done_s = round(capture_done_at - started, 2) if capture_done_at is not None else None
+
+            timings["total"] = total_time_s
+            timings["total_time_s"] = total_time_s
             if capture_done_at is not None:
-                # main indicator of the streaming mode: last photo announced -> model delivered
-                timings["wait_after_capture_s"] = round(time.time() - capture_done_at, 2)
+                # main indicators of the streaming mode
+                timings["wait_after_capture_s"] = time_after_capture_done_s
+                timings["time_after_capture_done_s"] = time_after_capture_done_s
+                timings["time_until_capture_done_s"] = time_until_capture_done_s
             status["timings_s"] = timings
+
+            stats_path = OUTPUT_DIR / "stats.json"
+            if stats_path.is_file():
+                try:
+                    s_data = json.loads(stats_path.read_text(encoding="utf-8"))
+                    s_data["total_time_s"] = total_time_s
+                    if time_until_capture_done_s is not None:
+                        s_data["time_until_capture_done_s"] = time_until_capture_done_s
+                    if time_after_capture_done_s is not None:
+                        s_data["time_after_capture_done_s"] = time_after_capture_done_s
+                    if "stream" in s_data.get("run_info", {}):
+                        if time_until_capture_done_s is not None:
+                            s_data["run_info"]["stream"]["time_until_capture_done_s"] = time_until_capture_done_s
+                        if time_after_capture_done_s is not None:
+                            s_data["run_info"]["stream"]["time_after_capture_done_s"] = time_after_capture_done_s
+                            s_data["run_info"]["stream"]["wait_after_capture_s"] = time_after_capture_done_s
+                        s_data["run_info"]["stream"]["total_time_s"] = total_time_s
+                    stats_path.write_text(json.dumps(s_data, indent=2), encoding="utf-8")
+                except Exception as e:
+                    logger.warning(f"Could not update stats.json with final timings: {e}")
 
         status["timings_s"] = timings
         if prework is not None:

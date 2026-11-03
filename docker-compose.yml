@@ -28,7 +28,7 @@ services:
       # Undistorted images + OpenMVS depth maps (~9 GB): a Docker volume is much faster than a
       # Windows folder bind-mounted through WSL. Logs, reports and deliverables still land in ./output.
       - turntable_work:/tmp/turntable_work
-    command: ["--input_dir", "/workspace/input_images", "--output_dir", "/workspace/output", "--rig_mode", "--texturing_engine", "texrecon", "--focal_length_mm", "3.9"]
+    command: ["--input_dir", "/workspace/input_images", "--output_dir", "/workspace/output", "--rig_mode", "--texturing_engine", "texrecon", "--focal_length_mm", "3.9", "--tag_layout", "pipeline/platan_345mm_layout.json"]
 
 volumes:
   turntable_work:

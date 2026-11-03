@@ -46,4 +46,7 @@ plans
 to_delete
 teste/
 
+# Modele ONNX (descărcate în imaginea docker la build)
+*.onnx
+
 count_loc.py

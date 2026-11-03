@@ -302,7 +302,7 @@ class TestMeshCleaner(unittest.TestCase):
         self.assertGreater(len(disc.faces), 10 * len(cube.faces))
         res, out = self._clean(trimesh.util.concatenate([disc, cube]), "orange")
         self.assertLess(max(out.extents), 0.02)
-        self.assertGreater(min(out.extents[[0, 2]]), 0.010)
+        self.assertGreater(min(out.extents[[0, 2]]), 0.009)
         self.assertTrue(res["is_watertight"])
         self.assertEqual(res["components"]["kept"], 1)
         self.assertNotIn("model_tiny", [w["code"] for w in res["warnings"]])

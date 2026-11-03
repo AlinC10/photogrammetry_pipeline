@@ -103,7 +103,13 @@ def select_object_components(mesh: trimesh.Trimesh, slice_y: float, rim_radius: 
         keep = [max(parts, key=lambda p: p["faces"])]
         info["no_piece_above_cut"] = True
     else:
-        keep = [p for p in parts if p["score"] >= keep_ratio * best]
+        keep = [
+            p for p in parts
+            if (p["score"] >= keep_ratio * best)
+            or (p["score"] >= 0.05 * best and p["faces"] >= 3000
+                and p["r_median_mm"] < rim_radius * 1000 * 0.70
+                and p["y_min_mm"] <= (slice_y + 0.025) * 1000)
+        ]
     dropped = sorted((p for p in parts if not any(p is k for k in keep)), key=lambda p: -p["faces"])
     kept = keep[0]["mesh"] if len(keep) == 1 else trimesh.util.concatenate([k["mesh"] for k in keep])
     info.update(kept=len(keep), faces_kept=int(len(kept.faces)),

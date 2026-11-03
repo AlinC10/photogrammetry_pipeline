@@ -386,7 +386,8 @@ class SystemTelemetry:
     def summary(self) -> Dict[str, Any]:
         """Compiles the full telemetry dataset into a structured dictionary."""
         total_wall_sec = round(time.time() - self.start_wall_time, 2)
-        return {
+        stream = self.run_info.get("stream") or {}
+        res = {
             "schema_version": STATS_SCHEMA_VERSION,
             "run_id": self.run_id,
             "started_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.start_wall_time)),
@@ -407,6 +408,13 @@ class SystemTelemetry:
             "steps": [asdict(s) for s in self.steps],
             "exported_models": [asdict(m) for m in self.mesh_metrics],
         }
+        if stream.get("time_until_capture_done_s") is not None:
+            res["time_until_capture_done_s"] = stream["time_until_capture_done_s"]
+        if stream.get("time_after_capture_done_s") is not None:
+            res["time_after_capture_done_s"] = stream["time_after_capture_done_s"]
+        if stream.get("total_time_s") is not None:
+            res["total_time_s"] = stream["total_time_s"]
+        return res
 
     def save_json(self, out_path: Optional[str] = None) -> str:
         """Saves telemetry summary to stats.json."""

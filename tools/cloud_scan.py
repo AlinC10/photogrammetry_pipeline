@@ -64,7 +64,7 @@ PIPELINE_OPTIONS = {
     "keep_depth_maps", "ram_margin", "min_point_distance", "target_high_poly_faces", "visual_hull",
     "visual_hull_refine", "visual_hull_voxel_mm", "densify_masks", "high_poly_ratio", "low_poly_ratio",
     "low_poly_max_faces", "glb_draco", "title",
-    "description",
+    "description", "refine_mesh", "tag_layout", "cylinder_radius_m", "disc_radius_m",
 }
 
 
@@ -147,6 +147,12 @@ def main(argv=None) -> int:
     ap.add_argument("--no_estimate_lift", action="store_true",
                     help="use --lift_mm instead of estimating the lift (default: estimated when there are >= 2 levels)")
     ap.add_argument("--lift_mm", type=float, default=80.0, help="lift the scanner commands per level (mm)")
+    ap.add_argument("--stream", action="store_true",
+                    help="start the pod together with photo upload and stream photos to R2 one by one")
+    ap.add_argument("--stream_delay", type=float, default=0.0,
+                    help="delay in seconds between photos in streaming mode (simulates scanner capture)")
+    ap.add_argument("--tag_layout", default="pipeline/platan_345mm_layout.json",
+                    help="Tag layout JSON for turntable (default: pipeline/platan_345mm_layout.json)")
     ap.add_argument("--set", action="append", metavar="KEY=VALUE", help="any run_pipeline option (repeatable)")
     args = ap.parse_args(argv)
 
@@ -158,6 +164,7 @@ def main(argv=None) -> int:
         "resolution_level": args.resolution_level,
         "lift_mm": args.lift_mm,
         "texturing_engine": "texrecon",
+        "tag_layout": args.tag_layout,
     }
     if args.no_estimate_lift:
         options["estimate_lift"] = False
@@ -190,6 +197,8 @@ def main(argv=None) -> int:
         image=args.image, dry_run=args.dry_run, skip_upload=args.skip_upload, keep_remote=args.keep_remote,
         min_vcpu=args.min_vcpu,
         delete_stale_after_s=None if args.keep_old_jobs else 0.0,
+        stream=args.stream,
+        stream_delay_s=args.stream_delay,
     )
     report["timings_s"]["total"] = round(time.time() - t0, 2)
 
@@ -203,7 +212,12 @@ def main(argv=None) -> int:
         if not pod.get("terminated"):
             print(f"   !!! pod {pod['pod_id']} could NOT be confirmed terminated: check https://console.runpod.io/pods")
     if report.get("pod_timings_s"):
-        print(f"   in the pod: {json.dumps(report['pod_timings_s'])}")
+        pt = report["pod_timings_s"]
+        t_before = pt.get("time_until_capture_done_s") or pt.get("stream_wait")
+        t_after = pt.get("time_after_capture_done_s") or pt.get("wait_after_capture_s")
+        t_total = pt.get("total_time_s") or pt.get("total")
+        print(f"   pod timings: until capture_done: {t_before}s | after capture_done: {t_after}s | total: {t_total}s")
+        print(f"   in the pod: {json.dumps(pt)}")
     if report.get("results_dir"):
         dest = Path(report["results_dir"])
         print(f"   results: {dest}")

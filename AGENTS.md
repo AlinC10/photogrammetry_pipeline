@@ -82,7 +82,7 @@ To prevent dark patches, Poisson bleeding, and micro-confetti texture atlases:
 - `--empty-color 0`: Fills unobserved faces (e.g. flat cut bottom) and empty atlas areas with clean black (`RGB 0,0,0`), not neon orange.
 
 ### RULE 9: Testing & Documentation Integrity
-- All unit tests in `tests/` (186 at the time of writing) must pass before any commit.
+- All unit tests in `tests/` (190 at the time of writing) must pass before any commit.
 - Preserve existing docstrings, comments, and structure.
 
 ---
@@ -125,10 +125,11 @@ turntable_studio/
 │   ├── turntable_poses.py      # AprilTag disc detection and rigid pose calculation (LOCKED)
 │   ├── rig_refine.py           # Per-(camera, level) rigid correction from sparse SIFT features, hold-out guarded
 │   ├── platan_260mm_layout.json# 260mm disc tag layout coordinates
+│   ├── platan_345mm_layout.json# 345mm disc tag layout coordinates (12 tags, 30mm, 307mm opposite dist)
 │   ├── bridge_sfm.py           # SFM-to-COLMAP bridge, OpenCV undistortion, proxy 3D points
 │   ├── visual_hull.py          # Volume carved from the masks: proxy bounds, scene_dense.ply prune + fill before ReconstructMesh,
 │   │                           #   ambiguous cone over the disc (AI masks keep it), hull silhouettes for skipped views
-│   ├── openmvs_runner.py       # Cross-platform CLI runner for OpenMVS binaries
+│   ├── openmvs_runner.py       # Cross-platform CLI runner for OpenMVS binaries (Densify, Reconstruct, RefineMesh)
 │   ├── mesh_cleaner.py         # Planar slicing, skirt extrusion, Ear-Clipping base capping
 │   ├── mesh_masks.py           # Vectorised rasterizer: mesh silhouette / face-id buffers from locked poses
 │   ├── texture_prep.py         # texturing_images/: PNG, background exactly 0, mesh masks, per-camera colour gains
@@ -138,6 +139,9 @@ turntable_studio/
 │   ├── mask_processor.py       # Masks: BiRefNet_lite 512 ONNX on the CPU (white parts, through-holes) or photometric
 │   │                           #   fallback; masking cylinder + tag blackout
 │   ├── mask_fusion.py          # Fused masks (default): AI on a crop + per-(camera, level) background median + the disc
+│   │                           #   rendered from tag layout; keeps floating upper parts (screwdriver) & metallic base (spray)
+│   ├── debug_lite.py           # Debug archive of a scan (raw mesh Draco, masks 1/4, hull, refine points, small files)
+│   └── calibrate_intrinsics.py # Chessboard/Charuco camera matrix calibration
 │   │                           #   rendered from the tag layout; disc out of the masks, no missed view
 │   ├── debug_lite.py           # Debug archive of a scan (raw mesh Draco, masks 1/4, hull, refine points, small files)
 │   └── calibrate_intrinsics.py # Chessboard/Charuco camera matrix calibration
