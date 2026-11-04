@@ -84,7 +84,7 @@ def component_report(mesh: trimesh.Trimesh, slice_y: float, rim_radius: float) -
     return out
 
 
-def select_object_components(mesh: trimesh.Trimesh, slice_y: float, rim_radius: float = 0.115,
+def select_object_components(mesh: trimesh.Trimesh, slice_y: float, rim_radius: float = 0.155,
                              keep_ratio: float = 0.25, label: str = "") -> Tuple[trimesh.Trimesh, Dict[str, Any]]:
     """
     The object by position, not by size (G1/P7 of the 01.11 audit): a piece counts by its vertices ABOVE the cut and
@@ -600,7 +600,7 @@ def clean_and_repair_mesh(
 
     logger.info(f"Loading mesh for cleaning: {in_p}")
     raw_mesh = trimesh.load(str(in_p), process=False)
-    rim = getattr(config, "rim_radius_m", 0.115)
+    rim = getattr(config, "rim_radius_m", 0.155)
     report: Dict[str, Any] = {"raw_faces": int(len(raw_mesh.faces)) if hasattr(raw_mesh, "faces") else None}
 
     # 1. The object pieces (the old "keep the largest" kept the disc of the orange piece 094944)

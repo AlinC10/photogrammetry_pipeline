@@ -323,7 +323,7 @@ def _ai_on_crop(task: Dict[str, Any], cam: Dict[str, Any], I: np.ndarray, full_i
     prob_q = cv2.resize(prob, (q1 - q0, p1 - p0), interpolation=cv2.INTER_AREA)
     full_q = np.zeros((hq, wq), np.float32)
     full_q[p0:p1, q0:q1] = prob_q[:hq - p0, :wq - q0]
-    ai = drop_small_components((full_q >= 0.5) & roi, 20, 0.2)
+    ai = drop_small_components((full_q >= 0.5) & roi, 20, 0.005)
     off = ai & ~zone
     sides = []
     pe, qe = min(p1, hq) - 1, min(q1, wq) - 1
@@ -380,10 +380,12 @@ def _phase1(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     # photometric test. Across the dark band around the disc rim the growth can reach the rails (phone lying near
     # the rim: a crop of the whole photo, model missed the phone), so it is used only when its box stays within
     # 2.5x the area of the box grown without that band (a long object reaching over the rim: remote control)
-    seed = drop_small_components(obj & roi, 20, 0.2)
+    # Light 1D vertical close bridges specular glare cuts on steel shafts/pins:
+    obj_closed = cv2.morphologyEx(obj.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((5, 1), np.uint8)) > 0
+    seed = drop_small_components(obj_closed & roi, 20, 0.005)
     seed_d = cv2.dilate(seed.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0 if seed.any() else zone
-    rough_s = keep_touching_or_roi(drop_small_components((obj | (photometric & ~(near & ~zone))) & roi, 20, 0.2), seed_d, roi)
-    rough_l = keep_touching_or_roi(drop_small_components((obj | photometric) & roi, 20, 0.2), seed_d, roi)
+    rough_s = keep_touching_or_roi(drop_small_components((obj_closed | (photometric & ~(near & ~zone))) & roi, 20, 0.005), seed_d, roi)
+    rough_l = keep_touching_or_roi(drop_small_components((obj_closed | photometric) & roi, 20, 0.005), seed_d, roi)
     box_s, box_l = crop_box(rough_s, w, h), crop_box(rough_l, w, h)
     area = lambda b: max(1, (b[2] - b[0]) * (b[3] - b[1]))
     rough, box = (rough_l, box_l) if area(box_l) <= 2.5 * area(box_s) else (rough_s, box_s)

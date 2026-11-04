@@ -244,7 +244,7 @@ class MeshCleaningConfig:
     max_hole_edges: int = 2000
     hole_fairing_steps: int = 5
     base_band_m: float = 0.015            # holes with a border this low are closed BEFORE the cut (G2)
-    rim_radius_m: float = 0.115           # pieces beyond this radius are the disc rim, not the object
+    rim_radius_m: float = 0.155           # pieces beyond this radius are the disc rim, not the object (for 345mm platter)
 
 
 @dataclass

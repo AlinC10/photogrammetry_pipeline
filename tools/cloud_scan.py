@@ -196,7 +196,7 @@ def main(argv=None) -> int:
         input_dir=args.input_dir, results_dir=args.results_dir, job_id=job_id, pipeline_options=options,
         image=args.image, dry_run=args.dry_run, skip_upload=args.skip_upload, keep_remote=args.keep_remote,
         min_vcpu=args.min_vcpu,
-        delete_stale_after_s=None if args.keep_old_jobs else 0.0,
+        delete_stale_after_s=None if args.keep_old_jobs else 7200.0,
         stream=args.stream,
         stream_delay_s=args.stream_delay,
     )

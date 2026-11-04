@@ -212,7 +212,7 @@ def proxy_bounds_from_hull(
     hull: Optional[Dict[str, Any]],
     cylinder_radius_m: float,
     cylinder_y_max_m: float,
-    margin_m: float = 0.010,
+    margin_m: float = 0.025,
 ) -> Dict[str, float]:
     """
     Volume for bridge_sfm.generate_proxy_3d_points: the hull box plus a margin, never larger than the masking
