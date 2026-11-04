@@ -131,7 +131,7 @@ def masking_config(job: Dict[str, Any]) -> MaskingConfig:
     is_260 = bool(layout and "260" in str(layout))
     cyl_r = job.get("cylinder_radius_m")
     if cyl_r is None:
-        cyl_r = 0.080 if is_260 else 0.130
+        cyl_r = 0.080 if is_260 else 0.138
     disc_r = job.get("disc_radius_m")
     if disc_r is None:
         disc_r = 0.127 if is_260 else 0.170
@@ -285,7 +285,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             outlier_threshold=job.get("outlier_threshold", 0.0),
             global_seam_leveling=job.get("global_seam_leveling", 0),
             local_seam_leveling=job.get("local_seam_leveling", 1),
-            refine_mesh_enabled=bool(job.get("refine_mesh", True)),
+            refine_mesh_enabled=bool(job.get("refine_mesh", False)),
             refine_resolution_level=int(job.get("refine_resolution_level", 1)),
             max_threads=resources["cpus"],
             keep_depth_maps=bool(job.get("keep_depth_maps", False)),
@@ -307,7 +307,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         visual_hull=VisualHullConfig(
             enabled=bool(job.get("visual_hull", True)),
             refine_cloud=bool(job.get("visual_hull_refine", True)),
-            voxel_m=float(job.get("visual_hull_voxel_mm", 1.5)) / 1000.0,
+            voxel_m=float(job.get("visual_hull_voxel_mm", 1.5)) / 1000.0 if job.get("visual_hull_voxel_mm") is not None else 0.0015,
         ),
         export_scale=job.get("export_scale", 1000.0),
         glb_scale=job.get("glb_scale", 100.0),
@@ -339,6 +339,11 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         inputs = run_metrics.input_stats(camera_init_sfm, name_regex)
         telemetry.set_info(inputs=inputs)
         n_levels = int((inputs or {}).get("n_levels") or 1)
+        n_images = int((inputs or {}).get("n_images") or len(views))
+        if job.get("visual_hull_voxel_mm") is None and config.visual_hull.enabled:
+            config.visual_hull.voxel_m = 0.0025 if n_images >= 80 else 0.0015
+            logger.info(f"Visual hull voxel size: {config.visual_hull.voxel_m * 1000:.1f} mm "
+                        f"({'adaptive for ' + str(n_images) + ' views' if n_images >= 80 else 'standard'}).")
         if config.turntable.estimate_lift is None:
             config.turntable.estimate_lift = n_levels >= 2
             logger.info(f"Lift per level: {'estimated from the photos' if n_levels >= 2 else 'not used'} "
@@ -1543,9 +1548,10 @@ def parse_args():
     parser.add_argument("--no_rig_refine", action="store_true", help="Keep the tag poses as they are (no per-camera, per-level correction from sparse object features)")
     parser.add_argument("--no_visual_hull", action="store_true", help="Do not carve the visual hull (proxy points use the fixed volume, no cloud refinement)")
     parser.add_argument("--no_visual_hull_refine", action="store_true", help="Keep the hull for the proxy volume, but feed ReconstructMesh the plain DensifyPointCloud output")
-    parser.add_argument("--visual_hull_voxel_mm", type=float, default=1.5, help="Voxel size of the visual hull in mm (default: 1.5)")
+    parser.add_argument("--visual_hull_voxel_mm", type=float, default=None, help="Voxel size of the visual hull in mm (default: adaptive, 1.5 mm for <=40 views, 2.5 mm for >=80 views)")
     parser.add_argument("--densify_masks", choices=list(DENSIFY_MASK_MODES), default="blackout", help="How DensifyPointCloud sees the masks: 'blackout' (background pixels set to 0, default), 'mask_path' (unchanged images + --mask-path), 'none'")
-    parser.add_argument("--no_refine_mesh", action="store_true", help="Disable OpenMVS RefineMesh surface refinement before cleaning")
+    parser.add_argument("--refine_mesh", action="store_true", default=False, help="Enable OpenMVS RefineMesh surface refinement before cleaning (disabled by default for speed)")
+    parser.add_argument("--no_refine_mesh", action="store_true", help="Legacy flag: RefineMesh is now disabled by default")
     parser.add_argument("--tag_layout", default=None, help="Custom tag layout JSON (e.g. pipeline/platan_345mm_layout.json)")
     parser.add_argument("--cylinder_radius_m", type=float, default=None, help="Object cylinder radius in metres (default 0.08 for 260mm disc, 0.13 for 345mm disc)")
     parser.add_argument("--disc_radius_m", type=float, default=None, help="Turntable disc radius in metres (default 0.127 for 260mm disc, 0.170 for 345mm disc)")
@@ -1579,7 +1585,7 @@ def main():
         "tag_layout": args.tag_layout,
         "cylinder_radius_m": args.cylinder_radius_m,
         "disc_radius_m": args.disc_radius_m,
-        "refine_mesh": not args.no_refine_mesh,
+        "refine_mesh": bool(args.refine_mesh and not args.no_refine_mesh),
         "workers": args.workers,
         "work_dir": args.work_dir,
         "keep_depth_maps": args.keep_depth_maps,

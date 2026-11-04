@@ -167,7 +167,11 @@ def fuse_masks(ai: np.ndarray, obj: np.ndarray, strong: np.ndarray, unreliable: 
         kd = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * disc_tolerance_px + 1, 2 * disc_tolerance_px + 1))
         near_obj = np.where(disc_zone, cv2.dilate((obj & roi).astype(np.uint8), kd) > 0, near_obj)
     fused = roi & ((ai & (near_obj | unreliable)) | (strong & roi))
-    fused = drop_small_components(fused, max(30, int(0.002 * roi.sum())))
+    # 1D vertical close bridges specular glare cuts on steel shafts/pins
+    fused_closed = cv2.morphologyEx(fused.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((7, 1), np.uint8)) > 0
+    # Safe minimum area: keep small/thin features (shafts, pins, antennas) down to 20 px
+    min_comp_area = min(20, max(10, int(0.0002 * roi.sum())))
+    fused = drop_small_components(fused_closed, min_comp_area, rel_to_largest=0.005)
     return cv2.morphologyEx(fused.astype(np.uint8), cv2.MORPH_CLOSE, k) > 0
 
 

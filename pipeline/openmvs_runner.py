@@ -308,8 +308,9 @@ class OpenMVSRunner:
             bin_path,
             str(in_file),
             "-o", str(out_file),
-            "--resolution-level", str(getattr(self.config, "refine_resolution_level", 1)),
-            "--max-face-area", "64",
+            "--resolution-level", str(getattr(self.config, "refine_resolution_level", 2)),
+            "--max-face-area", str(getattr(self.config, "refine_max_face_area", 256)),
+            "--scales", str(getattr(self.config, "refine_scales", 1)),
             "-v", "2",
         ]
         # ReconstructMesh (v2.3) leaves the surface in scene_mesh.ply next to a mesh-less .mvs

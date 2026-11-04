@@ -289,13 +289,29 @@ def main() -> int:
                 client=out_client)
 
     done = threading.Event()
+    capture_done_holder: List[Optional[float]] = [None]
 
     def watchdog():
-        if not done.wait(max(60.0, max_runtime - WATCHDOG_MARGIN_S - (time.time() - started))):
-            logger.error("Watchdog: runtime cap reached, reporting timeout.")
-            upload_outputs(out_client, bucket, job_id, {"state": "timeout", "job_id": job_id, "started_at": started,
-                                                         "elapsed_s": round(time.time() - started, 1)})
-            os._exit(3)
+        # In streaming mode, photo capture can take 8-15 minutes on the rig before capture_done.json.
+        # The pipeline calculation deserves its full computation budget without being cut short
+        # by the physical rotation time of the scanner.
+        while not done.wait(5.0):
+            now = time.time()
+            elapsed = now - started
+            cd_at = capture_done_holder[0]
+            if cd_at is not None:
+                pipeline_elapsed = now - cd_at
+                limit_pipeline = max_runtime
+                if pipeline_elapsed >= limit_pipeline - WATCHDOG_MARGIN_S:
+                    logger.error(f"Watchdog: pipeline computation cap reached ({pipeline_elapsed:.1f}s after capture_done), reporting timeout.")
+                    upload_outputs(out_client, bucket, job_id, {"state": "timeout", "job_id": job_id, "started_at": started,
+                                                                 "elapsed_s": round(elapsed, 1)})
+                    os._exit(3)
+            elif elapsed >= max_runtime - WATCHDOG_MARGIN_S:
+                logger.error(f"Watchdog: streaming input wait cap reached ({elapsed:.1f}s), reporting timeout.")
+                upload_outputs(out_client, bucket, job_id, {"state": "timeout", "job_id": job_id, "started_at": started,
+                                                             "elapsed_s": round(elapsed, 1)})
+                os._exit(3)
 
     threading.Thread(target=watchdog, daemon=True).start()
 
@@ -317,6 +333,7 @@ def main() -> int:
                                 on_level=prework.level_marker, progress=progress)
             prework.capture_done()
             capture_done_at = got["capture_done_at"]
+            capture_done_holder[0] = capture_done_at
             time_until_capture_done_s = round(capture_done_at - started, 2)
             stream_info = {"photos": got["photos"], "pod_ready_before_first_photo_s":
                            round(got["first_photo_at"] - started, 2) if got["first_photo_at"] else None,

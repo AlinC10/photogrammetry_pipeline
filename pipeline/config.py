@@ -167,8 +167,10 @@ class OpenMVSConfig:
     keep_depth_maps: bool = False     # False: depth*.dmap (~74 MB each at level 1) are deleted after fusion
     smooth_mesh: int = 2              # OpenMVS ReconstructMesh --smooth (default 2)
     min_point_distance: float = 0.5   # ReconstructMesh --min-point-distance, in pixels (OpenMVS default 2.5)
-    refine_mesh_enabled: bool = True  # Photo-consistency RefineMesh after ReconstructMesh
-    refine_resolution_level: int = 1  # RefineMesh image downscale (1 = 2x)
+    refine_mesh_enabled: bool = False  # Disabled by default: ReconstructMesh produces high-fidelity clean surfaces; RefineMesh adds 4-7 min with excessive decimation
+    refine_resolution_level: int = 2  # Fast RefineMesh image downscale when enabled (2 = 4x, runs in <40s)
+    refine_max_face_area: int = 256   # Target max face area in pixels (prevents vertex explosion)
+    refine_scales: int = 1            # Single scale iteration (prevents multi-scale slowdown)
     texture_resolution: int = 4096    # high-res texture atlas
     low_poly_texture_res: int = 2048  # low-poly texture atlas
     empty_color: int = 0              # 0 = black (prevents neon orange on unobserved/bottom faces)
@@ -272,8 +274,8 @@ class MaskingConfig:
     """Settings for automated background matting, silhouette masking, and turntable disc elimination."""
     enabled: bool = True
     auto_generate: bool = True               # Automatically generate masks from 3D cylinder + chroma
-    cylinder_radius_m: float = 0.080         # Radial bounding cylinder (80 mm); 35 mm cut the Parkside tool (max radius 38.7 mm)
-    # Used when the hull reaches cylinder_radius_m (object off centre or wider): out to the disc rim (127 mm)
+    cylinder_radius_m: float = 0.080         # Radial bounding cylinder (80 mm for 260mm platter; 138 mm for 345mm)
+    # Used when the hull reaches cylinder_radius_m (object off centre or wider): out to the disc rim
     wide_cylinder_radius_m: float = 0.125
     cylinder_y_min_m: float = 0.001          # Base cut 1.0 mm above turntable (matches slice_y_m = 1.0 mm)
     cylinder_y_max_m: float = 0.350          # Maximum object height 350 mm (the Parkside tool alone is 230 mm)
@@ -306,7 +308,7 @@ class MaskingConfig:
     min_hull_agreement: float = 0.75
     max_excluded_share: float = 0.25
     excluded_views: list = field(default_factory=list)   # set by the masking step (view ids)
-    disc_radius_m: float = 0.127             # turntable top (260 mm design x 0.98 print): rays landing beyond see the booth
+    disc_radius_m: float = 0.170             # turntable top (345 mm platter): rays landing beyond see the booth
     # How DensifyPointCloud sees the masks: "blackout" = background pixels of undistorted/ set to 0 (default),
     # "mask_path" = images unchanged + --mask-path/--ignore-mask-label 0, "none" = images unchanged, no masks
     densify_masks: str = "blackout"
@@ -319,7 +321,7 @@ class VisualHullConfig:
     refine_cloud: bool = True                # Prune wrong depths inside it and fill bare surfaces before ReconstructMesh
     voxel_m: float = 0.0015                  # 1.5 mm voxels: ~15 s for 120 views
     min_bg_votes: int = 2                    # Views that must see a voxel as background to remove it
-    proxy_margin_m: float = 0.010            # Margin around the hull box for the proxy points
+    proxy_margin_m: float = 0.050            # Margin around the hull box for the proxy points (prevents trimming thin/tall features)
     prune_depth_m: float = 0.005             # Points deeper than this inside the hull ...
     prune_max_views: int = 3                 # ... and fused from at most this many views are dropped
     fill: bool = True                        # Append hull surface points where no MVS point is left

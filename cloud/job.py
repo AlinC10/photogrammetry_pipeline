@@ -351,7 +351,8 @@ def run_cloud_job(
                 raise r2.R2Error(f"{len(missing)} photo(s) missing in R2, not starting a pod: {missing[:5]}")
             say("All photos are in R2.")
 
-    ttl = int(rp.POD_MAX_RUNTIME_S)
+    base_ttl = int(options.get("pod_max_runtime_s") or rp.POD_MAX_RUNTIME_S)
+    ttl = max(base_ttl, 3600 if stream else 1800)
     job_spec = dict(options, job_id=job_id)
     job_spec.setdefault("tag_layout", "pipeline/platan_345mm_layout.json")
 
