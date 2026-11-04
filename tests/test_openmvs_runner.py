@@ -10,7 +10,8 @@ from pathlib import Path
 
 import numpy as np
 
-from pipeline.openmvs_runner import textured_ply_to_obj
+from pipeline.config import OpenMVSConfig
+from pipeline.openmvs_runner import OpenMVSRunner, textured_ply_to_obj
 
 
 def write_textured_ply(path, vertices, faces, uvs, texnumbers, textures):
@@ -49,6 +50,50 @@ class TestTexturedPlyToObj(unittest.TestCase):
             mtl = (Path(tmp) / "scene_texture.mtl").read_text()
             self.assertIn("newmtl material_1", mtl)
             self.assertIn("map_Kd scene_texture1.png", mtl)
+
+
+class TestOpenMVSCommands(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.work = Path(self.tmp.name)
+        cfg = OpenMVSConfig(
+            densify_point_cloud="DensifyPointCloud",
+            reconstruct_mesh="ReconstructMesh",
+            refine_mesh="RefineMesh",
+            texture_mesh="TextureMesh",
+        )
+        self.runner = OpenMVSRunner(config=cfg, work_dir=str(self.work))
+        self.calls = []
+
+        def fake_execute(cmd, name):
+            self.calls.append(cmd)
+            for i, a in enumerate(cmd):
+                if a == "-o":
+                    out = Path(cmd[i + 1])
+                    out.write_text("x")
+                    out.with_suffix(".ply").write_text("x")
+
+        self.runner._execute_cmd = fake_execute
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_densify_fuses_two_views_by_default(self):
+        (self.work / "scene.mvs").write_text("mvs")
+        self.runner.run_densify()
+        cmd = self.calls[0]
+        self.assertIn("--number-views-fuse", cmd)
+        self.assertEqual(cmd[cmd.index("--number-views-fuse") + 1], "2")
+
+    def test_reconstruct_mesh_smooth_and_point_distance(self):
+        (self.work / "scene_dense.mvs").write_text("mvs")
+        self.runner.run_reconstruct_mesh()
+        cmd = self.calls[0]
+        self.assertIn("--smooth", cmd)
+        self.assertEqual(cmd[cmd.index("--smooth") + 1], "4")
+        self.assertIn("--min-point-distance", cmd)
+        self.assertEqual(cmd[cmd.index("--min-point-distance") + 1], "2.0")
 
 
 if __name__ == "__main__":

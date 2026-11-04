@@ -208,7 +208,7 @@ class OpenMVSRunner:
             "--min-resolution", str(self.config.min_resolution),
             "--max-resolution", str(self.config.max_resolution),
             "--number-views", str(self.config.number_views),
-            "--number-views-fuse", "2",
+            "--number-views-fuse", str(getattr(self.config, "number_views_fuse", 2)),
             "-v", "2",
         ]
         if masks_dir and Path(masks_dir).is_dir():

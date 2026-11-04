@@ -65,6 +65,7 @@ PIPELINE_OPTIONS = {
     "visual_hull_refine", "visual_hull_voxel_mm", "densify_masks", "high_poly_ratio", "low_poly_ratio",
     "low_poly_max_faces", "glb_draco", "title",
     "description", "refine_mesh", "tag_layout", "cylinder_radius_m", "disc_radius_m",
+    "number_views_fuse", "smooth_mesh", "high_poly_smooth_iterations",
 }
 
 

@@ -276,8 +276,9 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         openmvs=OpenMVSConfig(
             bin_dir=job.get("openmvs_bin_dir"),
             resolution_level=job.get("resolution_level", 1),
-            smooth_mesh=job.get("smooth_mesh", 2),
-            min_point_distance=float(job.get("min_point_distance", 0.5)),
+            smooth_mesh=int(job.get("smooth_mesh", 4)),
+            min_point_distance=float(job.get("min_point_distance", 2.0)),
+            number_views_fuse=int(job.get("number_views_fuse", 2)),
             min_resolution=job.get("min_resolution", 640),
             texture_resolution=job.get("texture_resolution", 4096),
             empty_color=job.get("empty_color", 0),
@@ -286,7 +287,9 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             global_seam_leveling=job.get("global_seam_leveling", 0),
             local_seam_leveling=job.get("local_seam_leveling", 1),
             refine_mesh_enabled=bool(job.get("refine_mesh", False)),
-            refine_resolution_level=int(job.get("refine_resolution_level", 1)),
+            refine_resolution_level=int(job.get("refine_resolution_level", 2)),
+            refine_max_face_area=int(job.get("refine_max_face_area", 256)),
+            refine_scales=int(job.get("refine_scales", 1)),
             max_threads=resources["cpus"],
             keep_depth_maps=bool(job.get("keep_depth_maps", False)),
         ),
@@ -301,6 +304,7 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
             low_poly_max_faces=int(job.get("low_poly_max_faces", 50000)),
             target_high_poly_faces=int(job.get("target_high_poly_faces") or 0),
             target_low_poly_faces=int(job.get("target_low_poly_faces") or 0),
+            high_poly_smooth_iterations=int(job.get("high_poly_smooth_iterations", 5)),
         ),
         masking=masking_config(job),
         rig_refine=RigRefineConfig(enabled=bool(job.get("rig_refine", True))),
@@ -341,9 +345,9 @@ def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
         n_levels = int((inputs or {}).get("n_levels") or 1)
         n_images = int((inputs or {}).get("n_images") or len(views))
         if job.get("visual_hull_voxel_mm") is None and config.visual_hull.enabled:
-            config.visual_hull.voxel_m = 0.0025 if n_images >= 80 else 0.0015
+            config.visual_hull.voxel_m = 0.0015
             logger.info(f"Visual hull voxel size: {config.visual_hull.voxel_m * 1000:.1f} mm "
-                        f"({'adaptive for ' + str(n_images) + ' views' if n_images >= 80 else 'standard'}).")
+                        f"(high-precision surface definition).")
         if config.turntable.estimate_lift is None:
             config.turntable.estimate_lift = n_levels >= 2
             logger.info(f"Lift per level: {'estimated from the photos' if n_levels >= 2 else 'not used'} "
@@ -1509,7 +1513,10 @@ def parse_args():
     parser.add_argument("--empty_color", type=int, default=0, help="OpenMVS empty/unobserved face color in decimal RGB (0=black, 16744231=orange)")
     parser.add_argument("--global_seam_leveling", type=int, default=0, help="OpenMVS global Poisson seam leveling (0=disabled to avoid dark bleeding, 1=enabled)")
     parser.add_argument("--local_seam_leveling", type=int, default=1, help="OpenMVS local seam edge blending (1=enabled, 0=disabled)")
-    parser.add_argument("--min_point_distance", type=float, default=0.5, help="ReconstructMesh --min-point-distance in pixels (default 0.5; OpenMVS default 2.5: fewer points, faster Delaunay + graph-cut)")
+    parser.add_argument("--smooth_mesh", type=int, default=4, help="OpenMVS ReconstructMesh --smooth iterations (default: 4 for clean contours)")
+    parser.add_argument("--min_point_distance", type=float, default=2.0, help="ReconstructMesh --min-point-distance in pixels (default 2.0; eliminates micro-triangle jaggedness)")
+    parser.add_argument("--number_views_fuse", type=int, default=2, help="DensifyPointCloud --number-views-fuse: views that must agree to keep a point (default: 2; preserves occluded undercuts)")
+    parser.add_argument("--high_poly_smooth_iterations", type=int, default=5, help="PyMeshLab Taubin volume-preserving smoothing steps for high-poly mesh (default: 5)")
     parser.add_argument("--high_poly_ratio", type=float, default=0.75, help="High-poly keeps this share of the faces of the sealed mesh (default 0.75)")
     parser.add_argument("--low_poly_ratio", type=float, default=0.2, help="Low-poly keeps this share of the faces of the sealed mesh (default 0.2) ...")
     parser.add_argument("--low_poly_max_faces", type=int, default=50000, help="... but at most this many faces (default 50,000; 0 = no cap)")
@@ -1609,6 +1616,9 @@ def main():
         "title": args.title,
         "description": args.description,
         "min_point_distance": args.min_point_distance,
+        "smooth_mesh": args.smooth_mesh,
+        "number_views_fuse": args.number_views_fuse,
+        "high_poly_smooth_iterations": args.high_poly_smooth_iterations,
         "rig_refine": not args.no_rig_refine,
         "mask_method": args.mask_method,
         "ai_view_stride": args.ai_view_stride,

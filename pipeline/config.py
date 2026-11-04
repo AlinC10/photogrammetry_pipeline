@@ -163,10 +163,11 @@ class OpenMVSConfig:
     max_resolution: int = 3200
     density_factor: float = 1.0
     number_views: int = 6             # min views for PatchMatch (6 for turntable precision)
+    number_views_fuse: int = 2        # min views to fuse a 3D point (2 preserves occluded undercuts/brackets; 3 requires more views)
     max_threads: int = 0              # --max-threads for every OpenMVS app (0 = OpenMVS default: all cores)
     keep_depth_maps: bool = False     # False: depth*.dmap (~74 MB each at level 1) are deleted after fusion
-    smooth_mesh: int = 2              # OpenMVS ReconstructMesh --smooth (default 2)
-    min_point_distance: float = 0.5   # ReconstructMesh --min-point-distance, in pixels (OpenMVS default 2.5)
+    smooth_mesh: int = 4              # OpenMVS ReconstructMesh --smooth (default 4 for smooth boundary contours)
+    min_point_distance: float = 2.0   # ReconstructMesh --min-point-distance in pixels (2.0 eliminates micro-triangle edge stepping; OpenMVS default 2.5)
     refine_mesh_enabled: bool = False  # Disabled by default: ReconstructMesh produces high-fidelity clean surfaces; RefineMesh adds 4-7 min with excessive decimation
     refine_resolution_level: int = 2  # Fast RefineMesh image downscale when enabled (2 = 4x, runs in <40s)
     refine_max_face_area: int = 256   # Target max face area in pixels (prevents vertex explosion)
