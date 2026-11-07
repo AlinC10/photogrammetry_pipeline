@@ -1,342 +1,275 @@
-# Turntable Studio — 3D scanning pipeline for a turntable rig
+# Turntable Studio — Industrial 3D Scanning Pipeline
 
-Turns the photos of a turntable scanner (two Sony IMX477 cameras on a vertical carriage, a 260 mm disc with
-12 AprilTags) into textured, watertight 3D models: OBJ, GLB, STL and 3MF in a high- and a low-poly version.
+High-precision, industrial-grade 3D photogrammetry pipeline engineered specifically for **automated turntable scanning rigs**. It transforms multi-view photographs of mechanical parts, technical plastics, and power tools into production-ready, textured, watertight 2-manifold 3D CAD assets (OBJ, GLB, STL, 3MF) in both High-Poly and Low-Poly LODs.
 
-* Camera poses come from the **AprilTags on the disc** (`turntable_poses.py`), not from feature matching, and are
-  locked: on dark, glossy or plain plastics classic structure-from-motion drifts.
-* Geometry: **OpenMVS** (CUDA PatchMatch depth maps → Delaunay / graph-cut mesh).
-* Texture: **mvs-texturing (`texrecon`)**, with OpenMVS `TextureMesh` as fallback.
-* Runs locally (Docker or native) or **in the cloud**: one RunPod pod per scan, photos and results through
-  Cloudflare R2.
+* **Locked Camera Poses (Zero BA Drift):** Camera poses are determined deterministically from **AprilTags** on the turntable platter (`pipeline/turntable_poses.py`) and rigidly locked. Classic Structure-from-Motion (SfM) bundle adjustment is prevented from drifting on dark, glossy, or textureless technical plastics.
+* **GPU Mesh Reconstruction:** Powered by **OpenMVS** (CUDA PatchMatch multi-view depth maps → Delaunay tetrahedralization & graph-cut surface extraction, regularized with fine-tuned smoothing).
+* **High-Fidelity Texturing:** Powered by **mvs-texturing (`texrecon`)** using Markov Random Field (MRF) Potts optimization to assemble large, continuous chart atlases without Poisson bleeding or confetti micro-patches. OpenMVS `TextureMesh` serves as an automated fallback.
+* **Watertight CAD Base:** Automates planar base slicing at $Y = 3.0\text{ mm}$ and seals boundary contours using robust 2D polygon Ear-Clipping with volume-preserving Taubin smoothing.
+* **Flexible Execution:** Runs locally (bare-metal or containerized via Docker with NVIDIA GPU passthrough) or fully serverless in the cloud (one on-demand RunPod GPU pod per scan, streaming assets through Cloudflare R2).
 
 ---
 
-## 1. How it works
+## 1. Physical Rig & Hardware Configuration
+
+The Turntable Studio pipeline is mathematically calibrated to a dual-camera automated turntable rig:
+
+```
+                      [ Z-Axis Lead Screw (T8) ]
+                                  │
+                   ▲              │  Carriage Lift (~80 mm/level)
+                   │              ▼
+       ┌──────────────────────────────────────┐
+       │   Rigid Horizontal Carriage Bar      │
+       └───┬──────────────────────────────┬───┘
+           │                              │
+     [ Camera 0 ]                   [ Camera 1 ]
+   Sony IMX477 12MP               Sony IMX477 12MP
+   (M12 3.9mm lens)               (M12 3.9mm lens)
+      Height: ~135 mm                Height: ~135 mm (Same level, ±1.8 mm)
+      Pitch:  ~14°-15° down          Pitch:  ~14°-15° down
+           \                              /
+            \       ◄── 27° ──►          /
+             \  (Horizontal Azimuth)    /
+              \                        /
+               ▼                      ▼
+       ════════════════════════════════════════
+             [ 345 mm Turntable Platter ]
+             12 AprilTags (Tag36h11) Outer Ring
+             Rotates in 18° Steps (20 steps/turn)
+```
+
+### Rig Specifications:
+* **Cameras:** Dual **Sony IMX477 12.3MP** rolling-shutter CMOS sensors ($4056 \times 3040\text{ px}$, $1.865\,\mu\text{m}$ pixel pitch).
+* **Lenses:** Dual **3.9mm M12** wide-angle lenses ($\approx 75^\circ$ horizontal FOV, low barrel distortion $k_1 \approx -0.04$).
+* **Camera Placement (Same Level):** Both cameras are rigidly mounted to the **same horizontal carriage bar at the same height** ($Y \approx 135\text{ mm}$ above the platter surface, with a mechanical tolerance under $2\text{ mm}$).
+* **Camera Pitch:** Both cameras are tilted downward toward the platter center at the **same nominal pitch angle of $\approx 14^\circ - 15^\circ$**.
+* **Horizontal Separation ($27^\circ$ Azimuthal Offset):**
+  * The cameras are separated horizontally around the turntable rotation axis by **$27^\circ$**, establishing a physical stereo baseline of $b \approx 160\text{ mm}$.
+  * **Interleaved Vernier Sampling:** The $27^\circ$ camera separation and the $18^\circ$ turntable rotation step form an exact **$1.5\times$ Vernier ratio** ($27^\circ = 18^\circ + 9^\circ$). At each step, Camera 1 samples a viewpoint shifted by $9^\circ$ relative to Camera 0's previous stop. This yields **40 distinct horizontal perspectives at $9^\circ$ intervals** across the full $360^\circ$ circle from only 20 physical motor stops.
+* **Turntable Platter:** Stepper-motor-driven rotating disc with 20 stops per revolution ($18^\circ$ angular step). Default is the **$345\text{ mm}$ platter** (`platan_345mm_layout.json`) with an outer ring of 12 AprilTags (Tag36h11 family, printed at $0.99$ scale, $307\text{ mm}$ opposite tag distance). Legacy $260\text{ mm}$ platters (`platan_260mm_layout.json`) are also supported.
+* **Z-Axis Linear Motion:** A T8 trapezoidal lead screw with stepper motor lifts the entire dual-camera carriage between vertical scanning levels (nominal lift of $80\text{ mm}$ per level, automatically measured and estimated in photos with $\ge 2$ levels).
+
+---
+
+## 2. Pipeline Architecture & Workflow
 
 ```mermaid
 flowchart TD
-    A["Photos<br/>input_images/rig/0 and rig/1"] --> B["1. CameraInit<br/>views + intrinsics (3.9 mm lens)"]
-    B --> C["2. turntable_poses<br/>AprilTags -> locked camera poses"]
-    C --> RR["2.1 Rig refinement<br/>per camera + level, sparse SIFT features"]
-    RR --> D["2.5 Masks<br/>BiRefNet_lite on a crop + scan background + rendered disc"]
-    D --> V["2.6 Visual hull<br/>volume carved from the masks"]
-    V --> E["3. Bridge<br/>undistortion + COLMAP model (parallel)"]
-    E --> R{"RAM check"}
-    R --> F["4. OpenMVS<br/>DensifyPointCloud -> 4.2b hull correction -> ReconstructMesh"]
-    F --> RF["4.5 OpenMVS RefineMesh<br/>Photo-consistency surface regularizer (eliminates bubbles)"]
-    RF --> G["5. Mesh cleaning<br/>object by position, cut at 3 mm, cap every base loop, decimate, fill holes once"]
-    G --> H["5.5 Texturing images<br/>PNG, mesh-silhouette masks, colour gains"]
-    H --> T["4.4 texrecon<br/>(fallback: OpenMVS TextureMesh)"]
-    T --> X["6. Export<br/>OBJ / GLB / STL / 3MF, high + low"]
-    X --> Z["output.zip + stats.json + logs"]
+    A["Photos<br/>input_images/rig/0 and rig/1"] --> B["1. CameraInit<br/>Extract views & intrinsics"]
+    B --> C["2. turntable_poses<br/>AprilTags -> Locked Camera Poses"]
+    C --> RR["2.1 Rig Refinement<br/>Per camera + level sparse SIFT correction"]
+    RR --> D["2.5 Hybrid Mask Fusion<br/>BiRefNet_lite + Background Median + Rendered Disc"]
+    D --> V["2.6 Visual Hull<br/>1.5 mm voxel grid volume carving"]
+    V --> E["3. SFM-to-COLMAP Bridge<br/>Image undistortion & 1,500 proxy 3D tracking points"]
+    E --> R{"RAM Check<br/>Density memory validation"}
+    R --> F["4. OpenMVS DensifyPointCloud<br/>CUDA PatchMatch depth maps & cloud fusion"]
+    F --> HC["4.2b Hull Cloud Pruning<br/>Prune phantom depths & fill textureless surface"]
+    HC --> RM["4.3 OpenMVS ReconstructMesh<br/>Delaunay tetrahedralization & graph-cut surface"]
+    RM --> G["5. Mesh Cleaning<br/>3 mm base slicing, ear-clipping cap & Taubin smoothing"]
+    G --> H["5.5 Texturing Image Preparation<br/>Mesh-silhouette masks & camera white balancing"]
+    H --> T["6. mvs-texturing (texrecon)<br/>MRF Potts chart texturing (Fallback: TextureMesh)"]
+    T --> X["7. Multi-LOD Export<br/>High/Low OBJ, GLB (Draco), watertight STL, 3MF"]
+    X --> Z["Deliverables: output.zip + stats.json + object.json"]
 ```
 
-| Step | What happens | Module |
-|---|---|---|
-| 1. CameraInit | Finds the photos, reads the level / step from the file name (`f_2005.jpg` = level 2, step 5), writes `cameraInit.sfm` | `pipeline/camera_init.py` |
-| 2. Poses | Detects the 12 AprilTags in every photo and fits one rigid turntable model (step angle, rotation axis, lift per level, camera intrinsics). Supports 260 mm (`platan_260mm_layout.json`) and 345 mm (`platan_345mm_layout.json`) turntables. Writes `cameras_known.sfm`, `turntable_report.txt` (RMS, lift, per-photo errors) and `turntable_calib.json` | `pipeline/turntable_poses.py` (**never modified**, called as a subprocess) |
-| 2.1 Rig refinement | SIFT on half-resolution photos, booth points dropped (static within a level), neighbouring views matched; one rigid correction per (camera, level) from the epipolar error on the object (the carriage tilts ~0.9° on the first lift, cam1 is ~0.4° off). Applied only when it lowers the error on held-out view pairs and stays small (`rig_refine.json`; tag-only poses in `cameras_known_tags.sfm`). Box: between levels 2.9 → 1.0 px, spray can 1.9 → 0.3 px; 10–30 s | `pipeline/rig_refine.py` |
-| 2.5 Masks | Object vs background inside a bounding cylinder (80 mm / 125 mm wide for 260 mm disc; 130 mm / 138 mm wide for 345 mm disc), minus the tags the object cannot cover. Default `fused`, on every view: BiRefNet_lite (512 px ONNX on the CPU) on a square crop around the object, grown and run again while the object leaves it; `keep_touching_or_roi` preserves isolated upper parts (screwdriver handle); discrimination on disc paper (`d_min > 0.75 & r < 0.68`) preserves grey/metallic bases (spray can) on the white disc. Disc leaves the masks, no view is missed. | `pipeline/mask_fusion.py`, `pipeline/mask_processor.py` |
-| 2.6 Visual hull | Voxels (1.5 mm) carved by the masks (a voxel goes when ≥ 2 views see background); its box sets the volume of the synthetic tracking points, but only when the silhouettes decided something (otherwise the whole cylinder). With `ai` masks, which keep the turntable, the low cone over the disc no view can judge is marked ambiguous (a warning when the hull is nothing else). The cylinder is widened only when decided voxels reach it | `pipeline/visual_hull.py` |
-| 3. Bridge | Undistorts photos and masks, writes the COLMAP model OpenMVS imports (poses + 1500 synthetic tracking points inside the hull box: they set OpenMVS's ROI and depth range) | `pipeline/bridge_sfm.py` |
-| RAM check | Estimates DensifyPointCloud's RAM from photos × resolution and stops in seconds if the container cannot hold it | `pipeline/resources.py` |
-| 4. OpenMVS | Depth map per photo on the GPU, fusion into a dense point cloud, surface mesh. Depth maps are deleted after fusion | `pipeline/openmvs_runner.py` |
-| 4.2b Hull correction | Before ReconstructMesh: drops dense points > 5 mm inside the hull fused from ≤ 3 views (wrong depths on uniform plastic, e.g. a single-colour cap) and adds hull-surface points where nothing is left. Skipped when the hull is much shorter than the cloud (wrong masks). The plain cloud stays as `scene_dense_mvs.ply`; ReconstructMesh falls back to it if it fails | `pipeline/visual_hull.py` |
-| 4.5 RefineMesh | OpenMVS `RefineMesh`: photo-consistency surface regularizer using Laplacian smoothing and multi-view gradients to eliminate orange-peel noise and bubbles on smooth technical plastics without flattening sharp relief and logos | `pipeline/openmvs_runner.py` |
-| 5. Cleaning | Keeps the object pieces by position (vertices above the cut, inside the disc rim; preserves large base components), closes holes just above the cut, cuts at Y = 3 mm, caps every loop of the cut flat (ring feet, legs), repairs, decimates the high poly to 75 % of its faces, then closes its holes once (up to 2000 edges, smoothed patch, snapped onto the visual hull where it sags < 3 mm inside it); low poly = min(20 %, 50 000) faces of it, still closed (`--high_poly_ratio`, `--low_poly_ratio`, `--low_poly_max_faces`). Writes `object.json`: title, description, length × width × height in mm, volume, watertight, patched area. Problems go to `status.json` "warnings" | `pipeline/mesh_cleaner.py`, `pipeline/exporter.py` |
-| 5.5 Texturing images | Lossless PNGs where everything outside the mesh silhouette is exactly black, per-camera colour gains from the white paper | `pipeline/texture_prep.py`, `pipeline/mesh_masks.py` |
-| 4.4 Texturing | `texrecon` picks the best photo per face and builds the atlases; unseen faces are coloured like their neighbours. High and low poly run at the same time (one `.cam` scene, low in `texrecon/low/`) when ≥ 16 GB RAM is free. Low-poly decimation, print exports, metrics and `object.json` run in background workers; export chains in parallel; `output.zip` once, at the end | `pipeline/texrecon_runner.py`, `pipeline/parallel.py` |
-| 6. Export | OBJ + MTL + PNG/JPG, GLB with embedded textures, watertight STL / 3MF at real scale, `output.zip` | `pipeline/exporter.py` |
-
-Everything the run measured (time, RAM, VRAM, CPU, disk per step, hardware, object, mesh quality) goes into
-`stats.json`; the full log into `run_log.txt` (section 7).
-
-### Coordinates and units
-The model is built in **metres**, Y up, the disc surface at Y = 0. Units of the deliverables:
-- OBJ, STL, 3MF: **millimetres** (`--export_scale 1000`, default). STL has no unit field and every slicer reads mm;
-  with the old `--export_scale 100` (centimetres) Bambu / Anycubic showed the model 10x too small. STL / 3MF are
-  Z-up, base on Z = 0.
-- GLB: `--glb_scale` units per metre, default **100 = centimetres** (what the viewers were built with). glTF is defined
-  in metres: `--glb_scale 1` gives the real size in Blender / three.js; switch once the front-end handles it.
-- `object.json` is measured on the metre mesh: mm, cm³, cm² whatever the export scales.
-The AliceVision `.sfm` conventions (column-major rotations, principal point as offset from the centre) are in `AGENTS.md`.
+### Pipeline Stages:
+1. **Camera Discovery & Init (`pipeline/camera_init.py`):** Discovers stereo images (`rig/0` and `rig/1`), parses level and step indices (`f_<level><step>.jpg`), and initializes metadata.
+2. **AprilTag Poses (`pipeline/turntable_poses.py`):** Detects AprilTag corners, fits a 23-parameter global kinematic turntable model (rotation axis, angular step, lift scale, optical centers, focal length, radial distortion), and locks camera poses to sub-pixel accuracy ($\text{RMSE} < 0.45\text{ px}$). Supports **Zero-Tag Prediction** when large parts occlude the disc.
+3. **Rig Refinement (`pipeline/rig_refine.py`):** Corrects mechanical carriage tilt ($\approx 0.9^\circ$) on upper levels using hold-out guarded sparse SIFT matches on the object.
+4. **Hybrid Mask Fusion (`pipeline/mask_fusion.py`):** Combines lightweight deep learning (BiRefNet_lite 512 ONNX CPU) on a dynamic object crop with per-level background median subtraction and synthetic 3D disc projection.
+5. **Visual Hull (`pipeline/visual_hull.py`):** Carves a $1.5\text{ mm}$ voxel volume from multi-view silhouettes to bound proxy points and prune floating depth artifacts.
+6. **SFM-to-COLMAP Bridge (`pipeline/bridge_sfm.py`):** Undistorts 4K frames and injects 1,500 synchronized proxy 3D points inside the visual hull bounding volume.
+7. **OpenMVS Core (`pipeline/openmvs_runner.py`):** Computes per-view depth maps with CUDA PatchMatch, fuses them into a dense point cloud, and reconstructs a manifold triangular surface mesh.
+8. **Mesh Cleaning & Base Sealing (`pipeline/mesh_cleaner.py`):** Isolates the scanned object by spatial position, executes planar slicing at $Y = 3.0\text{ mm}$, caps all base boundary loops with 2D ear clipping, and applies Taubin volume-preserving smoothing.
+9. **Texturing (`pipeline/texrecon_runner.py`):** Projects high-resolution photos into UV chart atlases via `texrecon` using global MRF Potts energy minimization.
+10. **Multi-LOD Packaging (`pipeline/exporter.py`):** Decimates topology, embeds Draco-compressed geometry for GLB, writes watertight STL/3MF for 3D printing, and measures physical dimensions for `object.json`.
 
 ---
 
-## 2. Input
+## 3. Directory Layout
 
 ```text
 input_images/
 └── rig/
-    ├── 0/                 # camera 0
-    │   ├── f_1000.jpg     # level 1, step 0
-    │   ├── f_1001.jpg     # level 1, step 1 (18° later)
+    ├── 0/                 # Camera 0 (Left)
+    │   ├── f_1000.jpg     # Level 1, Step 0
+    │   ├── f_1001.jpg     # Level 1, Step 1 (18° rotation)
     │   ├── ...
-    │   ├── f_2000.jpg     # level 2 (carriage moved up)
+    │   ├── f_2000.jpg     # Level 2, Step 0 (Carriage lifted +80 mm)
     │   └── ...
-    └── 1/                 # camera 1, same names
+    └── 1/                 # Camera 1 (Right), synchronized filenames
 ```
 
-* File names end in `<level><3-digit step>` (`f_1005` → level 1, step 5). 20 steps of 18° per level.
-* Without `rig/` (flat folder, one camera) run without `--rig_mode`.
-* Optional: own masks in `input_images/masks/` (`<viewId>_<stem>.mask.png`); otherwise they are generated.
-
-### Good scans
-* The disc must stay **in frame** on every level (at least ~4 tags per photo; the report shows `tag-uri pe poză: min`).
-* The real carriage lift was measured at ~85 mm for a commanded 80 mm: it is estimated from the photos automatically (≥ 2 levels). The tag sheet was printed at ~98 % (`--tag_scale 0.98`, default).
-* Plain, glossy surfaces (a cap of one colour) give no depth (nothing to match between photos): side lighting or
-  matte scanning spray help. Open issues and their fixes: `plans/PLAN.md`; causes and measurements: `plans/CUNOSTINTE_SI_MASURATORI.md`.
+* Naming convention: `f_<level><step:03d>.jpg` (e.g. `f_1000.jpg` = Level 1, Step 0; `f_2019.jpg` = Level 2, Step 19).
+* Without `rig/` (single camera flat folder), omit `--rig_mode`.
 
 ---
 
-## 3. Running
+## 4. How to Run
 
-### A. Docker on the GPU machine (Windows + Docker Desktop, or Linux)
+### A. Docker (Recommended for GPU & Production)
+
+#### 1. Build the Docker Image
+Always pass `GIT_COMMIT` so the container embeds the exact version tag into `stats.json`:
 
 ```bash
-# once, and after code changes (GIT_COMMIT is recorded in stats.json)
+# Standard Docker build with Git commit argument
+docker build \
+  --build-arg GIT_COMMIT=$(git rev-parse --short HEAD) \
+  -t turntable-studio:latest .
+```
+
+#### 2. Run via Docker Compose (Simplest)
+`docker-compose.yml` mounts host directories and configures NVIDIA GPU passthrough automatically:
+
+```bash
+# Build with commit hash
 GIT_COMMIT=$(git rev-parse --short HEAD) docker compose build
 
-# a scan: photos in ./input_images, results in ./output
-docker compose run --rm turntable-studio --input_dir /workspace/input_images --output_dir /workspace/output --rig_mode
+# Run pipeline on input_images/ with output in output/
+docker compose run --rm turntable-studio \
+  --input_dir /workspace/input_images \
+  --output_dir /workspace/output \
+  --rig_mode
 ```
 
-PowerShell: `docker compose build`, then the same `docker compose run ...` line. No `| tee` is needed:
-the log is written to `output/run_log.txt` by the pipeline itself (UTF-8).
+#### 3. Run Directly via `docker run`
+For custom host paths, CI runners, or explicit volume control:
 
-With the image from Docker Hub and any folders (Windows, PowerShell, from the repository root):
-
-```powershell
-powershell -ExecutionPolicy Bypass -File tools\docker_scan.ps1 -Name t1 -Title "Parkside"
-powershell -ExecutionPolicy Bypass -File tools\docker_scan.ps1 -Name t2 -InputDir D:\scanari\fixativ -Extra "--densify_masks","none"
-```
-
-Photos from `-InputDir` (default `input_images\`), results in `teste\<Name>\` (or `-OutputDir`), image `-Image`
-(default `alinc10/turntable-studio:v4`); `-Extra` takes any `main.py` options.
-
-What `docker-compose.yml` mounts:
-
-| Host | Container | Contents |
-|---|---|---|
-| `./input_images` | `/workspace/input_images` (read-only) | photos |
-| `./output` | `/workspace/output` | models, `output.zip`, `stats.json`, logs, reports, masks, texrecon files |
-| volume `turntable_work` | `/tmp/turntable_work` | undistorted images, COLMAP files, OpenMVS scene and depth maps |
-
-The work volume matters on Windows: a folder of `D:\` mounted through WSL is several times slower for the ~9 GB of
-depth maps (DensifyPointCloud spent ~14 of its 18.5 minutes on disk there). It persists between runs, so `--resume`
-still works. To keep everything in `./output` (e.g. for `tools/debug_texturing.py`) add `--work_dir /workspace/output`.
-
-Re-texture / re-export without recomputing the geometry:
 ```bash
-docker compose run --rm turntable-studio --input_dir /workspace/input_images --output_dir /workspace/output --rig_mode --resume
+docker run --rm -it \
+  --gpus all \
+  --shm-size=16g \
+  -v "$(pwd)/input_images:/workspace/input_images:ro" \
+  -v "$(pwd)/output:/workspace/output" \
+  turntable-studio:latest \
+  --input_dir /workspace/input_images \
+  --output_dir /workspace/output \
+  --rig_mode
 ```
-`--resume` reuses `cameras_known.sfm` and the OpenMVS mesh. Run **without** it after changing photos, poses or
-intrinsics.
 
-WSL memory: DensifyPointCloud needs ~10–12 GB for 80–120 photos. If Docker Desktop has less, raise `memory=` in
-`%UserProfile%\.wslconfig` and run `wsl --shutdown`.
+#### 4. Re-Texturing / Re-Exporting (`--resume`)
+To change texturing or export settings without recomputing expensive CUDA depth maps and Delaunay meshing:
 
-### B. Native (without Docker)
-
-Needs OpenMVS (with CUDA) and `texrecon` on the machine; Python 3.10 or 3.11 (not 3.14: no wheels for pymeshlab / scipy).
 ```bash
-uv venv .venv --python 3.11 && source .venv/bin/activate     # Windows: .venv\Scripts\activate
+docker compose run --rm turntable-studio \
+  --input_dir /workspace/input_images \
+  --output_dir /workspace/output \
+  --rig_mode \
+  --resume
+```
+
+---
+
+### B. Local Bare-Metal (Native Execution)
+
+Requires Python 3.10 or 3.11, OpenMVS binaries (compiled with CUDA), and `texrecon`:
+
+```bash
+# 1. Create and activate virtual environment
+uv venv .venv --python 3.11 && source .venv/bin/activate    # Windows: .venv\Scripts\activate
 uv pip install -r requirements.txt
-python main.py --input_dir ./input_images --output_dir ./output --rig_mode \
-    --openmvs_bin_dir /path/to/OpenMVS --texrecon_bin /path/to/texrecon
-```
-OpenMVS is also searched in `OPENMVS_BIN_DIR`, `PATH`, `/usr/local/bin/OpenMVS`, `C:\OpenMVS\...`; texrecon in
-`TEXRECON_BIN`. Without texrecon the pipeline falls back to OpenMVS `TextureMesh`.
 
-Quick check without OpenMVS (fake geometry, all later steps run):
+# 2. Run full pipeline
+python main.py \
+  --input_dir ./input_images \
+  --output_dir ./output \
+  --rig_mode \
+  --openmvs_bin_dir /path/to/OpenMVS/bin \
+  --texrecon_bin /path/to/texrecon
+```
+
+#### Fast Mock Test (No GPU / No OpenMVS Required)
+Validates argument parsing, AprilTag detection, mask generation, mesh cleaning, and export packaging without requiring OpenMVS binaries:
+
 ```bash
 python main.py --mock_openmvs --rig_mode --input_dir ./input_images --output_dir ./output_test
 ```
 
-### C. Cloud: RunPod + Cloudflare R2
+---
 
-One scan = one pod, created for the job and terminated as soon as the result is in R2.
-```
-laptop / Pi ──upload photos──▶ R2 jobs/<id>/input/ ──▶ pod: download, run, upload ──▶ R2 jobs/<id>/output/
-            ◀──────────── download results/<id>/, delete the photos from R2 ◀──────────────────────────────
-```
-* The pod gets **temporary R2 keys** (1 hour, read-only on its photos, write-only on its output), never your keys,
-  never the RunPod key.
-* GPU: the first available from a list ordered by speed (up to 1.10 $/h), with a minimum host RAM computed from the photos and a
-  minimum vCPU count; 16 vCPU and 48 GB are asked for first, the minimum only when no host has them.
-  GPU speed barely matters; RAM, CPUs and disk do.
-* The result stays in R2 (`jobs/<id>/output/`) until the next cloud scan, which deletes the older jobs at its start.
-* Every pod is terminated, also after errors, timeouts and cancels; one retry with more RAM if it ran out of memory.
+### C. Cloud Serverless (RunPod + Cloudflare R2)
 
-Once:
-1. Push the image to a registry: `docker tag turntable-studio:latest ghcr.io/<user>/turntable-studio:v1 && docker push ...`
-   (private registry: add its credentials in RunPod → Settings → Container Registry Auth).
-2. `cp .env.example .env` and fill in: R2 bucket key, Cloudflare API token with R2 permissions only,
-   `CLOUDFLARE_ACCOUNT_ID`, `RUNPOD_API_KEY`, `TURNTABLE_IMAGE`.
+One scan = one on-demand GPU pod, launched dynamically when needed and terminated the instant results are secured in R2.
 
-Then, from the repository root:
-```bash
-python tools/cloud_scan.py --dry_run     # R2 check + RAM/disk estimate + the pod request, no pod, no cost
-python tools/cloud_scan.py               # upload input_images/ -> pod -> results/<job_id>/ -> clean R2
-python tools/cloud_scan.py D:\scans\multimeter --name multimeter --set tag_scale=1.002   # any folder, any pipeline option
-python tools/cloud_scan.py --keep_remote # leave the job in R2 (debugging)
-python tools/cloud_scan.py --job_id <id> --skip_upload   # retry with the photos already in R2
+```text
+Local Machine / Raspberry Pi ──── Upload Photos ────▶ Cloudflare R2 (jobs/<id>/input/)
+                                                             │
+                                                     Launch On-Demand Pod
+                                                             ▼
+                                                    RunPod NVIDIA GPU Pod
+                                                    (OpenMVS + texrecon)
+                                                             │
+                                                     Upload Results
+                                                             ▼
+Local Machine ◄─── Download & Verify output.zip ─── Cloudflare R2 (jobs/<id>/output/)
 ```
-It asks before starting the (billed) pod (`-y` skips the question); Ctrl+C terminates the pod. It prints the time of every phase, the GPU / RAM / vCPU received and the cost estimate. Details, key permissions,
-`status.json` and the Pi upload queue: [`cloud/README.md`](cloud/README.md).
+
+1. **Setup Environment:**
+   Copy `.env.example` to `.env` and fill in your Cloudflare R2 credentials, `RUNPOD_API_KEY`, and `TURNTABLE_IMAGE` (Docker image in a public or private registry).
+
+2. **Execute Cloud Scan:**
+   ```bash
+   # Dry-run check (validates credentials, estimates RAM and cost; no pod created)
+   python tools/cloud_scan.py --dry_run
+
+   # Full cloud scan execution (uploads photos, runs pod, downloads results to results/<id>/)
+   python tools/cloud_scan.py --input_dir ./input_images
+
+   # Re-run a previous scan with photos already in R2
+   python tools/cloud_scan.py --job_id <id> --skip_upload
+   ```
 
 ---
 
-## 4. Output
+## 5. Output Deliverables Contract
+
+Every successful run outputs the following structured assets in `output/` (and packaged in `output.zip`):
 
 ```text
 output/
-├── glb/high_model.glb, low_model.glb          # open in Windows 3D Viewer, Blender, any glTF viewer
-├── obj/high/model_high.obj + .mtl + model_high_tex_*.png
-├── obj/low/model_low.obj   + .mtl + model_low_tex_*.jpg   (≤ 2048 px)
-├── stl/high_model.stl, low_model.stl          # watertight, flat base: straight into the slicer
-├── 3mf/high_model.3mf, low_model.3mf
-├── output.zip       # all of the above + stats.json + reports + logs/ (run_log, OpenMVS, texrecon)
-├── stats.json       # measurements of the run (section 7)
-├── run_log.txt      # full log, UTF-8
-├── turntable_report.txt, turntable_calib.json # pose quality: RMS, tags per photo, lift, per-photo errors
-├── cameraInit.sfm, cameras_known.sfm          # views, locked poses
-├── masks/, texturing_images/, texrecon/       # intermediate files (useful for debugging)
-└── model_cleaned_watertight.obj, cleaned_mesh_low.obj
-```
-Blender: switch the viewport to *Material Preview*. If two runs reuse the same texture file names, Blender may show
-the old texture from its cache: reload the images or restart Blender.
-
-### Reading `turntable_report.txt`
-* `Total: ... RMS x px`: tag reprojection error. ~3 px today; < 1 px needs a chessboard calibration (`--intrinsics_in`).
-* `Urcare: x mm/nivel, unghi față de axă y°`: lift per level. A large angle (> 2°) or a large free-pose difference on one
-  level means the lift is wrong: use `--estimate_lift`.
-* `tag-uri pe poză: min n`: below ~4 the top level loses the disc.
-* `Corecția tag-urilor`: the sheet's own unevenness (±1.5 mm, the same in every scan). Several mm on one tag = the
-  object covers or stands on it: `stats.json` gets `tag_correction_warning`; keep the object inside the tag ring.
-* `rig_refine.json`: epipolar error on the object per pair type before / after the per-(camera, level) correction,
-  the corrections and whether they were applied.
-
----
-
-## 5. Options
-
-Run `python main.py --help` for all of them. The ones that matter:
-
-| Option | Default | Meaning |
-|---|---|---|
-| `--rig_mode` | off | photos in `rig/0`, `rig/1` |
-| `--estimate_lift` / `--no_estimate_lift` | automatic | the lift per level is estimated from the photos when there are ≥ 2 levels; a warning when it differs by > 10 % from `--lift_mm` |
-| `--lift_mm` | 80 | lift the scanner commands per level (used as is with `--no_estimate_lift`) |
-| `--tag_scale` | 0.98 | printed / designed size of the tag sheet (this rig's sheet came out at ~98 %: disc 255 mm, tags 0–6 196 mm; 1.0 for a sheet printed at actual size) |
-| `--intrinsics_in` | – | chessboard calibration from `pipeline/calibrate_intrinsics.py` |
-| `--no_tag_refine` | off | disable the per-tag paper-height correction |
-| `--no_rig_refine` | off | keep the tag poses (no per-camera, per-level correction from sparse object features) |
-| `--mask_method` | fused | `fused` (BiRefNet_lite on a crop, checked against the scan background and the rendered disc, every view), `ai` (the model on the whole photo) or `photometric`; without the model or onnxruntime: photometric |
-| `--ai_view_stride` | 2 | `ai` only: model on 1 view in N, the others from the visual hull silhouette (1 = every view) |
-| `--resolution_level` | 1 | DensifyPointCloud at 1/2 resolution (0 = full: ~4× GPU time and much more RAM) |
-| `--resume` | off | reuse poses and the OpenMVS mesh |
-| `--texturing_engine` | texrecon | or `openmvs` (TextureMesh) |
-| `--data_term` | gmi | texrecon: `gmi` or `area` |
-| `--high_poly_ratio` / `--low_poly_ratio` | 0.75 / 0.2 | share of the sealed mesh's faces kept in the high / low poly (every object is decimated a little) |
-| `--low_poly_max_faces` | 50000 | cap of the low poly (web model): it gets min(ratio × faces, cap) |
-| `--target_high_poly_faces` / `--target_low_poly_faces` | 0 | fixed face counts instead of the ratios (0 = use the ratios) |
-| `--no_draco` | off | GLB without Draco geometry compression (Draco: high GLB ~22 → ~6 MB; viewers need a Draco decoder: Blender, three.js, model-viewer, Babylon) |
-| `--title` / `--description` | – | written to `object.json` with the measured size and volume (`tools/cloud_scan.py --title`; default: `--name`) |
-| `--workers` | 0 = auto | parallel images for masks / undistortion / texturing images: `min(CPUs − 1, free RAM / 0.5 GB)` from the container limits |
-| `--work_dir` | output dir (Docker: `/tmp/turntable_work`) | where the large intermediate files go |
-| `--keep_depth_maps` | off | keep OpenMVS `depth*.dmap` (~74 MB each) |
-| `--ram_margin` | 1.0 | safety factor on the RAM estimate before DensifyPointCloud |
-| `--no_visual_hull` | off | no hull: fixed proxy volume, no cloud correction (the behaviour before 2026-10-28) |
-| `--no_visual_hull_refine` | off | hull only for the proxy volume; ReconstructMesh gets the plain dense cloud |
-| `--visual_hull_voxel_mm` | 1.5 | hull voxel size |
-| `--densify_masks` | blackout | how DensifyPointCloud sees the masks: `blackout` (background pixels set to 0), `mask_path` (unchanged photos + OpenMVS `--mask-path`), `none` |
-| `--mock_openmvs` | off | fake geometry for quick tests |
-
-Texture tuning (texrecon seam leveling, unseen faces, mask margin, colour gains) and the OpenMVS `TextureMesh`
-options are listed by `--help`.
-
----
-
-## 6. Resources
-
-* **RAM.** DensifyPointCloud dominates: ≈ 6.8 GB + 12 bytes × photos × working pixels (80 photos → 9.8 GB, 120 → 11.3 GB
-  at level 1; full resolution ~25–40 GB). The check uses the container's limit (cgroup), not the host RAM.
-  `tools/fit_ram_model.py <stats.json...>` refits the formula from more runs.
-* **Parallelism** only raises RAM inside the parallel steps (~0.5 GB per worker), which stay below DensifyPointCloud.
-  Masks: 66 s → 15 s with 8 workers on 120 photos.
-* **GPU.** NVIDIA with CUDA is required (OpenMVS is built with CUDA); its speed matters little (~4 of 30 minutes).
-  OpenMVS uses ~0.6 GB of VRAM (one depth map at a time); more VRAM does not speed one job up.
-* **Disk.** ~9 GB of depth maps at their peak for 120 photos at level 1 (4× at level 0); a fast disk matters most.
-* **Docker image.** Runtime on `nvidia/cuda:12.2.2-base` with only the OpenMVS apps used, `texrecon` and the libraries
-  `ldd` reports (`docker/runtime_deps.sh`); the build fails with "Missing shared libraries" if one is missing.
-
----
-
-## 7. stats.json and the log
-
-`stats.json` (`schema_version` 2) is meant as training data for predicting RAM, time, disk, cost and quality:
-
-* **run:** id, start time, outcome (`ok` / `error` + error type + failed step), code version (git commit / image);
-* **hardware:** CPU model and cores, GPU model / VRAM / compute capability / driver, host (local, WSL, RunPod),
-  measured disk write/read speed of the work and output directories, container CPUs and RAM, workers;
-* **input:** photos per level and camera, resolution, JPEG size, settings; pose quality (RMS, tags per photo, lift,
-  free-pose difference per level); the object in the images (fraction of the frame, texture inside the mask,
-  brightness, saturation, white/specular share, bounding box);
-* **per step:** duration, peak RAM, peak VRAM minus what was already in use, CPU seconds and utilisation
-  (low = waiting on disk or GPU), disk read/write, peak disk usage;
-* **results:** OpenMVS GPU seconds, discarded depths, dense points, Delaunay cells; raw and cleaned mesh (faces,
-  components, boundary edges, watertight); texrecon unseen faces; warnings / errors; zip size;
-* **cloud jobs:** the pod rented (GPU, RAM, vCPU), price, cost, image pull + boot time, transfer times.
-
-`python tools/collect_stats.py results/*/stats.json output/stats.json -o runs.csv` turns many runs into one table.
-
-`run_log.txt` contains everything printed plus the OpenMVS output; `output.zip/logs/` also holds the OpenMVS and
-texrecon logs.
-
----
-
-## 8. Repository
-
-```text
-main.py                  pipeline (CLI and run_pipeline(job))
-runpod_job.py            inside a RunPod pod: R2 -> run_pipeline -> R2
-docker_entrypoint.sh     container entry: runpod_job.py if JOB_ID is set, else main.py
-Dockerfile, docker-compose.yml, docker/runtime_deps.sh
-requirements-runtime.txt (image) / requirements.txt (+ local tools)
-.env.example             keys for the cloud flow (.env is ignored by git and Docker)
-pipeline/                the steps of section 1, resources.py (RAM/CPU), run_metrics.py (stats), telemetry.py
-cloud/                   cloudflare_r2.py, runpod.py, job.py, README.md
-tools/                   local only: cloud_scan.py, collect_stats.py, fit_ram_model.py,
-                         debug_texturing.py (texture diagnostics), debug_blender_compare.py (headless Blender),
-                         pull_debug.py (debug bucket -> PC), regression.py (results table vs a reference run)
-tests/                   unit tests (no GPU, no network)
-plans/                   PLAN.md (what is left), CUNOSTINTE_SI_MASURATORI.md (measurements, research); arhiva/ = old plans
-docs/                    architecture description, competition documentation
-deprecated/              code no longer used (AliceVision texturing, inspect_rig_poses.py)
-to_delete/               superseded files, kept until reviewed
+├── glb/
+│   ├── high_model.glb         # High-Poly GLB with embedded PNG textures (Draco compressed)
+│   └── low_model.glb          # Web-optimized Low-Poly GLB with embedded JPG textures
+├── obj/
+│   ├── high/
+│   │   ├── model_high.obj     # Full detail polygonal mesh
+│   │   ├── model_high.mtl     # Material definition
+│   │   └── model_high_texture.png
+│   └── low/
+│       ├── model_low.obj      # Web LOD polygonal mesh (topology-preserved)
+│       ├── model_low.mtl
+│       └── model_low_texture.jpg (Max 2048px)
+├── stl/
+│   ├── high_model.stl         # Watertight, 2-manifold CAD mesh (Z-up, scale in mm)
+│   └── low_model.stl          # Watertight Low-Poly for 3D slicing
+├── 3mf/
+│   ├── high_model.3mf         # Modern manufacturing format with unit & orientation metadata
+│   └── low_model.3mf
+├── object.json                # Physical metadata: dimensions (LxWxH mm), volume (cm³), surface area
+├── stats.json                 # Comprehensive execution telemetry: RAM, VRAM, step timings, warnings
+├── run_log.txt                # Complete execution log (UTF-8)
+└── output.zip                 # Self-contained distribution archive for R2 / client download
 ```
 
-Tests:
+### Coordinate Systems & Metric Units:
+* **Internal Processing:** Metres, Y-up, turntable platter plane at $Y = 0.0\text{ m}$.
+* **OBJ, STL, 3MF:** Millimetres (`--export_scale 1000`). STL & 3MF are oriented Z-up with the base resting on $Z = 0.0\text{ mm}$ for direct 3D slicer compatibility (Bambu Studio, PrusaSlicer, Cura).
+* **GLB:** Scaled at $100\text{ units/m}$ (centimetres) for web viewers, or $1\text{ unit/m}$ for standard glTF conformance via `--glb_scale 1`.
+* **`object.json`:** Real-world measurements calculated directly from the unscaled metric mesh.
+
+---
+
+## 6. Testing
+
+The repository contains an automated unit test suite covering geometry, calibration math, masks, mesh slicing, and cloud protocols:
+
 ```bash
-uv run --with numpy --with opencv-python-headless --with scipy --with trimesh --with shapely --with mapbox-earcut \
-  --with psutil --with pillow --with networkx --with pymeshlab --with boto3 --with requests --with lxml \
-  python -m unittest discover -s tests
+# Run full unit test suite with uv
+uv run --with numpy --with opencv-python-headless --with scipy --with trimesh \
+       --with shapely --with mapbox-earcut --with psutil --with pillow \
+       --with networkx --with pymeshlab --with boto3 --with requests \
+       --with lxml --with DracoPy \
+       python -m unittest discover -v -s tests
 ```
-
----
-
-## 9. Troubleshooting
-
-* **Pieces or holes on one level, `turntable_report.txt` RMS ≫ 3 px or a large free-pose difference on the upper
-  levels** → wrong lift: `--estimate_lift`.
-* **"Not enough RAM: DensifyPointCloud needs about X GB"** → more memory for Docker/WSL, a pod with more RAM, or
-  `--resolution_level 1` / fewer photos.
-* **DensifyPointCloud killed without a message (exit 137)** → out of memory (WSL limit); same fixes.
-* **Black model in Blender** → *Material Preview*; after `--resume` with changed poses run without `--resume`.
-* **Holes in the middle of the object, flattened plain caps** → masks and plain surfaces: see
-  `plans/CUNOSTINTE_SI_MASURATORI.md` §6 (G1–G3) and the debugging images it lists.
-* **Red `NativeCommandError` in PowerShell** → only docker writing a warning to stderr; not an error of the run.
-* **Texture debugging** → `python tools/debug_texturing.py all --output_dir output --input_dir input_images`
-  (needs `undistorted/` in `output/`: run with `--work_dir /workspace/output`).

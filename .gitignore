@@ -49,3 +49,6 @@ teste/
 *.onnx
 
 count_loc.py
+
+docs
+backup_v10

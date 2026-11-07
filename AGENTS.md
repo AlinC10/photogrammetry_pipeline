@@ -6,9 +6,18 @@ Welcome, Agent. This document defines the architectural principles, invariants, 
 
 ## 1. System Mission & Core Purpose
 
-Turntable Studio is a high-precision, industrial-grade 3D photogrammetry pipeline tailored specifically for **automated turntable scanning rigs** (e.g., dual Sony IMX477 12MP cameras with M12 lenses scanning technical plastics, power tools, and mechanical parts).
+Turntable Studio is a high-precision, industrial-grade 3D photogrammetry pipeline tailored specifically for **automated turntable scanning rigs** (dual Sony IMX477 12MP cameras with M12 lenses scanning technical plastics, power tools, and mechanical parts).
 
 The system replaces the slow and noisy components of Meshroom (DepthMap, Meshing, Texturing) with **OpenMVS**, enforces rigidly locked camera poses via **TurntablePoses**, slices the turntable disc to produce a 2-manifold watertight CAD-ready base, and packages production-ready multi-LOD assets matching Cloudflare R2 and RunPod serverless job specifications.
+
+### Physical Rig Specifications & Geometry Invariants:
+- **Cameras:** Dual Sony IMX477 12.3MP sensors ($4056 \times 3040\text{ px}$) with 3.9mm M12 lenses ($\approx 75^\circ$ HFOV).
+- **Same Vertical Height:** Both cameras are mounted on the **same horizontal carriage bar at the same height** ($Y \approx 135\text{ mm}$ above the platter, within $\pm 1.8\text{ mm}$ mechanical tolerance). Neither camera is physically mounted above or below the other.
+- **Same Downward Pitch:** Both cameras are tilted down toward the platter center at the **same nominal pitch angle of $\approx 14^\circ - 15^\circ$**.
+- **Horizontal Azimuthal Separation ($27^\circ$):** The cameras are offset horizontally around the turntable rotation axis by **$27^\circ$** (stereo baseline $b \approx 160\text{ mm}$).
+- **Interleaved Vernier Sampling:** The $27^\circ$ camera separation and $18^\circ$ turntable rotation step form a **$1.5\times$ Vernier ratio** ($27^\circ = 18^\circ + 9^\circ$). Camera 1 samples $9^\circ$ between Camera 0's views, doubling effective horizontal angular resolution to 40 distinct perspectives ($9^\circ$ intervals) from 20 physical stops.
+- **Elevation via Carriage Lift:** Vertical elevation changes happen exclusively when the T8 lead screw lifts the entire carriage between scanning levels (nominal $80\text{ mm}$ lift per level).
+- **Platter Layout:** Default active platter is **$345\text{ mm}$** (`pipeline/platan_345mm_layout.json`, 12 AprilTags of Tag36h11 family, tag scale 0.99, $307\text{ mm}$ opposite tag distance). The legacy $260\text{ mm}$ platter (`pipeline/platan_260mm_layout.json`) remains supported.
 
 ---
 
@@ -140,9 +149,6 @@ turntable_studio/
 │   │                           #   fallback; masking cylinder + tag blackout
 │   ├── mask_fusion.py          # Fused masks (default): AI on a crop + per-(camera, level) background median + the disc
 │   │                           #   rendered from tag layout; keeps floating upper parts (screwdriver) & metallic base (spray)
-│   ├── debug_lite.py           # Debug archive of a scan (raw mesh Draco, masks 1/4, hull, refine points, small files)
-│   └── calibrate_intrinsics.py # Chessboard/Charuco camera matrix calibration
-│   │                           #   rendered from the tag layout; disc out of the masks, no missed view
 │   ├── debug_lite.py           # Debug archive of a scan (raw mesh Draco, masks 1/4, hull, refine points, small files)
 │   └── calibrate_intrinsics.py # Chessboard/Charuco camera matrix calibration
 └── tests/
